@@ -35,7 +35,7 @@ bot.on('text', async (ctx) => {
     try {
         await ctx.sendChatAction('typing');
 
-        const binary = getBinaryPath("win32-x64"); // Přebíráme binárku pro Windows s ohledem na systém D:\\Wendy
+        const binary = getBinaryPath("linux-x64"); // Binárka existuje pouze pro Linux a macOS. Spouštět to musíme přímo na Caslavi!
         
         // Získání správné cesty k aktuálnímu konfiguračnímu adresáři
         const zcConfigDir = __dirname;
