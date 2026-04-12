@@ -1,0 +1,12 @@
+# Prostředí a tajemství
+.env
+
+# Závislosti
+node_modules/
+.npm/
+
+# Další lokální logy atd.
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
