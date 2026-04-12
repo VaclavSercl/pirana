@@ -17,6 +17,13 @@ console.log('Spouštím ZeroClaw Telegram Bota...');
 bot.start((ctx) => ctx.reply('Ahoj! Jsem ZeroClaw AI bot poháněný modelem Gemini. Jak mohu pomoci?'));
 
 bot.on('text', async (ctx) => {
+    // Validate Chat ID
+    const allowedChatId = process.env.TELEGRAM_ALLOWED_CHAT_ID;
+    if (allowedChatId && ctx.chat.id.toString() !== allowedChatId) {
+        console.warn(`Neautorizovaný pokus o komunikaci z chatu ID: ${ctx.chat.id}`);
+        return; // Můžeme tiše ignorovat
+    }
+
     const userMessage = ctx.message.text;
     
     // Check if the user has provided the Gemini API Key, since we stored a placeholder

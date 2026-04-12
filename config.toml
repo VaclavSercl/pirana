@@ -2,8 +2,8 @@ title = "ZeroClaw Telegram AI Configuration"
 
 # Set the default backend text generation provider to Google Gemini
 default_provider = "gemini"
-# Ensure the model is correct (using Standard gemini-2.5-pro as requested or implicitly assumed)
-default_model = "gemini-2.5-pro"
+# Ensure the model is correct (using Standard gemini-3.1-flash-lite-preview as requested or implicitly assumed)
+default_model = "gemini-3.1-flash-lite-preview"
 # Using Env-var evaluation from Node wrapper
 default_temperature = 0.7
 
@@ -11,4 +11,4 @@ default_temperature = 0.7
   [providers.gemini]
   enabled = true
   api_key = "${GEMINI_API_KEY}"
-  models = ["gemini-2.5-pro", "gemini-1.5-pro", "gemini-1.5-flash"]
+  models = ["gemini-3.1-flash-lite-preview", "gemini-2.5-pro", "gemini-1.5-flash"]
