@@ -1,12 +1,43 @@
-# Prostředí a tajemství
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Environment — NEVER commit secrets
 .env
+.env.local
+.env.production
 
-# Závislosti
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js (not used — we use Rust only)
 node_modules/
-.npm/
+package.json
+package-lock.json
 
-# Další lokální logy atd.
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# Old files not part of Pirana
+bot.js
+config.toml
+
+# Logs
+*.log
+logs/
+
+# Data
+/data
+*.db
+*.sqlite
+
+# Build artifacts
+*.o
+*.so
+*.dylib

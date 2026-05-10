@@ -1,0 +1,89 @@
+# PIRANA — Docker Compose Configuration
+
+version: "3.9"
+
+services:
+  # Main trading engine
+  pirana-engine:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile
+    container_name: pirana-engine
+    restart: unless-stopped
+    environment:
+      - BITFINEX_API_KEY=${BITFINEX_API_KEY}
+      - BITFINEX_API_SECRET=${BITFINEX_API_SECRET}
+      - PIRANA_ENV=production
+      - LOG_LEVEL=info
+      - METRICS_PORT=9090
+      - HEALTH_CHECK_PORT=8080
+    ports:
+      - "9090:9090"  # Prometheus metrics
+      - "8080:8080"  # Health check
+    volumes:
+      - pirana-data:/data
+    networks:
+      - pirana-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "1.0"
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # Prometheus metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pirana-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    networks:
+      - pirana-net
+
+  # Grafana dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pirana-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-pirana}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    ports:
+      - "3000:3000"
+    networks:
+      - pirana-net
+
+  # Loki log aggregation
+  loki:
+    image: grafana/loki:latest
+    container_name: pirana-loki
+    restart: unless-stopped
+    volumes:
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - pirana-net
+
+volumes:
+  pirana-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+
+networks:
+  pirana-net:
+    driver: bridge

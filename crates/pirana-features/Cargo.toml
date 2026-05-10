@@ -1,0 +1,16 @@
+[package]
+name = "pirana-features"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pirana-core = { path = "../pirana-core" }
+pirana-telemetry = { path = "../pirana-telemetry" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+metrics = { workspace = true }

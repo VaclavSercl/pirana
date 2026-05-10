@@ -1,0 +1,112 @@
+[package]
+name = "pirana"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+authors = ["PIRANA Team"]
+license = "Proprietary"
+repository = "https://github.com/VaclavSercl/pirana"
+
+[[bin]]
+name = "pirana"
+path = "src/main.rs"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/pirana-core",
+    "crates/pirana-config",
+    "crates/pirana-telemetry",
+    "crates/pirana-market-data",
+    "crates/pirana-features",
+    "crates/pirana-signal-validator",
+    "crates/pirana-risk-engine",
+    "crates/pirana-execution",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+authors = ["PIRANA Team"]
+license = "Proprietary"
+repository = "https://github.com/VaclavSercl/pirana"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# WebSocket & HTTP
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "=0.12.9", features = ["json", "rustls-tls"] }
+url = "=2.4.0"
+
+# Pin idna to version compatible with rustc 1.85
+# (icu_* crates in newer idna require rustc 1.86+)
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+dashmap = "6"
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+# Crypto (for API signing)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+# Security
+zeroize = { version = "1", features = ["derive"] }
+
+# Configuration
+config = "0.14"
+
+[dependencies]
+pirana-core = { path = "crates/pirana-core" }
+pirana-config = { path = "crates/pirana-config" }
+pirana-telemetry = { path = "crates/pirana-telemetry" }
+pirana-market-data = { path = "crates/pirana-market-data" }
+pirana-features = { path = "crates/pirana-features" }
+pirana-signal-validator = { path = "crates/pirana-signal-validator" }
+pirana-risk-engine = { path = "crates/pirana-risk-engine" }
+pirana-execution = { path = "crates/pirana-execution" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false
