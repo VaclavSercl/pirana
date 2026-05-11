@@ -1,6 +1,6 @@
 use axum::{
     extract::{State, WebSocketUpgrade},
-    response::IntoResponse,
+    response::{IntoResponse, Html},
     routing::get,
     Json, Router,
 };
@@ -11,14 +11,32 @@ use tracing::info;
 
 use crate::state::DashboardState;
 
+/// Landing page HTML — served at /
+const LANDING_HTML: &str = include_str!("../static/landing.html");
+
+/// Trading dashboard HTML — served at /trading
+const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
+
 /// Create the dashboard router
 pub fn create_router(state: Arc<DashboardState>) -> Router {
     Router::new()
+        .route("/", get(landing_handler))
+        .route("/trading", get(trading_handler))
         .route("/api/snapshot", get(snapshot_handler))
         .route("/ws", get(ws_handler))
         .route("/api/health", get(health_handler))
-        .nest_service("/", ServeDir::new("crates/pirana-dashboard/static"))
+        .nest_service("/assets", ServeDir::new("crates/pirana-dashboard/static"))
         .with_state(state)
+}
+
+/// GET / — Landing page (rozcestník)
+async fn landing_handler() -> impl IntoResponse {
+    Html(LANDING_HTML)
+}
+
+/// GET /trading — Trading dashboard
+async fn trading_handler() -> impl IntoResponse {
+    Html(DASHBOARD_HTML)
 }
 
 /// GET /api/snapshot — returns full dashboard state as JSON
