@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PIRANA — Trading Dashboard</title>
+    <style>
+        :root {
+            --bg-primary: #0a0e17;
+            --bg-secondary: #111827;
+            --bg-card: #1a2332;
+            --bg-card-hover: #1e293b;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
+            --accent-yellow: #f59e0b;
+            --accent-purple: #8b5cf6;
+            --accent-cyan: #06b6d4;
+            --border-color: #1e293b;
+            --glow-green: rgba(16, 185, 129, 0.15);
+            --glow-red: rgba(239, 68, 68, 0.15);
+            --glow-blue: rgba(59, 130, 246, 0.15);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Header */
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo {
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--accent-cyan);
+            letter-spacing: 2px;
+        }
+
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .status-active { background: var(--glow-green); color: var(--accent-green); border: 1px solid var(--accent-green); }
+        .status-defensive { background: rgba(245, 158, 11, 0.15); color: var(--accent-yellow); border: 1px solid var(--accent-yellow); }
+        .status-halted { background: var(--glow-red); color: var(--accent-red); border: 1px solid var(--accent-red); }
+        .status-initializing { background: var(--glow-blue); color: var(--accent-blue); border: 1px solid var(--accent-blue); }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .connection-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            animation: pulse 2s infinite;
+        }
+
+        .connection-dot.disconnected { background: var(--accent-red); animation: none; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* Main Grid */
+        .dashboard {
+            padding: 16px;
+            display: grid;
+            grid-template-columns: repeat(12, 1fr);
+            gap: 16px;
+            max-width: 1920px;
+            margin: 0 auto;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            transition: border-color 0.2s;
+        }
+
+        .card:hover { border-color: var(--text-muted); }
+
+        .card-title {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+        }
+
+        /* KPI Cards */
+        .kpi-card { grid-column: span 3; }
+        .kpi-value {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+        .kpi-label { font-size: 12px; color: var(--text-secondary); }
+        .kpi-change {
+            font-size: 12px;
+            margin-top: 4px;
+            font-weight: 600;
+        }
+        .positive { color: var(--accent-green); }
+        .negative { color: var(--accent-red); }
+        .neutral { color: var(--text-secondary); }
+
+        /* Chart Cards */
+        .chart-card { grid-column: span 6; }
+        .chart-container { height: 200px; position: relative; }
+        canvas { width: 100% !important; height: 100% !important; }
+
+        /* Full width */
+        .full-width { grid-column: span 12; }
+        .half-width { grid-column: span 6; }
+        .third-width { grid-column: span 4; }
+
+        /* Order Book */
+        .order-book { grid-column: span 3; }
+        .ob-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 3px 0;
+            font-size: 11px;
+            position: relative;
+        }
+        .ob-row::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            right: 0;
+            z-index: 0;
+        }
+        .ob-bid::after { background: rgba(16, 185, 129, 0.1); }
+        .ob-ask::after { background: rgba(239, 68, 68, 0.1); }
+        .ob-price-bid { color: var(--accent-green); }
+        .ob-price-ask { color: var(--accent-red); }
+        .ob-spread {
+            text-align: center;
+            padding: 6px 0;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--accent-yellow);
+            border-top: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+            margin: 4px 0;
+        }
+
+        /* Trades Table */
+        .trades-table { grid-column: span 5; }
+        .table-container { max-height: 300px; overflow-y: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        th {
+            text-align: left;
+            padding: 6px 8px;
+            color: var(--text-muted);
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 10px;
+            letter-spacing: 1px;
+            border-bottom: 1px solid var(--border-color);
+            position: sticky;
+            top: 0;
+            background: var(--bg-card);
+        }
+        td {
+            padding: 5px 8px;
+            border-bottom: 1px solid rgba(30, 41, 59, 0.5);
+        }
+        tr:hover td { background: var(--bg-card-hover); }
+
+        /* Signals */
+        .signal-card { grid-column: span 4; }
+        .signal-item {
+            padding: 8px;
+            margin-bottom: 6px;
+            border-radius: 4px;
+            border-left: 3px solid;
+            background: rgba(255,255,255,0.02);
+            font-size: 11px;
+        }
+        .signal-accumulation { border-color: var(--accent-green); }
+        .signal-distribution { border-color: var(--accent-red); }
+        .signal-hold { border-color: var(--accent-yellow); }
+        .signal-defensive { border-color: var(--accent-purple); }
+        .signal-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+        .signal-type { font-weight: 700; text-transform: uppercase; font-size: 10px; }
+        .signal-confidence { color: var(--accent-cyan); }
+        .signal-rationale { color: var(--text-secondary); line-height: 1.4; }
+        .signal-time { color: var(--text-muted); font-size: 10px; margin-top: 4px; }
+
+        /* Risk Bars */
+        .risk-bar-container { margin-bottom: 12px; }
+        .risk-bar-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            margin-bottom: 4px;
+        }
+        .risk-bar {
+            height: 6px;
+            background: var(--bg-primary);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .risk-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+        .risk-safe { background: var(--accent-green); }
+        .risk-warning { background: var(--accent-yellow); }
+        .risk-danger { background: var(--accent-red); }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 2px; }
+
+        /* Responsive */
+        @media (max-width: 1200px) {
+            .kpi-card { grid-column: span 6; }
+            .chart-card { grid-column: span 12; }
+            .order-book { grid-column: span 6; }
+            .trades-table { grid-column: span 6; }
+            .signal-card { grid-column: span 12; }
+        }
+        @media (max-width: 768px) {
+            .kpi-card, .chart-card, .order-book, .trades-table, .signal-card { grid-column: span 12; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <div class="header-left">
+        <div class="logo">PIRANA</div>
+        <div class="status-badge status-initializing" id="systemMode">INITIALIZING</div>
+    </div>
+    <div class="header-right">
+        <div class="connection-dot" id="connDot"></div>
+        <span id="connStatus">Connecting...</span>
+        <span>|</span>
+        <span>Uptime: <strong id="uptime">0s</strong></span>
+        <span>|</span>
+        <span>Trades: <strong id="tradeCount">0</strong></span>
+    </div>
+</div>
+
+<div class="dashboard">
+
+    <!-- KPI Cards -->
+    <div class="card kpi-card">
+        <div class="card-title">BTC Price</div>
+        <div class="kpi-value" id="btcPrice">—</div>
+        <div class="kpi-label">USD</div>
+    </div>
+
+    <div class="card kpi-card">
+        <div class="card-title">Daily P&L</div>
+        <div class="kpi-value neutral" id="dailyPnl">—</div>
+        <div class="kpi-change neutral" id="dailyPnlPct">—</div>
+    </div>
+
+    <div class="card kpi-card">
+        <div class="card-title">Total P&L</div>
+        <div class="kpi-value neutral" id="totalPnl">—</div>
+        <div class="kpi-label">All time</div>
+    </div>
+
+    <div class="card kpi-card">
+        <div class="card-title">Win Rate</div>
+        <div class="kpi-value" id="winRate">—</div>
+        <div class="kpi-label">Best: <span id="bestTrade" class="positive">—</span> | Worst: <span id="worstTrade" class="negative">—</span></div>
+    </div>
+
+    <!-- Price Chart -->
+    <div class="card chart-card">
+        <div class="card-title">BTC/USD Price</div>
+        <div class="chart-container">
+            <canvas id="priceChart"></canvas>
+        </div>
+    </div>
+
+    <!-- P&L Chart -->
+    <div class="card chart-card">
+        <div class="card-title">P&L Over Time</div>
+        <div class="chart-container">
+            <canvas id="pnlChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Order Book -->
+    <div class="card order-book">
+        <div class="card-title">Order Book</div>
+        <div id="orderBook"></div>
+    </div>
+
+    <!-- Recent Trades -->
+    <div class="card trades-table">
+        <div class="card-title">Recent Trades</div>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Side</th>
+                        <th>Price</th>
+                        <th>Size</th>
+                        <th>P&L</th>
+                    </tr>
+                </thead>
+                <tbody id="tradesBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- AI Signals -->
+    <div class="card signal-card">
+        <div class="card-title">AI Signals</div>
+        <div id="signalsList"></div>
+    </div>
+
+    <!-- Risk Metrics -->
+    <div class="card third-width">
+        <div class="card-title">Risk Metrics</div>
+        <div class="risk-bar-container">
+            <div class="risk-bar-label">
+                <span>Exposure</span>
+                <span id="exposureVal">0%</span>
+            </div>
+            <div class="risk-bar">
+                <div class="risk-bar-fill risk-safe" id="exposureBar" style="width: 0%"></div>
+            </div>
+        </div>
+        <div class="risk-bar-container">
+            <div class="risk-bar-label">
+                <span>Daily Drawdown</span>
+                <span id="ddVal">0%</span>
+            </div>
+            <div class="risk-bar">
+                <div class="risk-bar-fill risk-safe" id="ddBar" style="width: 0%"></div>
+            </div>
+        </div>
+        <div class="risk-bar-container">
+            <div class="risk-bar-label">
+                <span>OFI</span>
+                <span id="ofiVal">0.00</span>
+            </div>
+            <div class="risk-bar">
+                <div class="risk-bar-fill risk-safe" id="ofiBar" style="width: 50%"></div>
+            </div>
+        </div>
+        <div class="risk-bar-container">
+            <div class="risk-bar-label">
+                <span>Volatility</span>
+                <span id="volVal">0%</span>
+            </div>
+            <div class="risk-bar">
+                <div class="risk-bar-fill risk-safe" id="volBar" style="width: 0%"></div>
+            </div>
+        </div>
+        <div style="margin-top: 12px; font-size: 11px; color: var(--text-secondary);">
+            <div>Consecutive Losses: <span id="consecLosses" class="neutral">0</span> / 5</div>
+            <div>Avg Trade Size: <span id="avgSize" class="neutral">—</span></div>
+            <div>Spread: <span id="spreadVal" class="neutral">—</span></div>
+        </div>
+    </div>
+
+    <!-- Balances -->
+    <div class="card third-width">
+        <div class="card-title">Account</div>
+        <div style="font-size: 13px; line-height: 2;">
+            <div>BTC: <strong id="btcBal">—</strong></div>
+            <div>USD: <strong id="usdBal">—</strong></div>
+            <hr style="border-color: var(--border-color); margin: 8px 0;">
+            <div class="card-title" style="margin-top: 8px;">Open Orders</div>
+            <div id="openOrders" style="max-height: 150px; overflow-y: auto;"></div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+// ─── State ───────────────────────────────────────────
+let ws = null;
+let reconnectTimer = null;
+let priceData = [];
+let pnlData = [];
+
+// ─── Helpers ─────────────────────────────────────────
+function fmt(n, d=2) { return Number(n).toFixed(d); }
+function fmtUsd(n) { return '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function fmtPct(n) { return (n >= 0 ? '+' : '') + fmt(n) + '%'; }
+function timeAgo(s) {
+    const d = new Date(s);
+    return d.toLocaleTimeString('en-US', {hour12: false});
+}
+function uptimeStr(s) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return `${h}h ${m}m ${sec}s`;
+}
+
+// ─── Canvas Charts ───────────────────────────────────
+function drawLineChart(canvasId, data, color, fillColor, minVal, maxVal) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * 2;
+    canvas.height = rect.height * 2;
+    ctx.scale(2, 2);
+    const w = rect.width, h = rect.height;
+
+    ctx.clearRect(0, 0, w, h);
+
+    if (data.length < 2) {
+        ctx.fillStyle = '#64748b';
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Waiting for data...', w/2, h/2);
+        return;
+    }
+
+    const min = minVal !== undefined ? minVal : Math.min(...data) * 0.999;
+    const max = maxVal !== undefined ? maxVal : Math.max(...data) * 1.001;
+    const range = max - min || 1;
+
+    // Grid lines
+    ctx.strokeStyle = '#1e293b';
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i <= 4; i++) {
+        const y = (h / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+    }
+
+    // Fill
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    for (let i = 0; i < data.length; i++) {
+        const x = (w / (data.length - 1)) * i;
+        const y = h - ((data[i] - min) / range) * h;
+        ctx.lineTo(x, y);
+    }
+    ctx.lineTo(w, h);
+    ctx.closePath();
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    for (let i = 0; i < data.length; i++) {
+        const x = (w / (data.length - 1)) * i;
+        const y = h - ((data[i] - min) / range) * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Last value dot
+    const lastX = w;
+    const lastY = h - ((data[data.length - 1] - min) / range) * h;
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+}
+
+// ─── Update Dashboard ────────────────────────────────
+function updateDashboard(d) {
+    // System mode
+    const modeEl = document.getElementById('systemMode');
+    modeEl.textContent = d.system_mode;
+    modeEl.className = 'status-badge status-' + d.system_mode.toLowerCase();
+
+    // KPIs
+    document.getElementById('btcPrice').textContent = fmtUsd(d.btc_price);
+    const dailyPnlEl = document.getElementById('dailyPnl');
+    dailyPnlEl.textContent = (d.daily_pnl >= 0 ? '+' : '') + fmtUsd(d.daily_pnl);
+    dailyPnlEl.className = 'kpi-value ' + (d.daily_pnl >= 0 ? 'positive' : 'negative');
+
+    const dailyPnlPctEl = document.getElementById('dailyPnlPct');
+    dailyPnlPctEl.textContent = fmtPct(d.daily_pnl_pct);
+    dailyPnlPctEl.className = 'kpi-change ' + (d.daily_pnl_pct >= 0 ? 'positive' : 'negative');
+
+    const totalPnlEl = document.getElementById('totalPnl');
+    totalPnlEl.textContent = (d.total_pnl >= 0 ? '+' : '') + fmtUsd(d.total_pnl);
+    totalPnlEl.className = 'kpi-value ' + (d.total_pnl >= 0 ? 'positive' : 'negative');
+
+    document.getElementById('winRate').textContent = fmt(d.win_rate, 1) + '%';
+    document.getElementById('bestTrade').textContent = '+' + fmtUsd(d.best_trade);
+    document.getElementById('worstTrade').textContent = fmtUsd(d.worst_trade);
+
+    // Header
+    document.getElementById('uptime').textContent = uptimeStr(d.uptime_seconds);
+    document.getElementById('tradeCount').textContent = d.trades_today;
+
+    // Risk bars
+    const expPct = d.exposure_pct * 100;
+    document.getElementById('exposureVal').textContent = fmt(expPct, 1) + '%';
+    document.getElementById('exposureBar').style.width = Math.min(expPct / 20 * 100, 100) + '%';
+    document.getElementById('exposureBar').className = 'risk-bar-fill ' + (expPct > 15 ? 'risk-danger' : expPct > 10 ? 'risk-warning' : 'risk-safe');
+
+    const ddPct = d.daily_drawdown_pct * 100;
+    document.getElementById('ddVal').textContent = fmt(ddPct, 2) + '%';
+    document.getElementById('ddBar').style.width = Math.min(ddPct / 3 * 100, 100) + '%';
+    document.getElementById('ddBar').className = 'risk-bar-fill ' + (ddPct > 2 ? 'risk-danger' : ddPct > 1 ? 'risk-warning' : 'risk-safe');
+
+    const ofi = d.ofi;
+    document.getElementById('ofiVal').textContent = fmt(ofi, 3);
+    document.getElementById('ofiBar').style.width = ((ofi + 1) / 2 * 100) + '%';
+    document.getElementById('ofiBar').className = 'risk-bar-fill ' + (Math.abs(ofi) > 0.6 ? 'risk-warning' : 'risk-safe');
+
+    const vol = d.volatility * 100;
+    document.getElementById('volVal').textContent = fmt(vol, 1) + '%';
+    document.getElementById('volBar').style.width = Math.min(vol / 100 * 100, 100) + '%';
+    document.getElementById('volBar').className = 'risk-bar-fill ' + (vol > 80 ? 'risk-danger' : vol > 50 ? 'risk-warning' : 'risk-safe');
+
+    document.getElementById('consecLosses').textContent = d.consecutive_losses;
+    document.getElementById('consecLosses').className = d.consecutive_losses >= 3 ? 'negative' : d.consecutive_losses >= 1 ? 'neutral' : 'positive';
+    document.getElementById('avgSize').textContent = fmtUsd(d.avg_trade_size);
+    document.getElementById('spreadVal').textContent = fmtUsd(d.spread);
+
+    // Balances
+    document.getElementById('btcBal').textContent = fmt(d.btc_balance, 6) + ' ₿';
+    document.getElementById('usdBal').textContent = fmtUsd(d.usd_balance);
+
+    // Price chart
+    priceData = d.price_history.map(p => p.price);
+    drawLineChart('priceChart', priceData, '#06b6d4', 'rgba(6, 182, 212, 0.1)');
+
+    // P&L chart
+    pnlData = d.pnl_history.map(p => p.pnl);
+    const pnlColor = pnlData.length > 0 && pnlData[pnlData.length - 1] >= 0 ? '#10b981' : '#ef4444';
+    drawLineChart('pnlChart', pnlData, pnlColor, pnlColor + '15');
+
+    // Order Book
+    const obEl = document.getElementById('orderBook');
+    let obHtml = '';
+    const asks = d.order_book.asks.slice(0, 8).reverse();
+    const bids = d.order_book.bids.slice(0, 8);
+    asks.forEach(a => {
+        const w = Math.min((a.quantity / 5) * 100, 100);
+        obHtml += `<div class="ob-row ob-ask" style="--w:${w}%">
+            <span class="ob-price-ask">${fmt(a.price)}</span>
+            <span>${fmt(a.quantity, 4)}</span>
+            <span style="color:var(--text-muted)">${fmt(a.total, 0)}</span>
+        </div>`;
+    });
+    obHtml += `<div class="ob-spread">Spread: ${fmtUsd(d.order_book.spread)}</div>`;
+    bids.forEach(b => {
+        const w = Math.min((b.quantity / 5) * 100, 100);
+        obHtml += `<div class="ob-row ob-bid" style="--w:${w}%">
+            <span class="ob-price-bid">${fmt(b.price)}</span>
+            <span>${fmt(b.quantity, 4)}</span>
+            <span style="color:var(--text-muted)">${fmt(b.total, 0)}</span>
+        </div>`;
+    });
+    obEl.innerHTML = obHtml;
+
+    // Trades table
+    const tbody = document.getElementById('tradesBody');
+    tbody.innerHTML = d.recent_trades.slice(0, 20).map(t => `
+        <tr>
+            <td style="color:var(--text-muted)">${timeAgo(t.timestamp)}</td>
+            <td class="${t.side === 'Buy' || t.side === 'BUY' ? 'positive' : 'negative'}">${t.side}</td>
+            <td>${fmtUsd(t.price)}</td>
+            <td>${fmt(t.quantity, 6)}</td>
+            <td class="${t.pnl >= 0 ? 'positive' : 'negative'}">${t.pnl >= 0 ? '+' : ''}${fmtUsd(t.pnl)}</td>
+        </tr>
+    `).join('');
+
+    // Signals
+    const sigEl = document.getElementById('signalsList');
+    if (d.recent_signals.length === 0) {
+        sigEl.innerHTML = '<div style="color:var(--text-muted);font-size:11px;padding:16px;text-align:center;">No signals yet</div>';
+    } else {
+        sigEl.innerHTML = d.recent_signals.slice(0, 10).map(s => {
+            const cls = s.signal_type.includes('ACCUMULATION') ? 'signal-accumulation' :
+                        s.signal_type.includes('DISTRIBUTION') ? 'signal-distribution' :
+                        s.signal_type.includes('DEFENSIVE') ? 'signal-defensive' : 'signal-hold';
+            return `<div class="signal-item ${cls}">
+                <div class="signal-header">
+                    <span class="signal-type">${s.signal_type}</span>
+                    <span class="signal-confidence">${fmt(s.confidence * 100, 0)}%</span>
+                </div>
+                <div class="signal-rationale">${s.rationale}</div>
+                <div class="signal-time">${s.regime} • ${timeAgo(s.timestamp)}</div>
+            </div>`;
+        }).join('');
+    }
+
+    // Open orders
+    const ooEl = document.getElementById('openOrders');
+    if (d.open_orders.length === 0) {
+        ooEl.innerHTML = '<div style="color:var(--text-muted);font-size:11px;">No open orders</div>';
+    } else {
+        ooEl.innerHTML = d.open_orders.map(o => `
+            <div style="padding:4px 0;border-bottom:1px solid var(--border-color);">
+                <span class="${o.side === 'Buy' || o.side === 'BUY' ? 'positive' : 'negative'}">${o.side}</span>
+                ${fmt(o.quantity, 4)} @ ${fmtUsd(o.price)}
+                <span style="color:var(--text-muted)">(${fmt(o.filled/o.quantity*100, 0)}%)</span>
+            </div>
+        `).join('');
+    }
+}
+
+// ─── WebSocket ───────────────────────────────────────
+function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+    ws.onopen = () => {
+        document.getElementById('connDot').className = 'connection-dot';
+        document.getElementById('connStatus').textContent = 'Live';
+        clearTimeout(reconnectTimer);
+    };
+
+    ws.onmessage = (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            updateDashboard(data);
+        } catch (err) { console.error('Parse error:', err); }
+    };
+
+    ws.onclose = () => {
+        document.getElementById('connDot').className = 'connection-dot disconnected';
+        document.getElementById('connStatus').textContent = 'Reconnecting...';
+        reconnectTimer = setTimeout(connect, 3000);
+    };
+
+    ws.onerror = () => { ws.close(); };
+}
+
+// ─── Init ────────────────────────────────────────────
+connect();
+
+// Redraw charts on window resize
+window.addEventListener('resize', () => {
+    drawLineChart('priceChart', priceData, '#06b6d4', 'rgba(6, 182, 212, 0.1)');
+    const pnlColor = pnlData.length > 0 && pnlData[pnlData.length - 1] >= 0 ? '#10b981' : '#ef4444';
+    drawLineChart('pnlChart', pnlData, pnlColor, pnlColor + '15');
+});
+</script>
+
+</body>
+</html>

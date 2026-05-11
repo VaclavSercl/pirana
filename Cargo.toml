@@ -22,6 +22,7 @@ members = [
     "crates/pirana-signal-validator",
     "crates/pirana-risk-engine",
     "crates/pirana-execution",
+    "crates/pirana-dashboard",
 ]
 
 [workspace.package]
@@ -44,6 +45,9 @@ serde_json = "1"
 # WebSocket & HTTP
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 reqwest = { version = "=0.12.9", features = ["json", "rustls-tls"] }
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
 url = "=2.4.0"
 
 # Pin idna to version compatible with rustc 1.85
@@ -91,6 +95,7 @@ pirana-features = { path = "crates/pirana-features" }
 pirana-signal-validator = { path = "crates/pirana-signal-validator" }
 pirana-risk-engine = { path = "crates/pirana-risk-engine" }
 pirana-execution = { path = "crates/pirana-execution" }
+pirana-dashboard = { path = "crates/pirana-dashboard" }
 
 tokio = { workspace = true }
 serde = { workspace = true }
