@@ -85,6 +85,7 @@ zeroize = { version = "1", features = ["derive"] }
 
 # Configuration
 config = "0.14"
+dotenvy = "0.15"
 
 [dependencies]
 pirana-core = { path = "crates/pirana-core" }

@@ -1,5 +1,6 @@
 use pirana_core::errors::{PiranaError, PiranaResult};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tracing::{info, warn};
 
 /// System configuration loaded from environment and config files
@@ -15,13 +16,15 @@ pub struct PiranaConfig {
     pub infrastructure: InfrastructureConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ExchangeConfig {
     /// Exchange name
     pub name: String,
-    /// API key (loaded from environment)
+    /// API key (loaded from environment) — never serialized or logged
+    #[serde(skip_serializing)]
     pub api_key: String,
-    /// API secret (loaded from environment)
+    /// API secret (loaded from environment) — never serialized or logged
+    #[serde(skip_serializing)]
     pub api_secret: String,
     /// WebSocket URL
     pub ws_url: String,
@@ -29,6 +32,20 @@ pub struct ExchangeConfig {
     pub rest_url: String,
     /// Whether to use testnet
     pub testnet: bool,
+}
+
+/// Custom Debug implementation that hides API keys
+impl fmt::Debug for ExchangeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExchangeConfig")
+            .field("name", &self.name)
+            .field("api_key", &"[REDACTED]")
+            .field("api_secret", &"[REDACTED]")
+            .field("ws_url", &self.ws_url)
+            .field("rest_url", &self.rest_url)
+            .field("testnet", &self.testnet)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +90,13 @@ pub struct InfrastructureConfig {
 
 impl PiranaConfig {
     /// Load configuration from environment variables
+    /// Uses dotenvy to load .env file if present
     pub fn from_env() -> PiranaResult<Self> {
+        // Load .env file if it exists (silently ignore if missing)
+        if dotenvy::dotenv().is_ok() {
+            info!("Loaded .env file");
+        }
+
         info!("Loading configuration from environment");
 
         let api_key = std::env::var("BITFINEX_API_KEY").unwrap_or_default();
