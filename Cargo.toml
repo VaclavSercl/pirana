@@ -104,6 +104,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
 
 [profile.release]
 opt-level = 3
