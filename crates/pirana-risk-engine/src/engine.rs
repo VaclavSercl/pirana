@@ -65,22 +65,14 @@ impl RiskEngine {
     }
 
     /// Evaluate a proposed trade against all risk limits
-    /// BTC ACCUMULATION STRATEGY: Never sell BTC base position, only accumulate
+    /// HFT STRATEGY: Buy and sell in milliseconds, profit from spread capture
+    /// BTC is the base asset — we trade around it actively, no panic selling
     pub fn evaluate_trade(&self, signal: &Signal, current_price: f64) -> PiranaResult<RiskAssessment> {
         let mut state = self.state.write();
 
-        // BTC ACCUMULATION: Block distribution/exit signals — we never sell BTC base
-        if signal.signal_type == SignalType::DistributionExit {
-            return Ok(RiskAssessment {
-                approved: false,
-                rejection_reason: Some("BTC ACCUMULATION: Distribution/Exit blocked — Bitcoin is the base asset, we never sell".to_string()),
-                adjusted_position_size: 0.0,
-                current_exposure_pct: state.aggregate_exposure,
-                daily_drawdown_pct: state.daily_drawdown_pct,
-                weekly_drawdown_pct: state.weekly_drawdown_pct,
-                consecutive_losses: state.consecutive_losses,
-            });
-        }
+        // HFT: Allow all signal types — we buy AND sell for profit
+        // DistributionExit is valid — we sell when profitable
+        // AccumulationEntry is valid — we buy on dips
 
         // Check system mode
         if state.mode == SystemMode::Halted {
