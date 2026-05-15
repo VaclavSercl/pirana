@@ -1,6 +1,11 @@
 /// Hard risk limits — these are NON-NEGOTIABLE constants.
 /// The AI layer CANNOT override these values.
 
+/// BTC ACCUMULATION STRATEGY
+/// Bitcoin is the base asset — we never sell, only accumulate
+/// Price drops are buying opportunities, never panic sell
+pub const BTC_ACCUMULATION_MODE: bool = true;
+
 /// Maximum aggregate exposure as a fraction of total capital (20%)
 pub const MAX_AGGREGATE_EXPOSURE: f64 = 0.20;
 

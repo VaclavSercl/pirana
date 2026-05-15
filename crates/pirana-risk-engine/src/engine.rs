@@ -65,8 +65,22 @@ impl RiskEngine {
     }
 
     /// Evaluate a proposed trade against all risk limits
+    /// BTC ACCUMULATION STRATEGY: Never sell BTC base position, only accumulate
     pub fn evaluate_trade(&self, signal: &Signal, current_price: f64) -> PiranaResult<RiskAssessment> {
         let mut state = self.state.write();
+
+        // BTC ACCUMULATION: Block distribution/exit signals — we never sell BTC base
+        if signal.signal_type == SignalType::DistributionExit {
+            return Ok(RiskAssessment {
+                approved: false,
+                rejection_reason: Some("BTC ACCUMULATION: Distribution/Exit blocked — Bitcoin is the base asset, we never sell".to_string()),
+                adjusted_position_size: 0.0,
+                current_exposure_pct: state.aggregate_exposure,
+                daily_drawdown_pct: state.daily_drawdown_pct,
+                weekly_drawdown_pct: state.weekly_drawdown_pct,
+                consecutive_losses: state.consecutive_losses,
+            });
+        }
 
         // Check system mode
         if state.mode == SystemMode::Halted {
