@@ -39,7 +39,7 @@ impl BitfinexClient {
         price: f64,
     ) -> PiranaResult<String> {
         let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
-        let endpoint = "/v2/auth/w/order/submit";
+        let endpoint = "/api/v2/auth/w/order/submit";
 
         let type_str = match order_type {
             OrderType::Limit => "EXCHANGE LIMIT",
@@ -61,7 +61,7 @@ impl BitfinexClient {
         let payload = format!("{}{}{}", endpoint, nonce, &body_str);
         let signature = self.sign(&payload);
 
-        let url = format!("{}{}", self.base_url, endpoint);
+        let url = format!("{}/v2/auth/w/order/submit", self.base_url);
 
         debug!("Submitting order: {} {} {} @ {}", side_str(side), quantity, symbol, price);
 
@@ -100,14 +100,14 @@ impl BitfinexClient {
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: i64) -> PiranaResult<String> {
         let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
-        let endpoint = "/v2/auth/w/order/cancel";
+        let endpoint = "/api/v2/auth/w/order/cancel";
 
         let body = serde_json::json!({ "id": order_id });
         let body_str = body.to_string();
         let payload = format!("{}{}{}", endpoint, nonce, &body_str);
         let signature = self.sign(&payload);
 
-        let url = format!("{}{}", self.base_url, endpoint);
+        let url = format!("{}/v2/auth/w/order/cancel", self.base_url);
 
         let response = self.client
             .post(&url)
@@ -135,12 +135,12 @@ impl BitfinexClient {
     /// Get wallet balances
     pub async fn get_wallets(&self) -> PiranaResult<Vec<Balance>> {
         let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
-        let endpoint = "/v2/auth/r/wallets";
-
-        let payload = format!("{}{}", endpoint, nonce);
+        let endpoint = "/api/v2/auth/r/wallets";
+        let body = "{}";
+        let payload = format!("{}{}{}", endpoint, nonce, body);
         let signature = self.sign(&payload);
 
-        let url = format!("{}{}", self.base_url, endpoint);
+        let url = format!("{}/v2/auth/r/wallets", self.base_url);
 
         let response = self.client
             .post(&url)
