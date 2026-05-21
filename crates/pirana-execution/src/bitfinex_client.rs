@@ -38,7 +38,7 @@ impl BitfinexClient {
         quantity: f64,
         price: f64,
     ) -> PiranaResult<String> {
-        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+        let nonce = chrono::Utc::now().timestamp_millis().to_string();
         let endpoint = "/api/v2/auth/w/order/submit";
 
         let type_str = match order_type {
@@ -99,7 +99,7 @@ impl BitfinexClient {
 
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: i64) -> PiranaResult<String> {
-        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+        let nonce = chrono::Utc::now().timestamp_millis().to_string();
         let endpoint = "/api/v2/auth/w/order/cancel";
 
         let body = serde_json::json!({ "id": order_id });
@@ -134,7 +134,7 @@ impl BitfinexClient {
 
     /// Get wallet balances
     pub async fn get_wallets(&self) -> PiranaResult<Vec<Balance>> {
-        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+        let nonce = chrono::Utc::now().timestamp_millis().to_string();
         let endpoint = "/api/v2/auth/r/wallets";
         let body = "{}";
         let payload = format!("{}{}{}", endpoint, nonce, body);
@@ -148,6 +148,7 @@ impl BitfinexClient {
             .header("bfx-nonce", &nonce)
             .header("bfx-signature", &signature)
             .header("Content-Type", "application/json")
+            .body(body)
             .send()
             .await
             .map_err(|e| PiranaError::ExchangeApi {
