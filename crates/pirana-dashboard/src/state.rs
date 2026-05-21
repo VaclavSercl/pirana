@@ -9,53 +9,53 @@ use dashmap::DashMap;
 #[derive(Debug, Clone)]
 pub struct DashboardState {
     /// Current system mode
-    pub system_mode: Arc<std::sync::RwLock<SystemMode>>,
+    pub system_mode: Arc<parking_lot::RwLock<SystemMode>>,
     /// Current BTC price
-    pub btc_price: Arc<std::sync::RwLock<f64>>,
+    pub btc_price: Arc<parking_lot::RwLock<f64>>,
     /// Account balance in BTC
-    pub btc_balance: Arc<std::sync::RwLock<f64>>,
+    pub btc_balance: Arc<parking_lot::RwLock<f64>>,
     /// Account balance in USD
-    pub usd_balance: Arc<std::sync::RwLock<f64>>,
+    pub usd_balance: Arc<parking_lot::RwLock<f64>>,
     /// Daily P&L
-    pub daily_pnl: Arc<std::sync::RwLock<f64>>,
+    pub daily_pnl: Arc<parking_lot::RwLock<f64>>,
     /// Daily P&L percentage
-    pub daily_pnl_pct: Arc<std::sync::RwLock<f64>>,
+    pub daily_pnl_pct: Arc<parking_lot::RwLock<f64>>,
     /// Total P&L (all time)
-    pub total_pnl: Arc<std::sync::RwLock<f64>>,
+    pub total_pnl: Arc<parking_lot::RwLock<f64>>,
     /// Current exposure percentage
-    pub exposure_pct: Arc<std::sync::RwLock<f64>>,
+    pub exposure_pct: Arc<parking_lot::RwLock<f64>>,
     /// Daily drawdown percentage
-    pub daily_drawdown_pct: Arc<std::sync::RwLock<f64>>,
+    pub daily_drawdown_pct: Arc<parking_lot::RwLock<f64>>,
     /// OFI value
-    pub ofi: Arc<std::sync::RwLock<f64>>,
+    pub ofi: Arc<parking_lot::RwLock<f64>>,
     /// Volatility (annualized)
-    pub volatility: Arc<std::sync::RwLock<f64>>,
+    pub volatility: Arc<parking_lot::RwLock<f64>>,
     /// Spread
-    pub spread: Arc<std::sync::RwLock<f64>>,
+    pub spread: Arc<parking_lot::RwLock<f64>>,
     /// Recent trades (last 100)
-    pub recent_trades: Arc<std::sync::RwLock<Vec<TradeView>>>,
+    pub recent_trades: Arc<parking_lot::RwLock<Vec<TradeView>>>,
     /// Open orders
-    pub open_orders: Arc<std::sync::RwLock<Vec<OrderView>>>,
+    pub open_orders: Arc<parking_lot::RwLock<Vec<OrderView>>>,
     /// Recent signals from AI
-    pub recent_signals: Arc<std::sync::RwLock<Vec<SignalView>>>,
+    pub recent_signals: Arc<parking_lot::RwLock<Vec<SignalView>>>,
     /// Price history for chart (last 500 points)
-    pub price_history: Arc<std::sync::RwLock<Vec<PricePoint>>>,
+    pub price_history: Arc<parking_lot::RwLock<Vec<PricePoint>>>,
     /// P&L history for chart (last 500 points)
-    pub pnl_history: Arc<std::sync::RwLock<Vec<PnlPoint>>>,
+    pub pnl_history: Arc<parking_lot::RwLock<Vec<PnlPoint>>>,
     /// Order book snapshot
-    pub order_book: Arc<std::sync::RwLock<OrderBookView>>,
+    pub order_book: Arc<parking_lot::RwLock<OrderBookView>>,
     /// Consecutive losses
-    pub consecutive_losses: Arc<std::sync::RwLock<u32>>,
+    pub consecutive_losses: Arc<parking_lot::RwLock<u32>>,
     /// Total trades today
-    pub trades_today: Arc<std::sync::RwLock<u32>>,
+    pub trades_today: Arc<parking_lot::RwLock<u32>>,
     /// Win rate
-    pub win_rate: Arc<std::sync::RwLock<f64>>,
+    pub win_rate: Arc<parking_lot::RwLock<f64>>,
     /// Best trade today
-    pub best_trade: Arc<std::sync::RwLock<f64>>,
+    pub best_trade: Arc<parking_lot::RwLock<f64>>,
     /// Worst trade today
-    pub worst_trade: Arc<std::sync::RwLock<f64>>,
+    pub worst_trade: Arc<parking_lot::RwLock<f64>>,
     /// Average trade size
-    pub avg_trade_size: Arc<std::sync::RwLock<f64>>,
+    pub avg_trade_size: Arc<parking_lot::RwLock<f64>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -162,35 +162,35 @@ pub struct DashboardSnapshot {
 impl DashboardState {
     pub fn new() -> Self {
         Self {
-            system_mode: Arc::new(std::sync::RwLock::new(SystemMode::Initializing)),
-            btc_price: Arc::new(std::sync::RwLock::new(0.0)),
-            btc_balance: Arc::new(std::sync::RwLock::new(0.0)),
-            usd_balance: Arc::new(std::sync::RwLock::new(0.0)),
-            daily_pnl: Arc::new(std::sync::RwLock::new(0.0)),
-            daily_pnl_pct: Arc::new(std::sync::RwLock::new(0.0)),
-            total_pnl: Arc::new(std::sync::RwLock::new(0.0)),
-            exposure_pct: Arc::new(std::sync::RwLock::new(0.0)),
-            daily_drawdown_pct: Arc::new(std::sync::RwLock::new(0.0)),
-            ofi: Arc::new(std::sync::RwLock::new(0.0)),
-            volatility: Arc::new(std::sync::RwLock::new(0.0)),
-            spread: Arc::new(std::sync::RwLock::new(0.0)),
-            recent_trades: Arc::new(std::sync::RwLock::new(Vec::new())),
-            open_orders: Arc::new(std::sync::RwLock::new(Vec::new())),
-            recent_signals: Arc::new(std::sync::RwLock::new(Vec::new())),
-            price_history: Arc::new(std::sync::RwLock::new(Vec::new())),
-            pnl_history: Arc::new(std::sync::RwLock::new(Vec::new())),
-            order_book: Arc::new(std::sync::RwLock::new(OrderBookView {
+            system_mode: Arc::new(parking_lot::RwLock::new(SystemMode::Initializing)),
+            btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
+            btc_balance: Arc::new(parking_lot::RwLock::new(0.0)),
+            usd_balance: Arc::new(parking_lot::RwLock::new(0.0)),
+            daily_pnl: Arc::new(parking_lot::RwLock::new(0.0)),
+            daily_pnl_pct: Arc::new(parking_lot::RwLock::new(0.0)),
+            total_pnl: Arc::new(parking_lot::RwLock::new(0.0)),
+            exposure_pct: Arc::new(parking_lot::RwLock::new(0.0)),
+            daily_drawdown_pct: Arc::new(parking_lot::RwLock::new(0.0)),
+            ofi: Arc::new(parking_lot::RwLock::new(0.0)),
+            volatility: Arc::new(parking_lot::RwLock::new(0.0)),
+            spread: Arc::new(parking_lot::RwLock::new(0.0)),
+            recent_trades: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            open_orders: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            recent_signals: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            price_history: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            pnl_history: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            order_book: Arc::new(parking_lot::RwLock::new(OrderBookView {
                 bids: Vec::new(),
                 asks: Vec::new(),
                 spread: 0.0,
                 mid_price: 0.0,
             })),
-            consecutive_losses: Arc::new(std::sync::RwLock::new(0)),
-            trades_today: Arc::new(std::sync::RwLock::new(0)),
-            win_rate: Arc::new(std::sync::RwLock::new(0.0)),
-            best_trade: Arc::new(std::sync::RwLock::new(0.0)),
-            worst_trade: Arc::new(std::sync::RwLock::new(0.0)),
-            avg_trade_size: Arc::new(std::sync::RwLock::new(0.0)),
+            consecutive_losses: Arc::new(parking_lot::RwLock::new(0)),
+            trades_today: Arc::new(parking_lot::RwLock::new(0)),
+            win_rate: Arc::new(parking_lot::RwLock::new(0.0)),
+            best_trade: Arc::new(parking_lot::RwLock::new(0.0)),
+            worst_trade: Arc::new(parking_lot::RwLock::new(0.0)),
+            avg_trade_size: Arc::new(parking_lot::RwLock::new(0.0)),
             start_time: Utc::now(),
         }
     }
@@ -200,37 +200,37 @@ impl DashboardState {
         let uptime = (Utc::now() - self.start_time).num_seconds().max(0) as u64;
 
         DashboardSnapshot {
-            system_mode: format!("{:?}", *self.system_mode.read().unwrap()),
-            btc_price: *self.btc_price.read().unwrap(),
-            btc_balance: *self.btc_balance.read().unwrap(),
-            usd_balance: *self.usd_balance.read().unwrap(),
-            daily_pnl: *self.daily_pnl.read().unwrap(),
-            daily_pnl_pct: *self.daily_pnl_pct.read().unwrap(),
-            total_pnl: *self.total_pnl.read().unwrap(),
-            exposure_pct: *self.exposure_pct.read().unwrap(),
-            daily_drawdown_pct: *self.daily_drawdown_pct.read().unwrap(),
-            ofi: *self.ofi.read().unwrap(),
-            volatility: *self.volatility.read().unwrap(),
-            spread: *self.spread.read().unwrap(),
-            recent_trades: self.recent_trades.read().unwrap().clone(),
-            open_orders: self.open_orders.read().unwrap().clone(),
-            recent_signals: self.recent_signals.read().unwrap().clone(),
-            price_history: self.price_history.read().unwrap().clone(),
-            pnl_history: self.pnl_history.read().unwrap().clone(),
-            order_book: self.order_book.read().unwrap().clone(),
-            consecutive_losses: *self.consecutive_losses.read().unwrap(),
-            trades_today: *self.trades_today.read().unwrap(),
-            win_rate: *self.win_rate.read().unwrap(),
-            best_trade: *self.best_trade.read().unwrap(),
-            worst_trade: *self.worst_trade.read().unwrap(),
-            avg_trade_size: *self.avg_trade_size.read().unwrap(),
+            system_mode: format!("{:?}", *self.system_mode.read()),
+            btc_price: *self.btc_price.read(),
+            btc_balance: *self.btc_balance.read(),
+            usd_balance: *self.usd_balance.read(),
+            daily_pnl: *self.daily_pnl.read(),
+            daily_pnl_pct: *self.daily_pnl_pct.read(),
+            total_pnl: *self.total_pnl.read(),
+            exposure_pct: *self.exposure_pct.read(),
+            daily_drawdown_pct: *self.daily_drawdown_pct.read(),
+            ofi: *self.ofi.read(),
+            volatility: *self.volatility.read(),
+            spread: *self.spread.read(),
+            recent_trades: self.recent_trades.read().clone(),
+            open_orders: self.open_orders.read().clone(),
+            recent_signals: self.recent_signals.read().clone(),
+            price_history: self.price_history.read().clone(),
+            pnl_history: self.pnl_history.read().clone(),
+            order_book: self.order_book.read().clone(),
+            consecutive_losses: *self.consecutive_losses.read(),
+            trades_today: *self.trades_today.read(),
+            win_rate: *self.win_rate.read(),
+            best_trade: *self.best_trade.read(),
+            worst_trade: *self.worst_trade.read(),
+            avg_trade_size: *self.avg_trade_size.read(),
             uptime_seconds: uptime,
         }
     }
 
     /// Add a trade to the recent trades list
     pub fn add_trade(&self, trade: TradeView) {
-        let mut trades = self.recent_trades.write().unwrap();
+        let mut trades = self.recent_trades.write();
         trades.insert(0, trade);
         if trades.len() > 100 {
             trades.truncate(100);
@@ -239,7 +239,7 @@ impl DashboardState {
 
     /// Add a signal to the recent signals list
     pub fn add_signal(&self, signal: SignalView) {
-        let mut signals = self.recent_signals.write().unwrap();
+        let mut signals = self.recent_signals.write();
         signals.insert(0, signal);
         if signals.len() > 50 {
             signals.truncate(50);
@@ -248,7 +248,7 @@ impl DashboardState {
 
     /// Add a price point to history
     pub fn add_price_point(&self, price: f64) {
-        let mut history = self.price_history.write().unwrap();
+        let mut history = self.price_history.write();
         history.push(PricePoint {
             price,
             timestamp: Utc::now().to_rfc3339(),
@@ -260,7 +260,7 @@ impl DashboardState {
 
     /// Add a P&L point to history
     pub fn add_pnl_point(&self, pnl: f64) {
-        let mut history = self.pnl_history.write().unwrap();
+        let mut history = self.pnl_history.write();
         history.push(PnlPoint {
             pnl,
             timestamp: Utc::now().to_rfc3339(),

@@ -1,0 +1,24 @@
+[system]
+reload_interval_seconds = 61
+
+[trading]
+trade_size_btc = 0.0003
+max_open_orders = 3
+
+[strategy]
+entry_zone_spread_usd = 1.0
+take_profit_distance_usd = 25.0
+stop_loss_distance_usd = 50.0
+ofi_trigger_threshold = 0.5
+ofi_window_size = 100
+trade_cooldown_ms = 500
+min_confidence_score = 0.90
+
+[inventory]
+min_inventory_btc = 0.0002
+max_inventory_btc = 0.01
+
+[risk_management]
+max_slippage_bps = 5
+position_size_pct = 10.0
+daily_loss_limit_usd = 1000.0

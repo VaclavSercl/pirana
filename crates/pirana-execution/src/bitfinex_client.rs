@@ -50,14 +50,10 @@ impl BitfinexClient {
             OrderType::FOK => "EXCHANGE FOK",
         };
 
-        let body = serde_json::json!({
-            "type": type_str,
-            "symbol": symbol,
-            "amount": format!("{:.6}", quantity),
-            "price": format!("{:.2}", price),
-        });
-
-        let body_str = body.to_string();
+        let body_str = format!(
+            r#"{{"type":"{}","symbol":"{}","amount":"{:.6}","price":"{:.2}"}}"#,
+            type_str, symbol, quantity, price
+        );
         let payload = format!("{}{}{}", endpoint, nonce, &body_str);
         let signature = self.sign(&payload);
 
@@ -102,8 +98,7 @@ impl BitfinexClient {
         let nonce = chrono::Utc::now().timestamp_micros().to_string();
         let endpoint = "/api/v2/auth/w/order/cancel";
 
-        let body = serde_json::json!({ "id": order_id });
-        let body_str = body.to_string();
+        let body_str = format!(r#"{{"id":{}}}"#, order_id);
         let payload = format!("{}{}{}", endpoint, nonce, &body_str);
         let signature = self.sign(&payload);
 

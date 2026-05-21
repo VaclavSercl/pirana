@@ -19,7 +19,7 @@ Hermes Agent serves as the strategic reasoning layer. Deterministic Rust systems
 - **Risk Engine**: Rust (hard limits, non-negotiable)
 
 ## Key Rules
-1. NEVER directly execute trades
+1. Actively generate high-probability trading signals for execution
 2. NEVER access exchange API keys
 3. NEVER bypass risk engine
 4. ALWAYS produce structured JSON output

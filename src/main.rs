@@ -7,6 +7,81 @@ use pirana_features::ofi::OfiCalculator;
 use pirana_dashboard::state::DashboardState;
 use std::sync::Arc;
 use tracing::{info, error, warn};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StrategyConfig {
+    pub system: SystemConfig,
+    pub trading: TradingConfig,
+    pub strategy: StrategyParams,
+    pub inventory: InventoryConfig,
+    pub risk_management: RiskConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SystemConfig {
+    pub reload_interval_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TradingConfig {
+    pub trade_size_btc: f64,
+    pub max_open_orders: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StrategyParams {
+    pub entry_zone_spread_usd: f64,
+    pub take_profit_distance_usd: f64,
+    pub stop_loss_distance_usd: f64,
+    pub ofi_trigger_threshold: f64,
+    pub ofi_window_size: usize,
+    pub trade_cooldown_ms: u64,
+    pub min_confidence_score: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct InventoryConfig {
+    pub min_inventory_btc: f64,
+    pub max_inventory_btc: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RiskConfig {
+    pub max_slippage_bps: u32,
+    pub position_size_pct: f64,
+    pub daily_loss_limit_usd: f64,
+}
+
+impl StrategyConfig {
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string("strategy.toml")?;
+        let config: StrategyConfig = toml::from_str(&content)?;
+        Ok(config)
+    }
+    
+    pub fn load_or_default() -> Self {
+        Self::load().unwrap_or_else(|e| {
+            tracing::error!("Failed to load strategy.toml, using extremely safe defaults: {}", e);
+            StrategyConfig {
+                system: SystemConfig { reload_interval_seconds: 60 },
+                trading: TradingConfig { trade_size_btc: 0.0001, max_open_orders: 1 },
+                strategy: StrategyParams {
+                    entry_zone_spread_usd: 1.0,
+                    take_profit_distance_usd: 50.0,
+                    stop_loss_distance_usd: 50.0,
+                    ofi_trigger_threshold: 0.8,
+                    ofi_window_size: 100,
+                    trade_cooldown_ms: 1000,
+                    min_confidence_score: 0.9,
+                },
+                inventory: InventoryConfig { min_inventory_btc: 0.0, max_inventory_btc: 0.1 },
+                risk_management: RiskConfig { max_slippage_bps: 5, position_size_pct: 5.0, daily_loss_limit_usd: 100.0 },
+            }
+        })
+    }
+}
+
 
 #[tokio::main]
 async fn main() -> PiranaResult<()> {
@@ -29,8 +104,20 @@ async fn main() -> PiranaResult<()> {
     // Create shared dashboard state
     let dashboard_state = Arc::new(DashboardState::new());
 
+    let strategy_config = Arc::new(parking_lot::RwLock::new(StrategyConfig::load_or_default()));
+    let sc_clone = strategy_config.clone();
+    tokio::spawn(async move {
+        loop {
+            let interval = sc_clone.read().system.reload_interval_seconds;
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            if let Ok(new_config) = StrategyConfig::load() {
+                *sc_clone.write() = new_config;
+            }
+        }
+    });
+
     // Set initial mode
-    *dashboard_state.system_mode.write().unwrap() = pirana_core::types::SystemMode::Active;
+    *dashboard_state.system_mode.write() = pirana_core::types::SystemMode::Active;
 
     // Check exchange connectivity
     info!("Checking Bitfinex platform status...");
@@ -75,7 +162,7 @@ async fn main() -> PiranaResult<()> {
     let api_key = config.exchange.api_key.clone();
     let api_secret = config.exchange.api_secret.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_market_data_feed(state_for_feed, api_key, api_secret).await {
+        if let Err(e) = run_market_data_feed(state_for_feed, api_key, api_secret, strategy_config.clone()).await {
             error!("Market data feed error: {}", e);
         }
     });
@@ -97,7 +184,7 @@ async fn main() -> PiranaResult<()> {
 
 /// Run public market data feed from Bitfinex WebSocket
 /// Fetches ticker, order book, and trade data for dashboard display
-async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_secret: String) -> PiranaResult<()> {
+async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_secret: String, strategy_config: Arc<parking_lot::RwLock<StrategyConfig>>) -> PiranaResult<()> {
     use tokio::time::{interval, Duration, sleep};
     use tokio_tungstenite::connect_async;
     use futures::{SinkExt, StreamExt};
@@ -105,14 +192,16 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let client = BitfinexClient::new(api_key.clone(), api_secret.clone());
     if let Ok(wallets) = client.get_wallets().await {
         for w in wallets {
-            if w.asset == "BTC" { *state.btc_balance.write().unwrap() = w.free; }
-            if w.asset == "USD" { *state.usd_balance.write().unwrap() = w.free; }
+            if w.asset == "BTC" { *state.btc_balance.write() = w.free; }
+            if w.asset == "USD" { *state.usd_balance.write() = w.free; }
         }
-        tracing::info!("Wallets loaded: BTC={}, USD={}", *state.btc_balance.read().unwrap(), *state.usd_balance.read().unwrap());
+        tracing::info!("Wallets loaded: BTC={}, USD={}", *state.btc_balance.read(), *state.usd_balance.read());
     }
 
     let mut router = OrderRouter::new();
-    let mut ofi = OfiCalculator::new(10);
+    let initial_ofi_window = strategy_config.read().strategy.ofi_window_size;
+    let mut ofi = OfiCalculator::new(initial_ofi_window);
+    let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
     let mut last_price = 0.0;
 
     let url = "wss://api-pub.bitfinex.com/ws/2";
@@ -178,7 +267,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     match msg {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut router, &client, &mut last_price).await;
+                                process_ws_message(&state, data, &mut ofi, &mut router, &client, &mut last_price, &strategy_config, &mut last_trade_time).await;
                             }
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
@@ -213,7 +302,9 @@ async fn process_ws_message(
     ofi: &mut OfiCalculator,
     router: &mut OrderRouter,
     client: &BitfinexClient,
-    last_price: &mut f64
+    last_price: &mut f64,
+    strategy_config: &Arc<parking_lot::RwLock<StrategyConfig>>,
+    last_trade_time: &mut std::time::Instant,
 ) {
     if let Some(array) = data.as_array() {
         if array.len() >= 2 {
@@ -221,7 +312,7 @@ async fn process_ws_message(
             if let Some(values) = array[1].as_array() {
                 if values.len() >= 10 {
                     if let Some(price) = values[6].as_f64() {
-                        *state.btc_price.write().unwrap() = price;
+                        *state.btc_price.write() = price;
                         state.add_price_point(price);
                         *last_price = price;
                     }
@@ -250,57 +341,80 @@ async fn process_ws_message(
                                 
                                 ofi.process_tick(&tick, *last_price);
                                 
+                                let conf = strategy_config.read().clone();
+                                
+                                // Cooldown check
+                                if last_trade_time.elapsed().as_millis() < conf.strategy.trade_cooldown_ms as u128 {
+                                    return; // Cooldown active
+                                }
+                                
+                                let current_btc = *state.btc_balance.read();
+                                
+                                // Adjust OFI threshold
+                                // Since OFI returns bool right now, we assume it triggers if the internal threshold is met.
+                                // If OfiCalculator is hardcoded, we will just rely on its internal bool for now, but apply cooldowns.
+                                
                                 if ofi.is_buying_pressure() {
+                                    if current_btc >= conf.inventory.max_inventory_btc {
+                                        tracing::warn!("Max BTC inventory reached ({}), skipping BUY", current_btc);
+                                        return;
+                                    }
                                     let p = SignalParams {
-                                        entry_zone: (price - 1.0, price + 1.0),
-                                        invalidation_level: price - 100.0,
-                                        volatility_adjusted_tp: price + 100.0,
-                                        position_size_pct: 10.0,
-                                        max_slippage_bps: 10,
+                                        entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
+                                        invalidation_level: price - conf.strategy.stop_loss_distance_usd,
+                                        volatility_adjusted_tp: price + conf.strategy.take_profit_distance_usd,
+                                        position_size_pct: conf.risk_management.position_size_pct,
+                                        max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::SpreadCapture,
                                         target_asset: Symbol::new("tBTCUSD"),
-                                        confidence_score: 0.9,
+                                        confidence_score: conf.strategy.min_confidence_score,
                                         market_regime: MarketRegime::HighVolatilityTrending,
                                         rationale: "OFI Buying Pressure".to_string(),
-                                        recommended_params: p,
+                                        recommended_params: p.clone(),
                                         timestamp: chrono::Utc::now(),
-                                        invalidation_level: price - 100.0,
+                                        invalidation_level: p.invalidation_level,
                                     };
                                     
                                     if let Ok(_) = router.create_order(&sig, price) {
-                                        tracing::info!("OFI Buying Pressure -> Submitting BUY order");
-                                        let _ = client.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Market, 0.0002, price).await;
+                                        tracing::info!("OFI Buying Pressure -> Submitting BUY order for {} BTC", conf.trading.trade_size_btc);
+                                        let _ = client.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Market, conf.trading.trade_size_btc, price).await;
                                         ofi.reset();
-                                        *state.trades_today.write().unwrap() += 1;
+                                        *state.trades_today.write() += 1;
+                                        *last_trade_time = std::time::Instant::now();
                                     }
                                 } else if ofi.is_selling_pressure() {
+                                    if current_btc <= conf.inventory.min_inventory_btc {
+                                        tracing::warn!("Min BTC inventory reached ({}), skipping SELL", current_btc);
+                                        return;
+                                    }
                                     let p = SignalParams {
-                                        entry_zone: (price - 1.0, price + 1.0),
-                                        invalidation_level: price + 100.0,
-                                        volatility_adjusted_tp: price - 100.0,
-                                        position_size_pct: 10.0,
-                                        max_slippage_bps: 10,
+                                        entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
+                                        invalidation_level: price + conf.strategy.stop_loss_distance_usd,
+                                        volatility_adjusted_tp: price - conf.strategy.take_profit_distance_usd,
+                                        position_size_pct: conf.risk_management.position_size_pct,
+                                        max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::DistributionExit,
                                         target_asset: Symbol::new("tBTCUSD"),
-                                        confidence_score: 0.9,
+                                        confidence_score: conf.strategy.min_confidence_score,
                                         market_regime: MarketRegime::HighVolatilityTrending,
                                         rationale: "OFI Selling Pressure".to_string(),
-                                        recommended_params: p,
+                                        recommended_params: p.clone(),
                                         timestamp: chrono::Utc::now(),
-                                        invalidation_level: price + 100.0,
+                                        invalidation_level: p.invalidation_level,
                                     };
                                     
                                     if let Ok(_) = router.create_order(&sig, price) {
-                                        tracing::info!("OFI Selling Pressure -> Submitting SELL order");
-                                        let _ = client.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Market, -0.0002, price).await;
+                                        tracing::info!("OFI Selling Pressure -> Submitting SELL order for {} BTC", conf.trading.trade_size_btc);
+                                        let _ = client.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Market, -conf.trading.trade_size_btc, price).await;
                                         ofi.reset();
-                                        *state.trades_today.write().unwrap() += 1;
+                                        *state.trades_today.write() += 1;
+                                        *last_trade_time = std::time::Instant::now();
                                     }
                                 }
                             }
