@@ -726,21 +726,26 @@ async fn process_ws_message(
                                                         
                                                         // Record metrics in risk engine
                                                         risk_engine.update_exposure(-assessment.adjusted_position_size);
-                                                        risk_engine.record_trade_result(0.0); // Simple record for drawdown/counter tracking
+
+                                                        // Track active position for TP/SL monitoring
+                                                        // Instead of adding a SELL position (short) in Spot trading, we remove the oldest BUY position from active_positions
+                                                        let mut realized_pnl = 0.0;
+                                                        {
+                                                            let mut positions = active_positions.write();
+                                                            if let Some(idx) = positions.iter().position(|p| p.side == Side::Buy) {
+                                                                let closed_pos = positions.remove(idx);
+                                                                realized_pnl = (price - closed_pos.entry_price) * closed_pos.quantity;
+                                                                tracing::info!("OFI Selling Pressure closed BUY position (entry price: {}, qty: {:.6}). Realized PnL: {:.2} USD", closed_pos.entry_price, closed_pos.quantity, realized_pnl);
+                                                            } else {
+                                                                tracing::warn!("OFI Selling Pressure executed SELL, but no open BUY positions were tracked in memory!");
+                                                            }
+                                                        }
+
+                                                        risk_engine.record_trade_result(realized_pnl);
 
                                                         // Update balances locally in state
                                                         *state.btc_balance.write() -= final_trade_size;
                                                         *state.usd_balance.write() += final_trade_size * price;
-
-                                                        // Track active position for TP/SL monitoring
-                                                        active_positions.write().push(ActivePosition {
-                                                            entry_price: price,
-                                                            quantity: final_trade_size,
-                                                            side: Side::Sell,
-                                                            tp_price: price - conf.strategy.take_profit_distance_usd,
-                                                            sl_price: price + conf.strategy.stop_loss_distance_usd,
-                                                            exposure_size: assessment.adjusted_position_size,
-                                                        });
 
                                                         // Sync risk metrics to dashboard state
                                                         *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
@@ -755,7 +760,7 @@ async fn process_ws_message(
                                                             side: "SELL".to_string(),
                                                             price,
                                                             quantity: final_trade_size,
-                                                            pnl: 0.0,
+                                                            pnl: realized_pnl,
                                                             timestamp: chrono::Utc::now().to_rfc3339(),
                                                             order_type: "MARKET".to_string(),
                                                         });
