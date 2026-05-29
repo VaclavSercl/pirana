@@ -1,10 +1,12 @@
 use pirana_config::settings::PiranaConfig;
 use pirana_core::errors::PiranaResult;
-use pirana_core::types::{Signal, SignalType, SignalParams, Symbol, Side, Tick, MarketRegime};
+use pirana_core::types::{Signal, SignalType, SignalParams, Symbol, Side, Tick, MarketRegime, OrderStatus};
 use pirana_execution::bitfinex_client::BitfinexClient;
 use pirana_execution::order_router::OrderRouter;
 use pirana_features::ofi::OfiCalculator;
 use pirana_dashboard::state::DashboardState;
+use pirana_signal_validator::validator::{SignalValidator, ValidationResult};
+use pirana_risk_engine::engine::RiskEngine;
 use std::sync::Arc;
 use tracing::{info, error, warn};
 use serde::Deserialize;
@@ -204,6 +206,31 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
     let mut last_price = 0.0;
 
+    let mut validator = SignalValidator::new();
+    let btc_bal = *state.btc_balance.read();
+    let usd_bal = *state.usd_balance.read();
+    let initial_price = if *state.btc_price.read() > 0.0 { *state.btc_price.read() } else { 73000.0 };
+    let initial_balance = btc_bal * initial_price + usd_bal;
+    let risk_engine = RiskEngine::new(if initial_balance > 0.0 { initial_balance } else { 1000.0 });
+    risk_engine.activate();
+
+    // Spawn a permanent, background balance reconciliation task (every 30 seconds)
+    // to prevent virtual wallet balance drift on the dashboard and in PnL calculations
+    let client_for_reconciliation = BitfinexClient::new(api_key.clone(), api_secret.clone());
+    let state_for_reconciliation = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Ok(wallets) = client_for_reconciliation.get_wallets().await {
+                for w in wallets {
+                    if w.asset == "BTC" { *state_for_reconciliation.btc_balance.write() = w.free; }
+                    if w.asset == "USD" { *state_for_reconciliation.usd_balance.write() = w.free; }
+                }
+                tracing::debug!("Wallet balances reconciled with Bitfinex successfully.");
+            }
+        }
+    });
+
     let url = "wss://api-pub.bitfinex.com/ws/2";
 
     loop {
@@ -267,7 +294,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     match msg {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut router, &client, &mut last_price, &strategy_config, &mut last_trade_time).await;
+                                process_ws_message(&state, data, &mut ofi, &mut router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time).await;
                             }
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
@@ -301,6 +328,8 @@ async fn process_ws_message(
     data: serde_json::Value,
     ofi: &mut OfiCalculator,
     router: &mut OrderRouter,
+    validator: &mut SignalValidator,
+    risk_engine: &RiskEngine,
     client: &BitfinexClient,
     last_price: &mut f64,
     strategy_config: &Arc<parking_lot::RwLock<StrategyConfig>>,
@@ -315,6 +344,26 @@ async fn process_ws_message(
                         *state.btc_price.write() = price;
                         state.add_price_point(price);
                         *last_price = price;
+
+                        // Dynamically initialize starting equity if not set
+                        let mut start_eq = state.starting_equity.write();
+                        if *start_eq == 0.0 && price > 0.0 {
+                            *start_eq = *state.btc_balance.read() * price + *state.usd_balance.read();
+                            tracing::info!("Starting equity dynamically set to: {:.2} USD", *start_eq);
+                        }
+
+                        // Recalculate and update PnL on every ticker price tick
+                        let start_eq_val = *start_eq;
+                        if start_eq_val > 0.0 {
+                            let current_equity = *state.btc_balance.read() * price + *state.usd_balance.read();
+                            let pnl_usd = current_equity - start_eq_val;
+                            let pnl_pct = (pnl_usd / start_eq_val) * 100.0;
+                            
+                            *state.daily_pnl.write() = pnl_usd;
+                            *state.daily_pnl_pct.write() = pnl_pct;
+                            *state.total_pnl.write() = pnl_usd;
+                            state.add_pnl_point(pnl_usd);
+                        }
                     }
                 }
             }
@@ -350,10 +399,6 @@ async fn process_ws_message(
                                 
                                 let current_btc = *state.btc_balance.read();
                                 
-                                // Adjust OFI threshold
-                                // Since OFI returns bool right now, we assume it triggers if the internal threshold is met.
-                                // If OfiCalculator is hardcoded, we will just rely on its internal bool for now, but apply cooldowns.
-                                
                                 if ofi.is_buying_pressure() {
                                     if current_btc >= conf.inventory.max_inventory_btc {
                                         tracing::warn!("Max BTC inventory reached ({}), skipping BUY", current_btc);
@@ -363,7 +408,7 @@ async fn process_ws_message(
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
                                         invalidation_level: price - conf.strategy.stop_loss_distance_usd,
                                         volatility_adjusted_tp: price + conf.strategy.take_profit_distance_usd,
-                                        position_size_pct: conf.risk_management.position_size_pct,
+                                        position_size_pct: conf.risk_management.position_size_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
                                     let sig = Signal {
@@ -378,12 +423,107 @@ async fn process_ws_message(
                                         invalidation_level: p.invalidation_level,
                                     };
                                     
-                                    if let Ok(_) = router.create_order(&sig, price) {
-                                        tracing::info!("OFI Buying Pressure -> Submitting BUY order for {} BTC", conf.trading.trade_size_btc);
-                                        let _ = client.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Market, conf.trading.trade_size_btc, price).await;
-                                        ofi.reset();
-                                        *state.trades_today.write() += 1;
-                                        *last_trade_time = std::time::Instant::now();
+                                    // Add signal to dashboard state (initially not executed)
+                                    let signal_view = pirana_dashboard::state::SignalView {
+                                        id: sig.id.0.to_string(),
+                                        signal_type: format!("{:?}", sig.signal_type),
+                                        confidence: sig.confidence_score,
+                                        regime: format!("{:?}", sig.market_regime),
+                                        rationale: sig.rationale.clone(),
+                                        timestamp: sig.timestamp.to_rfc3339(),
+                                        executed: false,
+                                    };
+
+                                    // 1. Validate Signal
+                                    match validator.validate(&sig) {
+                                        Ok(ValidationResult::Approved { .. }) => {}
+                                        Ok(other) => {
+                                            tracing::warn!("Signal rejected by validator: {:?}", other);
+                                            state.add_signal(signal_view);
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Validator error: {}", e);
+                                            state.add_signal(signal_view);
+                                            return;
+                                        }
+                                    }
+
+                                    // 2. Evaluate in Risk Engine
+                                    match risk_engine.evaluate_trade(&sig, price) {
+                                        Ok(assessment) if assessment.approved => {
+                                            // Calculate dynamic size
+                                            let current_usd = *state.usd_balance.read();
+                                            let total_portfolio_usd = current_btc * price + current_usd;
+                                            let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
+                                            let final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+
+                                            let required_usd = final_trade_size * price;
+                                            if current_usd < required_usd {
+                                                tracing::warn!("Insufficient USD balance ({:.2} < {:.2}) for dynamic BUY {:.6} BTC", current_usd, required_usd, final_trade_size);
+                                                state.add_signal(signal_view);
+                                                return;
+                                            }
+
+                                            if let Ok(order_id) = router.create_order(&sig, price) {
+                                                tracing::info!("OFI Buying Pressure -> Submitting BUY order for {:.6} BTC", final_trade_size);
+                                                
+                                                match client.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Market, final_trade_size, price).await {
+                                                    Ok(_) => {
+                                                        // Update router state (MARKET order filled immediately)
+                                                        let _ = router.update_order(order_id, OrderStatus::Filled, final_trade_size, price, None);
+                                                        
+                                                        // Record metrics in risk engine
+                                                        risk_engine.update_exposure(assessment.adjusted_position_size);
+                                                        
+                                                        // Update balances locally in state
+                                                        *state.btc_balance.write() += final_trade_size;
+                                                        *state.usd_balance.write() -= required_usd;
+
+                                                        // Sync risk metrics to dashboard state
+                                                        *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
+                                                        *state.consecutive_losses.write() = assessment.consecutive_losses;
+                                                        *state.system_mode.write() = risk_engine.mode();
+                                                        *state.exposure_pct.write() = assessment.current_exposure_pct * 100.0;
+
+                                                        // Add trade to dashboard state
+                                                        state.add_trade(pirana_dashboard::state::TradeView {
+                                                            id: order_id.0.to_string(),
+                                                            symbol: "tBTCUSD".to_string(),
+                                                            side: "BUY".to_string(),
+                                                            price,
+                                                            quantity: final_trade_size,
+                                                            pnl: 0.0,
+                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            order_type: "MARKET".to_string(),
+                                                        });
+
+                                                        ofi.reset();
+                                                        *state.trades_today.write() += 1;
+                                                        *last_trade_time = std::time::Instant::now();
+
+                                                        // Add executed signal to dashboard state
+                                                        let mut executed_view = signal_view.clone();
+                                                        executed_view.executed = true;
+                                                        state.add_signal(executed_view);
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!("Bitfinex BUY order execution failed: {}", e);
+                                                        let _ = router.update_order(order_id, OrderStatus::Rejected, final_trade_size, price, None);
+                                                        state.add_signal(signal_view);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(assessment) => {
+                                            tracing::warn!("Trade rejected by Risk Engine: {:?}", assessment.rejection_reason);
+                                            *state.system_mode.write() = risk_engine.mode();
+                                            state.add_signal(signal_view);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Risk Engine error: {}", e);
+                                            state.add_signal(signal_view);
+                                        }
                                     }
                                 } else if ofi.is_selling_pressure() {
                                     if current_btc <= conf.inventory.min_inventory_btc {
@@ -394,7 +534,7 @@ async fn process_ws_message(
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
                                         invalidation_level: price + conf.strategy.stop_loss_distance_usd,
                                         volatility_adjusted_tp: price - conf.strategy.take_profit_distance_usd,
-                                        position_size_pct: conf.risk_management.position_size_pct,
+                                        position_size_pct: conf.risk_management.position_size_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
                                     let sig = Signal {
@@ -409,12 +549,108 @@ async fn process_ws_message(
                                         invalidation_level: p.invalidation_level,
                                     };
                                     
-                                    if let Ok(_) = router.create_order(&sig, price) {
-                                        tracing::info!("OFI Selling Pressure -> Submitting SELL order for {} BTC", conf.trading.trade_size_btc);
-                                        let _ = client.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Market, -conf.trading.trade_size_btc, price).await;
-                                        ofi.reset();
-                                        *state.trades_today.write() += 1;
-                                        *last_trade_time = std::time::Instant::now();
+                                    // Add signal to dashboard state (initially not executed)
+                                    let signal_view = pirana_dashboard::state::SignalView {
+                                        id: sig.id.0.to_string(),
+                                        signal_type: format!("{:?}", sig.signal_type),
+                                        confidence: sig.confidence_score,
+                                        regime: format!("{:?}", sig.market_regime),
+                                        rationale: sig.rationale.clone(),
+                                        timestamp: sig.timestamp.to_rfc3339(),
+                                        executed: false,
+                                    };
+
+                                    // 1. Validate Signal
+                                    match validator.validate(&sig) {
+                                        Ok(ValidationResult::Approved { .. }) => {}
+                                        Ok(other) => {
+                                            tracing::warn!("Signal rejected by validator: {:?}", other);
+                                            state.add_signal(signal_view);
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Validator error: {}", e);
+                                            state.add_signal(signal_view);
+                                            return;
+                                        }
+                                    }
+
+                                    // 2. Evaluate in Risk Engine
+                                    match risk_engine.evaluate_trade(&sig, price) {
+                                        Ok(assessment) if assessment.approved => {
+                                            // Calculate dynamic size
+                                            let current_usd = *state.usd_balance.read();
+                                            let total_portfolio_usd = current_btc * price + current_usd;
+                                            let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
+                                            let final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+
+                                            if current_btc < final_trade_size {
+                                                tracing::warn!("Insufficient BTC balance ({:.6} < {:.6}) for dynamic SELL", current_btc, final_trade_size);
+                                                state.add_signal(signal_view);
+                                                return;
+                                            }
+
+                                            if let Ok(order_id) = router.create_order(&sig, price) {
+                                                tracing::info!("OFI Selling Pressure -> Submitting SELL order for {:.6} BTC", final_trade_size);
+                                                
+                                                // Bitfinex sells require negative quantity
+                                                match client.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Market, -final_trade_size, price).await {
+                                                    Ok(_) => {
+                                                        // Update router state (MARKET order filled immediately)
+                                                        let _ = router.update_order(order_id, OrderStatus::Filled, final_trade_size, price, None);
+                                                        
+                                                        // Record metrics in risk engine
+                                                        risk_engine.update_exposure(-assessment.adjusted_position_size);
+                                                        risk_engine.record_trade_result(0.0); // Simple record for drawdown/counter tracking
+
+                                                        // Update balances locally in state
+                                                        *state.btc_balance.write() -= final_trade_size;
+                                                        *state.usd_balance.write() += final_trade_size * price;
+
+                                                        // Sync risk metrics to dashboard state
+                                                        *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
+                                                        *state.consecutive_losses.write() = assessment.consecutive_losses;
+                                                        *state.system_mode.write() = risk_engine.mode();
+                                                        *state.exposure_pct.write() = assessment.current_exposure_pct * 100.0;
+
+                                                        // Add trade to dashboard state
+                                                        state.add_trade(pirana_dashboard::state::TradeView {
+                                                            id: order_id.0.to_string(),
+                                                            symbol: "tBTCUSD".to_string(),
+                                                            side: "SELL".to_string(),
+                                                            price,
+                                                            quantity: final_trade_size,
+                                                            pnl: 0.0,
+                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            order_type: "MARKET".to_string(),
+                                                        });
+
+                                                        ofi.reset();
+                                                        *state.trades_today.write() += 1;
+                                                        *last_trade_time = std::time::Instant::now();
+
+                                                        // Add executed signal to dashboard state
+                                                        let mut executed_view = signal_view.clone();
+                                                        executed_view.executed = true;
+                                                        state.add_signal(executed_view);
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!("Bitfinex SELL order execution failed: {}", e);
+                                                        let _ = router.update_order(order_id, OrderStatus::Rejected, final_trade_size, price, None);
+                                                        state.add_signal(signal_view);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(assessment) => {
+                                            tracing::warn!("Trade rejected by Risk Engine: {:?}", assessment.rejection_reason);
+                                            *state.system_mode.write() = risk_engine.mode();
+                                            state.add_signal(signal_view);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Risk Engine error: {}", e);
+                                            state.add_signal(signal_view);
+                                        }
                                     }
                                 }
                             }

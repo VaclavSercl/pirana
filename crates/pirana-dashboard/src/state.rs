@@ -56,6 +56,8 @@ pub struct DashboardState {
     pub worst_trade: Arc<parking_lot::RwLock<f64>>,
     /// Average trade size
     pub avg_trade_size: Arc<parking_lot::RwLock<f64>>,
+    /// Starting portfolio equity in USD
+    pub starting_equity: Arc<parking_lot::RwLock<f64>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -156,6 +158,7 @@ pub struct DashboardSnapshot {
     pub best_trade: f64,
     pub worst_trade: f64,
     pub avg_trade_size: f64,
+    pub starting_equity: f64,
     pub uptime_seconds: u64,
 }
 
@@ -191,6 +194,7 @@ impl DashboardState {
             best_trade: Arc::new(parking_lot::RwLock::new(0.0)),
             worst_trade: Arc::new(parking_lot::RwLock::new(0.0)),
             avg_trade_size: Arc::new(parking_lot::RwLock::new(0.0)),
+            starting_equity: Arc::new(parking_lot::RwLock::new(0.0)),
             start_time: Utc::now(),
         }
     }
@@ -224,6 +228,7 @@ impl DashboardState {
             best_trade: *self.best_trade.read(),
             worst_trade: *self.worst_trade.read(),
             avg_trade_size: *self.avg_trade_size.read(),
+            starting_equity: *self.starting_equity.read(),
             uptime_seconds: uptime,
         }
     }

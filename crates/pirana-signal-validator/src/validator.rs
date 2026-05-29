@@ -66,13 +66,13 @@ impl SignalValidator {
 
         // Validate position size
         if signal.recommended_params.position_size_pct <= 0.0
-            || signal.recommended_params.position_size_pct > MAX_SINGLE_TRADE_RISK
+            || signal.recommended_params.position_size_pct > MAX_AGGREGATE_EXPOSURE
         {
             self.rejected_signals += 1;
             return Ok(ValidationResult::Rejected {
                 reason: format!(
-                    "Position size {:.4} outside allowed range",
-                    signal.recommended_params.position_size_pct
+                    "Position size {:.4} outside allowed range (max exposure is {:.2})",
+                    signal.recommended_params.position_size_pct, MAX_AGGREGATE_EXPOSURE
                 ),
             });
         }

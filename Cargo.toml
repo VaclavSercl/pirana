@@ -112,8 +112,8 @@ futures = { workspace = true }
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = true
 

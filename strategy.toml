@@ -2,7 +2,7 @@
 reload_interval_seconds = 61
 
 [trading]
-trade_size_btc = 0.0003
+trade_size_btc = 0.0005
 max_open_orders = 3
 
 [strategy]

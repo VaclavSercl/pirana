@@ -143,9 +143,19 @@ impl RiskEngine {
             });
         }
 
-        // Check aggregate exposure
-        let proposed_exposure = state.aggregate_exposure + signal.recommended_params.position_size_pct;
-        if proposed_exposure > MAX_AGGREGATE_EXPOSURE {
+        // Check aggregate exposure (only restrict increases in exposure, sells always reduce risk)
+        let is_sell = match signal.signal_type {
+            SignalType::DistributionExit => true,
+            _ => false,
+        };
+
+        let proposed_exposure = if is_sell {
+            (state.aggregate_exposure - signal.recommended_params.position_size_pct).max(0.0)
+        } else {
+            state.aggregate_exposure + signal.recommended_params.position_size_pct
+        };
+
+        if !is_sell && proposed_exposure > MAX_AGGREGATE_EXPOSURE {
             return Ok(RiskAssessment {
                 approved: false,
                 rejection_reason: Some(format!(
@@ -161,16 +171,24 @@ impl RiskEngine {
             });
         }
 
-        // Check single trade risk
-        if signal.recommended_params.position_size_pct > MAX_SINGLE_TRADE_RISK {
+        // Check single trade risk: Risk = Position Size * (Distance to Stop Loss / Price)
+        let stop_loss_pct = if current_price > 0.0 {
+            ((current_price - signal.invalidation_level) / current_price).abs()
+        } else {
+            0.0
+        };
+        let single_trade_risk = signal.recommended_params.position_size_pct * stop_loss_pct;
+        if single_trade_risk > MAX_SINGLE_TRADE_RISK {
             return Ok(RiskAssessment {
                 approved: false,
                 rejection_reason: Some(format!(
-                    "Single trade risk {:.4}% exceeds limit {:.2}%",
+                    "Single trade risk {:.4}% exceeds limit {:.2}% (Position size: {:.2}%, SL distance: {:.2}%)",
+                    single_trade_risk * 100.0,
+                    MAX_SINGLE_TRADE_RISK * 100.0,
                     signal.recommended_params.position_size_pct * 100.0,
-                    MAX_SINGLE_TRADE_RISK * 100.0
+                    stop_loss_pct * 100.0
                 )),
-                adjusted_position_size: MAX_SINGLE_TRADE_RISK,
+                adjusted_position_size: signal.recommended_params.position_size_pct * (MAX_SINGLE_TRADE_RISK / single_trade_risk),
                 current_exposure_pct: state.aggregate_exposure,
                 daily_drawdown_pct: state.daily_drawdown_pct,
                 weekly_drawdown_pct: state.weekly_drawdown_pct,
