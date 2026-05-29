@@ -84,6 +84,16 @@ impl StrategyConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ActivePosition {
+    pub entry_price: f64,
+    pub quantity: f64,
+    pub side: Side,
+    pub tp_price: f64,
+    pub sl_price: f64,
+    pub exposure_size: f64,
+}
+
 
 #[tokio::main]
 async fn main() -> PiranaResult<()> {
@@ -214,6 +224,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let risk_engine = RiskEngine::new(if initial_balance > 0.0 { initial_balance } else { 1000.0 });
     risk_engine.activate();
 
+    let active_positions = Arc::new(parking_lot::RwLock::new(Vec::<ActivePosition>::new()));
+
     // Spawn a permanent, background balance reconciliation task (every 30 seconds)
     // to prevent virtual wallet balance drift on the dashboard and in PnL calculations
     let client_for_reconciliation = BitfinexClient::new(api_key.clone(), api_secret.clone());
@@ -294,7 +306,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     match msg {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time).await;
+                                process_ws_message(&state, data, &mut ofi, &mut router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions).await;
                             }
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
@@ -334,6 +346,7 @@ async fn process_ws_message(
     last_price: &mut f64,
     strategy_config: &Arc<parking_lot::RwLock<StrategyConfig>>,
     last_trade_time: &mut std::time::Instant,
+    active_positions: &Arc<parking_lot::RwLock<Vec<ActivePosition>>>,
 ) {
     if let Some(array) = data.as_array() {
         if array.len() >= 2 {
@@ -344,6 +357,108 @@ async fn process_ws_message(
                         *state.btc_price.write() = price;
                         state.add_price_point(price);
                         *last_price = price;
+
+                        // Check active positions for Take Profit / Stop Loss
+                        let mut positions_to_close = Vec::new();
+                        {
+                            let mut positions = active_positions.write();
+                            let mut i = 0;
+                            while i < positions.len() {
+                                let pos = &positions[i];
+                                let mut should_close = false;
+                                match pos.side {
+                                    Side::Buy => {
+                                        if price >= pos.tp_price {
+                                            tracing::info!("🎯 BUY Position Take Profit hit! Price {} >= TP {}", price, pos.tp_price);
+                                            should_close = true;
+                                        } else if price <= pos.sl_price {
+                                            tracing::warn!("🛑 BUY Position Stop Loss hit! Price {} <= SL {}", price, pos.sl_price);
+                                            should_close = true;
+                                        }
+                                    }
+                                    Side::Sell => {
+                                        if price <= pos.tp_price {
+                                            tracing::info!("🎯 SELL Position Take Profit hit! Price {} <= TP {}", price, pos.tp_price);
+                                            should_close = true;
+                                        } else if price >= pos.sl_price {
+                                            tracing::warn!("🛑 SELL Position Stop Loss hit! Price {} >= SL {}", price, pos.sl_price);
+                                            should_close = true;
+                                        }
+                                    }
+                                }
+
+                                if should_close {
+                                    positions_to_close.push(positions.remove(i));
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+
+                        // Close positions
+                        for pos in positions_to_close {
+                            let close_side = match pos.side {
+                                Side::Buy => Side::Sell,
+                                Side::Sell => Side::Buy,
+                            };
+                            let sign = match close_side {
+                                Side::Buy => 1.0,
+                                Side::Sell => -1.0,
+                            };
+
+                            tracing::info!("Executing MARKET {:?} order for {:.6} BTC to close position (entry price: {})", close_side, pos.quantity, pos.entry_price);
+
+                            match client.submit_order("tBTCUSD", close_side.clone(), pirana_core::types::OrderType::Market, sign * pos.quantity, price).await {
+                                Ok(_) => {
+                                    // Record metrics in risk engine
+                                    let exposure_delta = match pos.side {
+                                        Side::Buy => -pos.exposure_size,
+                                        Side::Sell => pos.exposure_size,
+                                    };
+                                    risk_engine.update_exposure(exposure_delta);
+
+                                    // Calculate actual realized PnL
+                                    let pnl = match pos.side {
+                                        Side::Buy => (price - pos.entry_price) * pos.quantity,
+                                        Side::Sell => (pos.entry_price - price) * pos.quantity,
+                                    };
+                                    risk_engine.record_trade_result(pnl);
+
+                                    // Update balances locally in state
+                                    match close_side {
+                                        Side::Buy => {
+                                            *state.btc_balance.write() += pos.quantity;
+                                            *state.usd_balance.write() -= pos.quantity * price;
+                                        }
+                                        Side::Sell => {
+                                            *state.btc_balance.write() -= pos.quantity;
+                                            *state.usd_balance.write() += pos.quantity * price;
+                                        }
+                                    }
+
+                                    *state.trades_today.write() += 1;
+
+                                    // Add trade to dashboard state
+                                    state.add_trade(pirana_dashboard::state::TradeView {
+                                        id: pirana_core::types::SignalId::new().0.to_string(),
+                                        symbol: "tBTCUSD".to_string(),
+                                        side: format!("{:?}", close_side).to_uppercase(),
+                                        price,
+                                        quantity: pos.quantity,
+                                        pnl,
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        order_type: "MARKET".to_string(),
+                                    });
+
+                                    tracing::info!("Position closed successfully. PnL: {:.2} USD", pnl);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to close position: {}", e);
+                                    // Put the position back to try again next tick
+                                    active_positions.write().push(pos);
+                                }
+                            }
+                        }
 
                         // Dynamically initialize starting equity if not set
                         let mut start_eq = state.starting_equity.write();
@@ -480,6 +595,16 @@ async fn process_ws_message(
                                                         *state.btc_balance.write() += final_trade_size;
                                                         *state.usd_balance.write() -= required_usd;
 
+                                                        // Track active position for TP/SL monitoring
+                                                        active_positions.write().push(ActivePosition {
+                                                            entry_price: price,
+                                                            quantity: final_trade_size,
+                                                            side: Side::Buy,
+                                                            tp_price: price + conf.strategy.take_profit_distance_usd,
+                                                            sl_price: price - conf.strategy.stop_loss_distance_usd,
+                                                            exposure_size: assessment.adjusted_position_size,
+                                                        });
+
                                                         // Sync risk metrics to dashboard state
                                                         *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
                                                         *state.consecutive_losses.write() = assessment.consecutive_losses;
@@ -606,6 +731,16 @@ async fn process_ws_message(
                                                         // Update balances locally in state
                                                         *state.btc_balance.write() -= final_trade_size;
                                                         *state.usd_balance.write() += final_trade_size * price;
+
+                                                        // Track active position for TP/SL monitoring
+                                                        active_positions.write().push(ActivePosition {
+                                                            entry_price: price,
+                                                            quantity: final_trade_size,
+                                                            side: Side::Sell,
+                                                            tp_price: price - conf.strategy.take_profit_distance_usd,
+                                                            sl_price: price + conf.strategy.stop_loss_distance_usd,
+                                                            exposure_size: assessment.adjusted_position_size,
+                                                        });
 
                                                         // Sync risk metrics to dashboard state
                                                         *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
