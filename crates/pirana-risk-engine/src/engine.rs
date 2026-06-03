@@ -7,7 +7,7 @@ use tracing::{info, warn, error};
 
 /// Central risk engine — enforces ALL risk limits
 /// This is the FINAL gate before any order reaches the exchange.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RiskEngine {
     state: Arc<RwLock<RiskState>>,
 }

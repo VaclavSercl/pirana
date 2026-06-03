@@ -9,6 +9,7 @@ use tracing::{info, debug, error};
 type HmacSha384 = Hmac<Sha384>;
 
 /// Bitfinex REST API client for order execution
+#[derive(Clone)]
 pub struct BitfinexClient {
     client: Client,
     base_url: String,
