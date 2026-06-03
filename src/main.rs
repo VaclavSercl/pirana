@@ -445,6 +445,18 @@ async fn process_ws_message(
 
                                         *state_clone.trades_today.write() += 1;
 
+                                        // Update daily_pnl in dashboard state!
+                                        {
+                                            let mut daily_pnl = state_clone.daily_pnl.write();
+                                            *daily_pnl += pnl;
+                                            *state_clone.total_pnl.write() += pnl;
+                                            let start_eq = *state_clone.starting_equity.read();
+                                            if start_eq > 0.0 {
+                                                *state_clone.daily_pnl_pct.write() = (*daily_pnl / start_eq) * 100.0;
+                                            }
+                                            state_clone.add_pnl_point(*daily_pnl);
+                                        }
+
                                         // Add trade to dashboard state
                                         state_clone.add_trade(pirana_dashboard::state::TradeView {
                                             id: pirana_core::types::SignalId::new().0.to_string(),
@@ -475,18 +487,7 @@ async fn process_ws_message(
                             tracing::info!("Starting equity dynamically set to: {:.2} USD", *start_eq);
                         }
 
-                        // Recalculate and update PnL on every ticker price tick
-                        let start_eq_val = *start_eq;
-                        if start_eq_val > 0.0 {
-                            let current_equity = *state.btc_balance.read() * price + *state.usd_balance.read();
-                            let pnl_usd = current_equity - start_eq_val;
-                            let pnl_pct = (pnl_usd / start_eq_val) * 100.0;
-                            
-                            *state.daily_pnl.write() = pnl_usd;
-                            *state.daily_pnl_pct.write() = pnl_pct;
-                            *state.total_pnl.write() = pnl_usd;
-                            state.add_pnl_point(pnl_usd);
-                        }
+
                     }
                 }
             }
@@ -780,6 +781,18 @@ async fn process_ws_message(
                                                             }
 
                                                             risk_engine_clone.record_trade_result(realized_pnl);
+
+                                                            // Update daily_pnl in dashboard state!
+                                                            {
+                                                                let mut daily_pnl = state_clone.daily_pnl.write();
+                                                                *daily_pnl += realized_pnl;
+                                                                *state_clone.total_pnl.write() += realized_pnl;
+                                                                let start_eq = *state_clone.starting_equity.read();
+                                                                if start_eq > 0.0 {
+                                                                    *state_clone.daily_pnl_pct.write() = (*daily_pnl / start_eq) * 100.0;
+                                                                }
+                                                                state_clone.add_pnl_point(*daily_pnl);
+                                                            }
 
                                                             // Update balances locally in state
                                                             *state_clone.btc_balance.write() -= final_trade_size;
