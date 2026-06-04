@@ -152,6 +152,33 @@ impl RiskEngine {
             }
         }
 
+        // Determine the base position size allowed by the system mode
+        let mut position_size = if state.mode == SystemMode::Defensive {
+            signal.recommended_params.position_size_pct * 0.5
+        } else {
+            signal.recommended_params.position_size_pct
+        };
+
+        // Check single trade risk: Risk = Position Size * (Distance to Stop Loss / Price)
+        let stop_loss_pct = if current_price > 0.0 {
+            ((current_price - signal.invalidation_level) / current_price).abs()
+        } else {
+            0.0
+        };
+
+        let mut single_trade_risk = position_size * stop_loss_pct;
+
+        // If single trade risk exceeds the limit, systematically adjust (reduce) the position size down
+        if single_trade_risk > MAX_SINGLE_TRADE_RISK {
+            let reduction_factor = MAX_SINGLE_TRADE_RISK / single_trade_risk;
+            position_size *= reduction_factor;
+            single_trade_risk = position_size * stop_loss_pct;
+            warn!(
+                "Single trade risk would exceed limit. Systematically adjusted position size down by {:.2}% to fit MAX_SINGLE_TRADE_RISK",
+                (1.0 - reduction_factor) * 100.0
+            );
+        }
+
         // Check aggregate exposure (only restrict increases in exposure, sells always reduce risk)
         let is_sell = match signal.signal_type {
             SignalType::DistributionExit => true,
@@ -159,9 +186,9 @@ impl RiskEngine {
         };
 
         let proposed_exposure = if is_sell {
-            (state.aggregate_exposure - signal.recommended_params.position_size_pct).max(0.0)
+            (state.aggregate_exposure - position_size).max(0.0)
         } else {
-            state.aggregate_exposure + signal.recommended_params.position_size_pct
+            state.aggregate_exposure + position_size
         };
 
         if !is_sell && proposed_exposure > MAX_AGGREGATE_EXPOSURE {
@@ -180,43 +207,11 @@ impl RiskEngine {
             });
         }
 
-        // Check single trade risk: Risk = Position Size * (Distance to Stop Loss / Price)
-        let stop_loss_pct = if current_price > 0.0 {
-            ((current_price - signal.invalidation_level) / current_price).abs()
-        } else {
-            0.0
-        };
-        let single_trade_risk = signal.recommended_params.position_size_pct * stop_loss_pct;
-        if single_trade_risk > MAX_SINGLE_TRADE_RISK {
-            return Ok(RiskAssessment {
-                approved: false,
-                rejection_reason: Some(format!(
-                    "Single trade risk {:.4}% exceeds limit {:.2}% (Position size: {:.2}%, SL distance: {:.2}%)",
-                    single_trade_risk * 100.0,
-                    MAX_SINGLE_TRADE_RISK * 100.0,
-                    signal.recommended_params.position_size_pct * 100.0,
-                    stop_loss_pct * 100.0
-                )),
-                adjusted_position_size: signal.recommended_params.position_size_pct * (MAX_SINGLE_TRADE_RISK / single_trade_risk),
-                current_exposure_pct: state.aggregate_exposure,
-                daily_drawdown_pct: state.daily_drawdown_pct,
-                weekly_drawdown_pct: state.weekly_drawdown_pct,
-                consecutive_losses: state.consecutive_losses,
-            });
-        }
-
-        // In defensive mode, only allow reduced-size trades
-        let adjusted_size = if state.mode == SystemMode::Defensive {
-            signal.recommended_params.position_size_pct * 0.5
-        } else {
-            signal.recommended_params.position_size_pct
-        };
-
-        // All checks passed
+        // All checks passed and position size was mathematically sized to fit all risk limits
         Ok(RiskAssessment {
             approved: true,
             rejection_reason: None,
-            adjusted_position_size: adjusted_size,
+            adjusted_position_size: position_size,
             current_exposure_pct: state.aggregate_exposure,
             daily_drawdown_pct: state.daily_drawdown_pct,
             weekly_drawdown_pct: state.weekly_drawdown_pct,
