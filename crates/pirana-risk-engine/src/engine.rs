@@ -127,20 +127,29 @@ impl RiskEngine {
 
         // Check consecutive losses
         if state.consecutive_losses >= CONSECUTIVE_LOSS_THRESHOLD {
-            state.mode = SystemMode::Defensive;
-            warn!("Consecutive loss threshold reached! Entering DEFENSIVE MODE");
-            return Ok(RiskAssessment {
-                approved: false,
-                rejection_reason: Some(format!(
-                    "{} consecutive losses detected",
-                    state.consecutive_losses
-                )),
-                adjusted_position_size: 0.0,
-                current_exposure_pct: state.aggregate_exposure,
-                daily_drawdown_pct: state.daily_drawdown_pct,
-                weekly_drawdown_pct: state.weekly_drawdown_pct,
-                consecutive_losses: state.consecutive_losses,
-            });
+            if state.mode == SystemMode::Active {
+                state.mode = SystemMode::Defensive;
+                warn!("Consecutive loss threshold reached! Transitioning to DEFENSIVE MODE");
+            }
+
+            // Hard limit: If losses continue even in defensive mode and reach double threshold (10), HALT the system
+            if state.consecutive_losses >= CONSECUTIVE_LOSS_THRESHOLD * 2 {
+                state.mode = SystemMode::Halted;
+                error!("Critical consecutive loss threshold reached in defensive mode! System HALTED");
+                return Ok(RiskAssessment {
+                    approved: false,
+                    rejection_reason: Some(format!(
+                        "Critical consecutive losses limit ({} >= {}) reached — System Halted",
+                        state.consecutive_losses,
+                        CONSECUTIVE_LOSS_THRESHOLD * 2
+                    )),
+                    adjusted_position_size: 0.0,
+                    current_exposure_pct: state.aggregate_exposure,
+                    daily_drawdown_pct: state.daily_drawdown_pct,
+                    weekly_drawdown_pct: state.weekly_drawdown_pct,
+                    consecutive_losses: state.consecutive_losses,
+                });
+            }
         }
 
         // Check aggregate exposure (only restrict increases in exposure, sells always reduce risk)
@@ -223,6 +232,10 @@ impl RiskEngine {
             state.consecutive_losses += 1;
         } else {
             state.consecutive_losses = 0;
+            if state.mode == SystemMode::Defensive {
+                state.mode = SystemMode::Active;
+                info!("Risk Engine: Profitable trade recorded, automatically resuming SystemMode::Active");
+            }
         }
 
         state.daily_pnl += pnl;
