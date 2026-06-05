@@ -580,11 +580,17 @@ async fn process_ws_message(
                                             let current_usd = *state.usd_balance.read();
                                             let total_portfolio_usd = current_btc * price + current_usd;
                                             let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
-                                            let final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+                                            let mut final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
 
-                                            let required_usd = final_trade_size * price;
+                                            let mut required_usd = final_trade_size * price;
                                             if current_usd < required_usd {
-                                                tracing::warn!("Insufficient USD balance ({:.2} < {:.2}) for dynamic BUY {:.6} BTC", current_usd, required_usd, final_trade_size);
+                                                tracing::warn!("Dynamic BUY size {:.6} requires {:.2} USD, but only {:.2} USD is available. Adjusting size down.", final_trade_size, required_usd, current_usd);
+                                                final_trade_size = (current_usd / price) * 0.99; // 1% buffer for fees/slippage
+                                                required_usd = final_trade_size * price;
+                                            }
+
+                                            if final_trade_size < 0.00001 {
+                                                tracing::warn!("Adjusted BUY size {:.6} is below minimum trade limit.", final_trade_size);
                                                 state.add_signal(signal_view);
                                                 return;
                                             }
@@ -728,10 +734,15 @@ async fn process_ws_message(
                                             let current_usd = *state.usd_balance.read();
                                             let total_portfolio_usd = current_btc * price + current_usd;
                                             let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
-                                            let final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+                                            let mut final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
 
                                             if current_btc < final_trade_size {
-                                                tracing::warn!("Insufficient BTC balance ({:.6} < {:.6}) for dynamic SELL", current_btc, final_trade_size);
+                                                tracing::warn!("Dynamic SELL size {:.6} exceeds available balance ({:.6}). Adjusting size to maximum available balance.", final_trade_size, current_btc);
+                                                final_trade_size = current_btc;
+                                            }
+
+                                            if final_trade_size < 0.00001 {
+                                                tracing::warn!("Adjusted SELL size {:.6} is below minimum trade limit.", final_trade_size);
                                                 state.add_signal(signal_view);
                                                 return;
                                             }
