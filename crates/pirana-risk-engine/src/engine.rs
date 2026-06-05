@@ -36,6 +36,8 @@ struct RiskState {
     daily_drawdown_pct: f64,
     /// Weekly drawdown percentage
     weekly_drawdown_pct: f64,
+    /// Consecutive wins counter for paper trading in Halted mode
+    paper_consecutive_wins: u32,
 }
 
 impl RiskEngine {
@@ -53,6 +55,7 @@ impl RiskEngine {
                 open_positions: Vec::new(),
                 daily_drawdown_pct: 0.0,
                 weekly_drawdown_pct: 0.0,
+                paper_consecutive_wins: 0,
             })),
         }
     }
@@ -246,6 +249,29 @@ impl RiskEngine {
         }
         if state.weekly_start_balance > 0.0 {
             state.weekly_drawdown_pct = ((state.weekly_start_balance - weekly_current) / state.weekly_start_balance).max(0.0);
+        }
+    }
+
+    /// Record a paper trade result in Halted mode to track automatic recovery
+    pub fn record_paper_trade_result(&self, pnl: f64) {
+        let mut state = self.state.write();
+        if state.mode != SystemMode::Halted {
+            return;
+        }
+
+        if pnl > 0.0 {
+            state.paper_consecutive_wins += 1;
+            info!("Risk Engine [Paper]: Profitable paper trade recorded. Consecutive wins: {}/5", state.paper_consecutive_wins);
+            
+            if state.paper_consecutive_wins >= 5 {
+                state.mode = SystemMode::Active;
+                state.consecutive_losses = 0;
+                state.paper_consecutive_wins = 0;
+                error!("Risk Engine: 5 consecutive profitable paper trades achieved! System AUTOMATICALLY RESUMED to Active Mode!");
+            }
+        } else {
+            state.paper_consecutive_wins = 0;
+            info!("Risk Engine [Paper]: Unprofitable paper trade recorded. Consecutive wins reset to 0.");
         }
     }
 
