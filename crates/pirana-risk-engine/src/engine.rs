@@ -195,19 +195,35 @@ impl RiskEngine {
         };
 
         if !is_sell && proposed_exposure > MAX_AGGREGATE_EXPOSURE {
-            return Ok(RiskAssessment {
-                approved: false,
-                rejection_reason: Some(format!(
-                    "Aggregate exposure {:.2}% would exceed limit {:.2}%",
-                    proposed_exposure * 100.0,
-                    MAX_AGGREGATE_EXPOSURE * 100.0
-                )),
-                adjusted_position_size: 0.0,
-                current_exposure_pct: state.aggregate_exposure,
-                daily_drawdown_pct: state.daily_drawdown_pct,
-                weekly_drawdown_pct: state.weekly_drawdown_pct,
-                consecutive_losses: state.consecutive_losses,
-            });
+            // Dynamically scale position size down to fit remaining exposure budget
+            let remaining_budget = MAX_AGGREGATE_EXPOSURE - state.aggregate_exposure;
+
+            if remaining_budget <= 0.001 {
+                // Exposure budget fully exhausted — genuine reject
+                return Ok(RiskAssessment {
+                    approved: false,
+                    rejection_reason: Some(format!(
+                        "Aggregate exposure {:.2}% already at limit {:.2}% — no room for new positions",
+                        state.aggregate_exposure * 100.0,
+                        MAX_AGGREGATE_EXPOSURE * 100.0
+                    )),
+                    adjusted_position_size: 0.0,
+                    current_exposure_pct: state.aggregate_exposure,
+                    daily_drawdown_pct: state.daily_drawdown_pct,
+                    weekly_drawdown_pct: state.weekly_drawdown_pct,
+                    consecutive_losses: state.consecutive_losses,
+                });
+            }
+
+            // Scale position size down to fit remaining budget
+            let scaling_factor = remaining_budget / position_size;
+            position_size *= scaling_factor;
+            warn!(
+                "Position size scaled down by {:.1}% to fit exposure budget (remaining: {:.2}%, new size: {:.4}%)",
+                (1.0 - scaling_factor) * 100.0,
+                remaining_budget * 100.0,
+                position_size * 100.0
+            );
         }
 
         // All checks passed and position size was mathematically sized to fit all risk limits
@@ -284,6 +300,11 @@ impl RiskEngine {
     /// Get current system mode
     pub fn mode(&self) -> SystemMode {
         self.state.read().mode
+    }
+
+    /// Get current paper consecutive wins
+    pub fn paper_consecutive_wins(&self) -> u32 {
+        self.state.read().paper_consecutive_wins
     }
 
     /// Reset daily counters (call at day boundary)

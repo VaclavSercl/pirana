@@ -22,16 +22,29 @@ pub struct OfiCalculator {
     cumulative: f64,
     /// Last computed normalized OFI
     last_ofi: f64,
+    /// Configurable threshold for buy/sell pressure detection
+    threshold: f64,
 }
 
 impl OfiCalculator {
     pub fn new(window_size: usize) -> Self {
+        Self::with_threshold(window_size, OFI_THRESHOLD)
+    }
+
+    /// Create a new OfiCalculator with a custom threshold from strategy.toml
+    pub fn with_threshold(window_size: usize, threshold: f64) -> Self {
         Self {
             window: VecDeque::with_capacity(window_size),
             window_size,
             cumulative: 0.0,
             last_ofi: 0.0,
+            threshold,
         }
+    }
+
+    /// Update the threshold (called when strategy.toml is reloaded)
+    pub fn set_threshold(&mut self, threshold: f64) {
+        self.threshold = threshold;
     }
 
     /// Process a new tick and update OFI
@@ -78,12 +91,12 @@ impl OfiCalculator {
 
     /// Check if OFI indicates significant buying pressure
     pub fn is_buying_pressure(&self) -> bool {
-        self.last_ofi > OFI_THRESHOLD
+        self.last_ofi > self.threshold
     }
 
     /// Check if OFI indicates significant selling pressure
     pub fn is_selling_pressure(&self) -> bool {
-        self.last_ofi < -OFI_THRESHOLD
+        self.last_ofi < -self.threshold
     }
 
     /// Get the OFI trend (positive = increasing buying pressure)

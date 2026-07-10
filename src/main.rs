@@ -213,7 +213,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
     let router = Arc::new(parking_lot::Mutex::new(OrderRouter::new()));
     let initial_ofi_window = strategy_config.read().strategy.ofi_window_size;
-    let mut ofi = OfiCalculator::new(initial_ofi_window);
+    let initial_ofi_threshold = strategy_config.read().strategy.ofi_trigger_threshold;
+    let mut ofi = OfiCalculator::with_threshold(initial_ofi_window, initial_ofi_threshold);
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
     let mut last_price = 0.0;
 
@@ -524,6 +525,84 @@ async fn process_ws_message(
                 }
             }
             
+            // Order book data — array[1] is string "hb" (heartbeat) or array of book entries
+            // Book entries: [PRICE, COUNT, AMOUNT] where AMOUNT > 0 = bid, AMOUNT < 0 = ask
+            if array.len() >= 2 {
+                if let Some(book_data) = array[1].as_array() {
+                    // Check if this looks like order book data (array of arrays or single [price, count, amount])
+                    let is_book = if book_data[0].is_array() {
+                        // Snapshot: [[price, count, amount], ...]
+                        true
+                    } else if book_data.len() >= 3 {
+                        // Single update: [price, count, amount]
+                        book_data[0].as_f64().is_some() && book_data[1].as_i64().is_some() && book_data[2].as_f64().is_some()
+                    } else {
+                        false
+                    };
+
+                    if is_book {
+                        let mut bids = Vec::new();
+                        let mut asks = Vec::new();
+                        let mut bid_total = 0.0;
+                        let mut ask_total = 0.0;
+
+                        let entries: Vec<&serde_json::Value> = if book_data[0].is_array() {
+                            book_data.iter().collect()
+                        } else {
+                            vec![&array[1]]
+                        };
+
+                        for entry in entries {
+                            if let Some(arr) = entry.as_array() {
+                                if arr.len() >= 3 {
+                                    let bp = arr[0].as_f64().unwrap_or(0.0);
+                                    let _cnt = arr[1].as_i64().unwrap_or(0);
+                                    let amt = arr[2].as_f64().unwrap_or(0.0);
+                                    if amt > 0.0 {
+                                        bid_total += amt;
+                                        bids.push(pirana_dashboard::state::BookLevel {
+                                            price: bp,
+                                            quantity: amt,
+                                            total: bid_total,
+                                        });
+                                    } else if amt < 0.0 {
+                                        ask_total += amt.abs();
+                                        asks.push(pirana_dashboard::state::BookLevel {
+                                            price: bp,
+                                            quantity: amt.abs(),
+                                            total: ask_total,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        if !bids.is_empty() || !asks.is_empty() {
+                            // Sort: bids descending, asks ascending
+                            bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+                            asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+
+                            // Keep only top 25 levels
+                            bids.truncate(25);
+                            asks.truncate(25);
+
+                            let best_bid = bids.first().map(|b| b.price).unwrap_or(0.0);
+                            let best_ask = asks.first().map(|a| a.price).unwrap_or(0.0);
+                            let spread = if best_bid > 0.0 && best_ask > 0.0 { best_ask - best_bid } else { 0.0 };
+                            let mid = if best_bid > 0.0 && best_ask > 0.0 { (best_bid + best_ask) / 2.0 } else { 0.0 };
+
+                            *state.order_book.write() = pirana_dashboard::state::OrderBookView {
+                                bids,
+                                asks,
+                                spread,
+                                mid_price: mid,
+                            };
+                            *state.spread.write() = spread;
+                        }
+                    }
+                }
+            }
+
             // Trades data (array[1] is string "te" or "tu", array[2] is trade array)
             if array.len() >= 3 {
                 if let Some(event) = array[1].as_str() {
@@ -685,61 +764,67 @@ async fn process_ws_message(
                                                     executed_view.executed = true;
                                                     state.add_signal(executed_view);
 
+                                                    // Track active position BEFORE tokio::spawn to prevent race condition
+                                                    // where SELL arrives before BUY position is registered
+                                                    active_positions.write().push(ActivePosition {
+                                                        entry_price: price,
+                                                        quantity: final_trade_size,
+                                                        side: Side::Buy,
+                                                        tp_price: price + conf.strategy.take_profit_distance_usd,
+                                                        sl_price: price - conf.strategy.stop_loss_distance_usd,
+                                                        exposure_size: assessment.adjusted_position_size,
+                                                        is_paper: false,
+                                                    });
+
+                                                    // Update balances locally BEFORE async to prevent stale reads
+                                                    *state.btc_balance.write() += final_trade_size;
+                                                    *state.usd_balance.write() -= required_usd;
+
+                                                    // Record metrics in risk engine BEFORE async
+                                                    risk_engine.update_exposure(assessment.adjusted_position_size);
+
+                                                    // Sync risk metrics to dashboard state
+                                                    *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
+                                                    *state.consecutive_losses.write() = assessment.consecutive_losses;
+                                                    *state.system_mode.write() = risk_engine.mode();
+                                                    *state.exposure_pct.write() = assessment.current_exposure_pct * 100.0;
+
+                                                    // Add trade to dashboard state
+                                                    state.add_trade(pirana_dashboard::state::TradeView {
+                                                        id: order_id.0.to_string(),
+                                                        symbol: "tBTCUSD".to_string(),
+                                                        side: "BUY".to_string(),
+                                                        price,
+                                                        quantity: final_trade_size,
+                                                        pnl: 0.0,
+                                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                                        order_type: "LIMIT".to_string(),
+                                                    });
+
                                                     let client_clone = client.clone();
                                                     let state_clone = state.clone();
-                                                    let risk_engine_clone = risk_engine.clone();
-                                                    let active_positions_clone = active_positions.clone();
                                                     let router_clone = router.clone();
-                                                    let conf_clone = conf.clone();
-                                                    let assessment_clone = assessment.clone();
+                                                    let active_positions_clone = active_positions.clone();
 
                                                     tokio::spawn(async move {
-                                                        match client_clone.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Market, final_trade_size, price).await {
+                                                        // Use LIMIT order at best bid for maker fee
+                                                        match client_clone.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Limit, final_trade_size, price).await {
                                                             Ok(_) => {
-                                                                // Update router state (MARKET order filled immediately)
+                                                                // Update router state
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Filled, final_trade_size, price, None);
-                                                                
-                                                                // Record metrics in risk engine
-                                                                risk_engine_clone.update_exposure(assessment_clone.adjusted_position_size);
-                                                                
-                                                                // Update balances locally in state
-                                                                *state_clone.btc_balance.write() += final_trade_size;
-                                                                *state_clone.usd_balance.write() -= required_usd;
-
-                                                                // Track active position for TP/SL monitoring
-                                                                active_positions_clone.write().push(ActivePosition {
-                                                                    entry_price: price,
-                                                                    quantity: final_trade_size,
-                                                                    side: Side::Buy,
-                                                                    tp_price: price + conf_clone.strategy.take_profit_distance_usd,
-                                                                    sl_price: price - conf_clone.strategy.stop_loss_distance_usd,
-                                                                    exposure_size: assessment_clone.adjusted_position_size,
-                                                                    is_paper: false,
-                                                                });
-
-                                                                // Sync risk metrics to dashboard state
-                                                                *state_clone.daily_drawdown_pct.write() = assessment_clone.daily_drawdown_pct;
-                                                                *state_clone.consecutive_losses.write() = assessment_clone.consecutive_losses;
-                                                                *state_clone.system_mode.write() = risk_engine_clone.mode();
-                                                                *state_clone.exposure_pct.write() = assessment_clone.current_exposure_pct * 100.0;
-
-                                                                // Add trade to dashboard state
-                                                                state_clone.add_trade(pirana_dashboard::state::TradeView {
-                                                                    id: order_id.0.to_string(),
-                                                                    symbol: "tBTCUSD".to_string(),
-                                                                    side: "BUY".to_string(),
-                                                                    price,
-                                                                    quantity: final_trade_size,
-                                                                    pnl: 0.0,
-                                                                    timestamp: chrono::Utc::now().to_rfc3339(),
-                                                                    order_type: "MARKET".to_string(),
-                                                                });
-
                                                                 tracing::info!("Asynchronous BUY order executed successfully!");
                                                             }
                                                             Err(e) => {
                                                                 tracing::error!("Bitfinex asynchronous BUY order execution failed: {}", e);
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, final_trade_size, price, None);
+                                                                // Rollback: remove the position we added optimistically
+                                                                let mut positions = active_positions_clone.write();
+                                                                if let Some(idx) = positions.iter().position(|p| p.entry_price == price && p.quantity == final_trade_size && !p.is_paper) {
+                                                                    positions.remove(idx);
+                                                                }
+                                                                // Rollback balances
+                                                                *state_clone.btc_balance.write() -= final_trade_size;
+                                                                *state_clone.usd_balance.write() += required_usd;
                                                             }
                                                         }
                                                     });
@@ -748,6 +833,9 @@ async fn process_ws_message(
                                             Ok(assessment) => {
                                                 tracing::warn!("Trade rejected by Risk Engine: {:?}", assessment.rejection_reason);
                                                 *state.system_mode.write() = risk_engine.mode();
+                                                *state.exposure_pct.write() = assessment.current_exposure_pct * 100.0;
+                                                *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
+                                                *state.consecutive_losses.write() = assessment.consecutive_losses;
                                                 state.add_signal(signal_view);
                                             }
                                             Err(e) => {
@@ -872,16 +960,40 @@ async fn process_ws_message(
                                                     final_trade_size = current_btc;
                                                 }
 
+                                                // Safety: never SELL more BTC than we actually have (with 1% buffer)
+                                                let safe_btc = *state.btc_balance.read() * 0.99;
+                                                if final_trade_size > safe_btc {
+                                                    tracing::warn!("SELL size {:.6} exceeds safe BTC balance ({:.6}). Capping to safe amount.", final_trade_size, safe_btc);
+                                                    final_trade_size = safe_btc;
+                                                }
+
                                                 if final_trade_size < 0.00001 {
                                                     tracing::warn!("Adjusted SELL size {:.6} is below minimum trade limit.", final_trade_size);
                                                     state.add_signal(signal_view);
                                                     return;
                                                 }
 
+                                                // Close the oldest BUY position NOW (before spawn) to prevent race condition
+                                                let mut realized_pnl = 0.0;
+                                                let closed_entry_price;
+                                                {
+                                                    let mut positions = active_positions.write();
+                                                    if let Some(idx) = positions.iter().position(|p| p.side == Side::Buy && !p.is_paper) {
+                                                        let closed_pos = positions.remove(idx);
+                                                        realized_pnl = (price - closed_pos.entry_price) * closed_pos.quantity;
+                                                        closed_entry_price = closed_pos.entry_price;
+                                                        tracing::info!("OFI Selling Pressure closed BUY position (entry price: {}, qty: {:.6}). Realized PnL: {:.2} USD", closed_pos.entry_price, closed_pos.quantity, realized_pnl);
+                                                    } else {
+                                                        tracing::warn!("OFI Selling Pressure: no open BUY positions to close — skipping SELL to avoid naked short!");
+                                                        state.add_signal(signal_view);
+                                                        return;
+                                                    }
+                                                }
+
                                                 if let Ok(order_id) = router.lock().create_order(&sig, price) {
                                                     tracing::info!("OFI Selling Pressure -> Submitting SELL order asynchronously for {:.6} BTC", final_trade_size);
                                                     
-                                                    // Cooldown and OFI reset immediately on main thread to prevent spamming!
+                                                    // Cooldown and OFI reset immediately
                                                     ofi.reset();
                                                     *last_trade_time = std::time::Instant::now();
                                                     *state.trades_today.write() += 1;
@@ -891,78 +1003,90 @@ async fn process_ws_message(
                                                     executed_view.executed = true;
                                                     state.add_signal(executed_view);
 
+                                                    // Record in risk engine BEFORE async
+                                                    risk_engine.update_exposure(-assessment.adjusted_position_size);
+                                                    risk_engine.record_trade_result(realized_pnl);
+
+                                                    // Update daily_pnl in dashboard state
+                                                    {
+                                                        let mut daily_pnl = state.daily_pnl.write();
+                                                        *daily_pnl += realized_pnl;
+                                                        *state.total_pnl.write() += realized_pnl;
+                                                        let start_eq = *state.starting_equity.read();
+                                                        if start_eq > 0.0 {
+                                                            *state.daily_pnl_pct.write() = (*daily_pnl / start_eq) * 100.0;
+                                                        }
+                                                        state.add_pnl_point(*daily_pnl);
+                                                    }
+
+                                                    // Update balances locally BEFORE async
+                                                    *state.btc_balance.write() -= final_trade_size;
+                                                    *state.usd_balance.write() += final_trade_size * price;
+
+                                                    // Update win rate, best/worst trade
+                                                    {
+                                                        let mut wins = state.win_rate.write();
+                                                        let trades_today = *state.trades_today.read();
+                                                        if trades_today > 0 {
+                                                            let current_wins = if realized_pnl > 0.0 { 1.0 } else { 0.0 };
+                                                            // Running average: old_rate * (n-1)/n + new_result / n
+                                                            *wins = (*wins * ((trades_today - 1) as f64) + current_wins) / (trades_today as f64);
+                                                        }
+                                                        let mut best = state.best_trade.write();
+                                                        if realized_pnl > *best { *best = realized_pnl; }
+                                                        let mut worst = state.worst_trade.write();
+                                                        if realized_pnl < *worst { *worst = realized_pnl; }
+                                                        let mut avg = state.avg_trade_size.write();
+                                                        *avg = (*avg * ((trades_today - 1) as f64) + final_trade_size) / (trades_today as f64);
+                                                    }
+
+                                                    // Sync risk metrics to dashboard state
+                                                    *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
+                                                    *state.consecutive_losses.write() = assessment.consecutive_losses;
+                                                    *state.system_mode.write() = risk_engine.mode();
+                                                    *state.exposure_pct.write() = assessment.current_exposure_pct * 100.0;
+
+                                                    // Add trade to dashboard state
+                                                    state.add_trade(pirana_dashboard::state::TradeView {
+                                                        id: order_id.0.to_string(),
+                                                        symbol: "tBTCUSD".to_string(),
+                                                        side: "SELL".to_string(),
+                                                        price,
+                                                        quantity: final_trade_size,
+                                                        pnl: realized_pnl,
+                                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                                        order_type: "LIMIT".to_string(),
+                                                    });
+
                                                     let client_clone = client.clone();
                                                     let state_clone = state.clone();
-                                                    let risk_engine_clone = risk_engine.clone();
-                                                    let active_positions_clone = active_positions.clone();
                                                     let router_clone = router.clone();
-                                                    let assessment_clone = assessment.clone();
+                                                    let active_positions_clone = active_positions.clone();
 
                                                     tokio::spawn(async move {
                                                         // Bitfinex sells require negative quantity
-                                                        match client_clone.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Market, -final_trade_size, price).await {
+                                                        // Use LIMIT order for maker fee
+                                                        match client_clone.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Limit, -final_trade_size, price).await {
                                                             Ok(_) => {
-                                                                // Update router state (MARKET order filled immediately)
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Filled, final_trade_size, price, None);
-                                                                
-                                                                // Record metrics in risk engine
-                                                                risk_engine_clone.update_exposure(-assessment_clone.adjusted_position_size);
-
-                                                                // Track active position for TP/SL monitoring
-                                                                // Instead of adding a SELL position (short) in Spot trading, we remove the oldest BUY position from active_positions
-                                                                let mut realized_pnl = 0.0;
-                                                                {
-                                                                    let mut positions = active_positions_clone.write();
-                                                                    if let Some(idx) = positions.iter().position(|p| p.side == Side::Buy) {
-                                                                        let closed_pos = positions.remove(idx);
-                                                                        realized_pnl = (price - closed_pos.entry_price) * closed_pos.quantity;
-                                                                        tracing::info!("OFI Selling Pressure closed BUY position (entry price: {}, qty: {:.6}). Realized PnL: {:.2} USD", closed_pos.entry_price, closed_pos.quantity, realized_pnl);
-                                                                    } else {
-                                                                        tracing::warn!("OFI Selling Pressure executed SELL, but no open BUY positions were tracked in memory!");
-                                                                    }
-                                                                }
-
-                                                                risk_engine_clone.record_trade_result(realized_pnl);
-
-                                                                // Update daily_pnl in dashboard state!
-                                                                {
-                                                                    let mut daily_pnl = state_clone.daily_pnl.write();
-                                                                    *daily_pnl += realized_pnl;
-                                                                    *state_clone.total_pnl.write() += realized_pnl;
-                                                                    let start_eq = *state_clone.starting_equity.read();
-                                                                    if start_eq > 0.0 {
-                                                                        *state_clone.daily_pnl_pct.write() = (*daily_pnl / start_eq) * 100.0;
-                                                                    }
-                                                                    state_clone.add_pnl_point(*daily_pnl);
-                                                                }
-
-                                                                // Update balances locally in state
-                                                                *state_clone.btc_balance.write() -= final_trade_size;
-                                                                *state_clone.usd_balance.write() += final_trade_size * price;
-
-                                                                // Sync risk metrics to dashboard state
-                                                                *state_clone.daily_drawdown_pct.write() = assessment_clone.daily_drawdown_pct;
-                                                                *state_clone.consecutive_losses.write() = assessment_clone.consecutive_losses;
-                                                                *state_clone.system_mode.write() = risk_engine_clone.mode();
-                                                                *state_clone.exposure_pct.write() = assessment_clone.current_exposure_pct * 100.0;
-
-                                                                // Add trade to dashboard state
-                                                                state_clone.add_trade(pirana_dashboard::state::TradeView {
-                                                                    id: order_id.0.to_string(),
-                                                                    symbol: "tBTCUSD".to_string(),
-                                                                    side: "SELL".to_string(),
-                                                                    price,
-                                                                    quantity: final_trade_size,
-                                                                    pnl: realized_pnl,
-                                                                    timestamp: chrono::Utc::now().to_rfc3339(),
-                                                                    order_type: "MARKET".to_string(),
-                                                                });
-
                                                                 tracing::info!("Asynchronous SELL order executed successfully!");
                                                             }
                                                             Err(e) => {
                                                                 tracing::error!("Bitfinex asynchronous SELL order execution failed: {}", e);
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, final_trade_size, price, None);
+                                                                // Rollback: re-add the position we removed
+                                                                active_positions_clone.write().push(ActivePosition {
+                                                                    entry_price: closed_entry_price,
+                                                                    quantity: final_trade_size,
+                                                                    side: Side::Buy,
+                                                                    tp_price: closed_entry_price + 350.0, // Conservative defaults for rollback
+                                                                    sl_price: closed_entry_price - 150.0,
+                                                                    exposure_size: assessment.adjusted_position_size,
+                                                                    is_paper: false,
+                                                                });
+                                                                // Rollback balances
+                                                                *state_clone.btc_balance.write() += final_trade_size;
+                                                                *state_clone.usd_balance.write() -= final_trade_size * price;
                                                             }
                                                         }
                                                     });
@@ -971,6 +1095,9 @@ async fn process_ws_message(
                                             Ok(assessment) => {
                                                 tracing::warn!("Trade rejected by Risk Engine: {:?}", assessment.rejection_reason);
                                                 *state.system_mode.write() = risk_engine.mode();
+                                                *state.exposure_pct.write() = assessment.current_exposure_pct * 100.0;
+                                                *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
+                                                *state.consecutive_losses.write() = assessment.consecutive_losses;
                                                 state.add_signal(signal_view);
                                             }
                                             Err(e) => {

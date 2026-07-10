@@ -46,6 +46,8 @@ pub struct DashboardState {
     pub order_book: Arc<parking_lot::RwLock<OrderBookView>>,
     /// Consecutive losses
     pub consecutive_losses: Arc<parking_lot::RwLock<u32>>,
+    /// Paper consecutive wins in Halted mode
+    pub paper_consecutive_wins: Arc<parking_lot::RwLock<u32>>,
     /// Total trades today
     pub trades_today: Arc<parking_lot::RwLock<u32>>,
     /// Win rate
@@ -189,6 +191,7 @@ impl DashboardState {
                 mid_price: 0.0,
             })),
             consecutive_losses: Arc::new(parking_lot::RwLock::new(0)),
+            paper_consecutive_wins: Arc::new(parking_lot::RwLock::new(0)),
             trades_today: Arc::new(parking_lot::RwLock::new(0)),
             win_rate: Arc::new(parking_lot::RwLock::new(0.0)),
             best_trade: Arc::new(parking_lot::RwLock::new(0.0)),
