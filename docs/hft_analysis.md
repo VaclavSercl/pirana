@@ -1,88 +1,74 @@
 # PIRANA HFT Analysis Report
 
-## Bitfinex API Analysis
+## Bitfinex Fee Structure (Updated July 2026)
 
-### Account Balances
-| Asset | Free | Locked |
-|-------|------|--------|
-| UST | 0.05033621 | 0 |
-| ETH | 0.00000035 | 0 |
-| USD | 167.97 | 0 |
-| BTC | 0.00334339 | 0 |
+### ⚠️ IMPORTANT: Zero Fees Since December 17, 2025
 
-### Trading Volume (30 days)
-| Asset | Volume | Maker Volume |
-|-------|--------|--------------|
-| BTC | 0.00295743 | - |
-| Total (USD) | 231.79 | 206.78 |
+**As of December 17, 2025, Bitfinex charges ZERO fees for ALL trading activity.**
 
-### Bitfinex Fee Structure
+Source: https://www.bitfinex.com/fees (verified July 10, 2026)
 
-#### Trading Fees (Maker/Taker)
-| Level | Maker Fee | Taker Fee | 30d Volume (USD) |
-|-------|-----------|-----------|------------------|
-| 0 | 0.10% | 0.20% | < 500K |
-| 1 | 0.08% | 0.20% | 500K - 1M |
-| 2 | 0.06% | 0.18% | 1M - 2.5M |
-| 3 | 0.04% | 0.16% | 2.5M - 5M |
-| 4 | 0.02% | 0.14% | 5M - 10M |
-| 5 | 0.00% | 0.12% | 10M - 25M |
-| 6 | 0.00% | 0.10% | 25M+ |
+#### Order Execution Fees
 
-**Current level: 0** (volume < 500K USD)
-- **Maker fee: 0.10%**
-- **Taker fee: 0.20%**
+| Activity | Maker Fee | Taker Fee |
+|---|---|---|
+| **Spot and Margin trades** | **Zero** | **Zero** |
+| **Derivatives trades** | **Zero** | **Zero** |
+| OTC Trades | Zero | Zero |
+
+The previous tiered fee structure (0.10% maker / 0.20% taker at Tier 0) is **no longer in effect**.
+
+#### Other Fees (still apply)
+
+| Service | Fee |
+|---|---|
+| Bank wire deposit | 0.100% (min $60) |
+| Bank wire withdrawal | 0.100% (min $100) |
+| Express bank wire withdrawal | 1.000% (min $125) |
+| Crypto deposit | FREE |
+| Stablecoin deposit | FREE |
+| Crypto withdrawal | FREE |
+| Internal transfer (Bitfinex to Bitfinex) | FREE |
+| Bitfinex Borrow (funding fees) | Zero for borrower |
+| Margin Funding provider fee | 15% of fees generated |
+
+#### Impact on PIRANA Strategy
+
+- **No trading fees** = round-trip cost is **$0.00** regardless of order type
+- Both LIMIT and MARKET orders are free
+- The previous concern about MARKET vs LIMIT fees is **moot** — no fee difference
+- Spread capture profitability is now purely about price movement, not fee overhead
+- HFT frequency is no longer constrained by fee accumulation
 
 #### Minimum Order Sizes
+
 | Symbol | Min Order Size |
-|--------|----------------|
-| tBTCUSD | 0.00001 BTC (~$0.81) |
+|---|---|
+| tBTCUSD | 0.00001 BTC (~$0.64 at $64,000) |
 | tETHUSD | 0.0001 ETH (~$0.25) |
 
 #### Rate Limits
+
 - **REST API**: 90 requests per minute
 - **WebSocket**: 30 subscriptions per connection
 - **Order submission**: 10 orders per second (per symbol)
 - **Order cancellation**: 10 cancellations per second
 
-### HFT Strategy Considerations
+### HFT Strategy Implications (Zero-Fee Era)
 
-#### Spread Capture Profitability
-With current fees (0.10% maker, 0.20% taker):
-- **Round-trip cost**: 0.30% (buy maker + sell taker)
-- **Minimum spread needed**: 0.30% to break even
-- **At BTC $81,356**: minimum spread = $244.07
+With zero fees:
 
-#### Optimal Order Size
-- **Minimum**: 0.00001 BTC ($0.81)
-- **Recommended**: 0.001 BTC ($81.36) — balances fee impact
-- **Maximum per trade**: 0.01 BTC ($813.56) — risk management
+1. **Spread capture**: Any price improvement, even $0.01, is pure profit
+2. **Order type**: LIMIT or MARKET — no fee difference (use LIMIT for price control)
+3. **Frequency**: Trade as often as rate limits allow — no fee drain
+4. **Small trades**: Even minimum-size trades ($0.64) are viable
+5. **Round-trip**: Buy + Sell = $0.00 in fees (was $0.024 at old taker rates)
 
-#### Frequency Limits
-- **Max 10 orders/second** per symbol
-- **Max 10 cancellations/second**
-- **Recommended**: 1-2 orders/second to avoid rate limits
+### Account Status (as of July 10, 2026)
 
-### Implementation Plan
-
-1. **Spread Capture Strategy**
-   - Place buy order at bid - $1
-   - Place sell order at ask + $1
-   - Cancel and replace on price change > $0.50
-   - Order size: 0.001 BTC per side
-
-2. **Fee Optimization**
-   - Use LIMIT orders (maker) when possible
-   - Avoid MARKET orders (taker fee 0.20%)
-   - Target 0.10% maker fee by providing liquidity
-
-3. **Risk Management**
-   - Max exposure: 0.01 BTC per trade
-   - Stop-loss: 0.5% price drop
-   - Take-profit: 0.3% price rise
-   - Max daily loss: 3%
-
-4. **Rate Limit Compliance**
-   - Max 1 order per second
-   - Batch cancellations
-   - Use WebSocket for real-time data
+| Asset | Balance |
+|---|---|
+| USD | ~$408 |
+| BTC | ~0.0014 BTC (~$90) |
+| 30d Volume | ~$232 |
+| Fee Level | N/A (Zero fees) |
