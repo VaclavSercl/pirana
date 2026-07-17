@@ -205,8 +205,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let client = BitfinexClient::new(api_key.clone(), api_secret.clone());
     if let Ok(wallets) = client.get_wallets().await {
         for w in wallets {
-            if w.asset == "BTC" { *state.btc_balance.write() = w.free; }
-            if w.asset == "USD" { *state.usd_balance.write() = w.free; }
+            if w.asset == "BTC" { *state.btc_balance.write() = w.total; }
+            if w.asset == "USD" { *state.usd_balance.write() = w.total; }
         }
         tracing::info!("Wallets loaded: BTC={}, USD={}", *state.btc_balance.read(), *state.usd_balance.read());
     }
@@ -237,8 +237,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             if let Ok(wallets) = client_for_reconciliation.get_wallets().await {
                 for w in wallets {
-                    if w.asset == "BTC" { *state_for_reconciliation.btc_balance.write() = w.free; }
-                    if w.asset == "USD" { *state_for_reconciliation.usd_balance.write() = w.free; }
+                    if w.asset == "BTC" { *state_for_reconciliation.btc_balance.write() = w.total; }
+                    if w.asset == "USD" { *state_for_reconciliation.usd_balance.write() = w.total; }
                 }
                 tracing::debug!("Wallet balances reconciled with Bitfinex successfully.");
             }
@@ -304,22 +304,26 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
         while connection_active {
             tokio::select! {
-                msg = ws.next() => {
+                msg = tokio::time::timeout(std::time::Duration::from_secs(30), ws.next()) => {
                     match msg {
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
                                 process_ws_message(&state, data, &mut ofi, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions).await;
                             }
                         }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
                             ws.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await.ok();
                         }
-                        Some(Err(e)) => {
+                        Ok(Some(Err(e))) => {
                             error!("WebSocket error: {}", e);
                             connection_active = false;
                         }
-                        None => {
+                        Ok(None) => {
                             error!("WebSocket connection closed");
+                            connection_active = false;
+                        }
+                        Err(_) => {
+                            error!("WebSocket read timeout (no message for 30s) — reconnecting...");
                             connection_active = false;
                         }
                         _ => {}
@@ -696,7 +700,7 @@ async fn process_ws_message(
                                         let dynamic_trade_size = (paper_position_size_pct * total_portfolio_usd) / price;
                                         let final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
 
-                                        if let Ok(order_id) = router.lock().create_order(&sig, price) {
+                                        if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                             tracing::info!("🔒 [PAPER TRADING] OFI Buying Pressure -> Creating stínovou BUY pozici pro {:.6} BTC (Halted mode active)", final_trade_size);
 
                                             ofi.reset();
@@ -751,7 +755,7 @@ async fn process_ws_message(
                                                     return;
                                                 }
 
-                                                if let Ok(order_id) = router.lock().create_order(&sig, price) {
+                                                if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                                     tracing::info!("OFI Buying Pressure -> Submitting BUY order asynchronously for {:.6} BTC", final_trade_size);
                                                     
                                                     // Cooldown and OFI reset immediately on main thread to prevent spamming!
@@ -807,8 +811,8 @@ async fn process_ws_message(
                                                     let active_positions_clone = active_positions.clone();
 
                                                     tokio::spawn(async move {
-                                                        // Use LIMIT order at best bid for maker fee
-                                                        match client_clone.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Limit, final_trade_size, price).await {
+                                                         // Use MARKET order for execution since fees are zero
+                                                         match client_clone.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Market, final_trade_size, price).await {
                                                             Ok(_) => {
                                                                 // Update router state
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Filled, final_trade_size, price, None);
@@ -899,7 +903,21 @@ async fn process_ws_message(
 
                                     if is_halted {
                                         // Paper trading in Halted mode!
-                                        if let Ok(order_id) = router.lock().create_order(&sig, price) {
+                                        let mut final_trade_size = 0.000326; // Default placeholder for display
+                                        let mut realized_pnl = 0.0;
+                                        let mut found_paper = false;
+                                        {
+                                            let mut positions = active_positions.write();
+                                            if let Some(idx) = positions.iter().position(|p| p.side == Side::Buy && p.is_paper) {
+                                                let closed_pos = positions.remove(idx);
+                                                realized_pnl = (price - closed_pos.entry_price) * closed_pos.quantity;
+                                                final_trade_size = closed_pos.quantity;
+                                                found_paper = true;
+                                                tracing::info!("🔒 [PAPER TRADING] Closed stínovou BUY pozici (entry price: {}, qty: {:.6}). Realized PnL: {:.2} USD", closed_pos.entry_price, closed_pos.quantity, realized_pnl);
+                                            }
+                                        }
+
+                                        if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                             tracing::info!("🔒 [PAPER TRADING] OFI Selling Pressure -> Closing stínové pozice (Halted mode active)");
 
                                             ofi.reset();
@@ -910,21 +928,6 @@ async fn process_ws_message(
                                             executed_view.executed = true;
                                             executed_view.rationale = format!("{} (PAPER)", executed_view.rationale);
                                             state.add_signal(executed_view);
-
-                                            let mut realized_pnl = 0.0;
-                                            let mut found_paper = false;
-                                            let mut final_trade_size = 0.000326; // Default placeholder for display
-
-                                            {
-                                                let mut positions = active_positions.write();
-                                                if let Some(idx) = positions.iter().position(|p| p.side == Side::Buy && p.is_paper) {
-                                                    let closed_pos = positions.remove(idx);
-                                                    realized_pnl = (price - closed_pos.entry_price) * closed_pos.quantity;
-                                                    final_trade_size = closed_pos.quantity;
-                                                    found_paper = true;
-                                                    tracing::info!("🔒 [PAPER TRADING] Closed stínovou BUY pozici (entry price: {}, qty: {:.6}). Realized PnL: {:.2} USD", closed_pos.entry_price, closed_pos.quantity, realized_pnl);
-                                                }
-                                            }
 
                                             if found_paper {
                                                 risk_engine.record_paper_trade_result(realized_pnl);
@@ -990,7 +993,7 @@ async fn process_ws_message(
                                                     }
                                                 }
 
-                                                if let Ok(order_id) = router.lock().create_order(&sig, price) {
+                                                if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                                     tracing::info!("OFI Selling Pressure -> Submitting SELL order asynchronously for {:.6} BTC", final_trade_size);
                                                     
                                                     // Cooldown and OFI reset immediately
@@ -1065,8 +1068,8 @@ async fn process_ws_message(
 
                                                     tokio::spawn(async move {
                                                         // Bitfinex sells require negative quantity
-                                                        // Use LIMIT order for maker fee
-                                                        match client_clone.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Limit, -final_trade_size, price).await {
+                                                        // Use MARKET order for execution since fees are zero
+                                                        match client_clone.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Market, -final_trade_size, price).await {
                                                             Ok(_) => {
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Filled, final_trade_size, price, None);
                                                                 tracing::info!("Asynchronous SELL order executed successfully!");

@@ -56,6 +56,7 @@ impl OrderRouter {
         &mut self,
         signal: &Signal,
         current_price: f64,
+        quantity: f64,
     ) -> PiranaResult<OrderId> {
         // Check open order limit
         let symbol_orders = self.active_orders.iter()
@@ -86,8 +87,8 @@ impl OrderRouter {
         // Calculate entry price from signal zone
         let entry_price = (signal.recommended_params.entry_zone.0 + signal.recommended_params.entry_zone.1) / 2.0;
 
-        // Calculate position size
-        let position_size = signal.recommended_params.position_size_pct / entry_price;
+        // Calculate position size using the passed quantity directly
+        let position_size = quantity;
 
         let order = ActiveOrder {
             order_id,

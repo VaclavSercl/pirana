@@ -164,10 +164,14 @@ impl BitfinexClient {
             for item in arr {
                 if let Some(arr) = item.as_array() {
                     if arr.len() >= 5 {
+                        let total = arr[2].as_f64().unwrap_or(0.0);
+                        let free = arr[4].as_f64().unwrap_or(0.0);
+                        let locked = (total - free).max(0.0);
                         balances.push(Balance {
                             asset: arr[1].as_str().unwrap_or("").to_string(),
-                            free: arr[4].as_f64().unwrap_or(0.0),
-                            locked: arr[5].as_f64().unwrap_or(0.0),
+                            free,
+                            locked,
+                            total,
                         });
                     }
                 }

@@ -215,6 +215,7 @@ pub struct Balance {
     pub asset: String,
     pub free: f64,
     pub locked: f64,
+    pub total: f64,
 }
 
 /// Account state
