@@ -1,4 +1,6 @@
 pub mod ofi;
+pub mod atr;
+pub mod l2_depth;
 pub mod volatility;
 pub mod liquidity;
 pub mod volume_profile;

@@ -4,6 +4,8 @@ use pirana_core::types::{Signal, SignalType, SignalParams, Symbol, Side, Tick, M
 use pirana_execution::bitfinex_client::BitfinexClient;
 use pirana_execution::order_router::OrderRouter;
 use pirana_features::ofi::OfiCalculator;
+use pirana_features::atr::AtrCalculator;
+use pirana_features::l2_depth::L2DepthCalculator;
 use pirana_dashboard::state::DashboardState;
 use pirana_signal_validator::validator::{SignalValidator, ValidationResult};
 use pirana_risk_engine::engine::RiskEngine;
@@ -18,6 +20,10 @@ pub struct StrategyConfig {
     pub strategy: StrategyParams,
     pub inventory: InventoryConfig,
     pub risk_management: RiskConfig,
+    #[serde(default)]
+    pub volatility: VolatilityStrategyConfig,
+    #[serde(default)]
+    pub order_book: OrderBookStrategyConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -55,6 +61,85 @@ pub struct RiskConfig {
     pub daily_loss_limit_usd: f64,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct VolatilityStrategyConfig {
+    #[serde(default = "default_true")]
+    pub use_dynamic_atr: bool,
+    #[serde(default = "default_atr_period")]
+    pub atr_period: usize,
+    #[serde(default = "default_ticks_per_bar")]
+    pub ticks_per_bar: usize,
+    #[serde(default = "default_atr_tp_multiplier")]
+    pub atr_tp_multiplier: f64,
+    #[serde(default = "default_atr_sl_multiplier")]
+    pub atr_sl_multiplier: f64,
+    #[serde(default = "default_min_tp_usd")]
+    pub min_tp_usd: f64,
+    #[serde(default = "default_max_tp_usd")]
+    pub max_tp_usd: f64,
+    #[serde(default = "default_min_sl_usd")]
+    pub min_sl_usd: f64,
+    #[serde(default = "default_max_sl_usd")]
+    pub max_sl_usd: f64,
+}
+
+fn default_true() -> bool { true }
+fn default_atr_period() -> usize { 14 }
+fn default_ticks_per_bar() -> usize { 50 }
+fn default_atr_tp_multiplier() -> f64 { 0.5 }
+fn default_atr_sl_multiplier() -> f64 { 4.0 }
+fn default_min_tp_usd() -> f64 { 4.0 }
+fn default_max_tp_usd() -> f64 { 25.0 }
+fn default_min_sl_usd() -> f64 { 25.0 }
+fn default_max_sl_usd() -> f64 { 80.0 }
+
+impl Default for VolatilityStrategyConfig {
+    fn default() -> Self {
+        Self {
+            use_dynamic_atr: true,
+            atr_period: 14,
+            ticks_per_bar: 50,
+            atr_tp_multiplier: 0.5,
+            atr_sl_multiplier: 4.0,
+            min_tp_usd: 4.0,
+            max_tp_usd: 25.0,
+            min_sl_usd: 25.0,
+            max_sl_usd: 80.0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OrderBookStrategyConfig {
+    #[serde(default = "default_true")]
+    pub use_l2_depth_imbalance: bool,
+    #[serde(default = "default_l2_depth_levels")]
+    pub l2_depth_levels: usize,
+    #[serde(default = "default_l2_weight_decay")]
+    pub l2_weight_decay: f64,
+    #[serde(default = "default_l2_weight_alpha")]
+    pub l2_weight_alpha: f64,
+    #[serde(default = "default_min_l2_imbalance_threshold")]
+    pub min_l2_imbalance_threshold: f64,
+}
+
+fn default_l2_depth_levels() -> usize { 5 }
+fn default_l2_weight_decay() -> f64 { 0.5 }
+fn default_l2_weight_alpha() -> f64 { 0.40 }
+fn default_min_l2_imbalance_threshold() -> f64 { 0.15 }
+
+impl Default for OrderBookStrategyConfig {
+    fn default() -> Self {
+        Self {
+            use_l2_depth_imbalance: true,
+            l2_depth_levels: 5,
+            l2_weight_decay: 0.5,
+            l2_weight_alpha: 0.40,
+            min_l2_imbalance_threshold: 0.15,
+        }
+    }
+}
+
 impl StrategyConfig {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string("strategy.toml")?;
@@ -64,21 +149,23 @@ impl StrategyConfig {
     
     pub fn load_or_default() -> Self {
         Self::load().unwrap_or_else(|e| {
-            tracing::error!("Failed to load strategy.toml, using extremely safe defaults: {}", e);
+            tracing::error!("Failed to load strategy.toml, using safe defaults: {}", e);
             StrategyConfig {
                 system: SystemConfig { reload_interval_seconds: 60 },
                 trading: TradingConfig { trade_size_btc: 0.0001, max_open_orders: 1 },
                 strategy: StrategyParams {
                     entry_zone_spread_usd: 1.0,
-                    take_profit_distance_usd: 50.0,
+                    take_profit_distance_usd: 5.0,
                     stop_loss_distance_usd: 50.0,
-                    ofi_trigger_threshold: 0.8,
+                    ofi_trigger_threshold: 0.75,
                     ofi_window_size: 100,
-                    trade_cooldown_ms: 1000,
-                    min_confidence_score: 0.9,
+                    trade_cooldown_ms: 28000,
+                    min_confidence_score: 0.95,
                 },
-                inventory: InventoryConfig { min_inventory_btc: 0.0, max_inventory_btc: 0.1 },
-                risk_management: RiskConfig { max_slippage_bps: 5, position_size_pct: 5.0, daily_loss_limit_usd: 100.0 },
+                inventory: InventoryConfig { min_inventory_btc: 0.0, max_inventory_btc: 0.01 },
+                risk_management: RiskConfig { max_slippage_bps: 5, position_size_pct: 2.0, daily_loss_limit_usd: 1000.0 },
+                volatility: VolatilityStrategyConfig::default(),
+                order_book: OrderBookStrategyConfig::default(),
             }
         })
     }
@@ -215,6 +302,10 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let initial_ofi_window = strategy_config.read().strategy.ofi_window_size;
     let initial_ofi_threshold = strategy_config.read().strategy.ofi_trigger_threshold;
     let mut ofi = OfiCalculator::with_threshold(initial_ofi_window, initial_ofi_threshold);
+    let initial_vol_conf = strategy_config.read().volatility.clone();
+    let initial_ob_conf = strategy_config.read().order_book.clone();
+    let mut atr = AtrCalculator::new(initial_vol_conf.atr_period, initial_vol_conf.ticks_per_bar, 10.0);
+    let mut l2_depth = L2DepthCalculator::new(initial_ob_conf.l2_depth_levels, initial_ob_conf.l2_weight_decay, initial_ob_conf.min_l2_imbalance_threshold);
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
     let mut last_price = 0.0;
 
@@ -308,7 +399,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     match msg {
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -345,6 +436,8 @@ async fn process_ws_message(
     state: &DashboardState,
     data: serde_json::Value,
     ofi: &mut OfiCalculator,
+    atr: &mut AtrCalculator,
+    l2_depth: &mut L2DepthCalculator,
     router: &Arc<parking_lot::Mutex<OrderRouter>>,
     validator: &mut SignalValidator,
     risk_engine: &RiskEngine,
@@ -363,6 +456,7 @@ async fn process_ws_message(
                         *state.btc_price.write() = price;
                         state.add_price_point(price);
                         *last_price = price;
+                        atr.process_price(price);
 
                         // Check active positions for Take Profit / Stop Loss
                         let mut positions_to_close = Vec::new();
@@ -586,6 +680,11 @@ async fn process_ws_message(
                             bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
                             asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
 
+                            // Process L2 depth pressure across top order book levels
+                            let bid_pairs: Vec<(f64, f64)> = bids.iter().map(|b| (b.price, b.quantity)).collect();
+                            let ask_pairs: Vec<(f64, f64)> = asks.iter().map(|a| (a.price, a.quantity)).collect();
+                            l2_depth.process_book(&bid_pairs, &ask_pairs);
+
                             // Keep only top 25 levels
                             bids.truncate(25);
                             asks.truncate(25);
@@ -630,33 +729,71 @@ async fn process_ws_message(
                                 ofi.process_tick(&tick, *last_price);
                                 
                                 let conf = strategy_config.read().clone();
-                                
+
                                 // Cooldown check
                                 if last_trade_time.elapsed().as_millis() < conf.strategy.trade_cooldown_ms as u128 {
                                     return; // Cooldown active
                                 }
                                 
                                 let current_btc = *state.btc_balance.read();
-                                
-                                if ofi.is_buying_pressure() {
+                                let ofi_val = ofi.current_ofi();
+                                let l2_imb = l2_depth.current_imbalance();
+
+                                let composite_signal = if conf.order_book.use_l2_depth_imbalance {
+                                    l2_depth.composite_signal(ofi_val, conf.order_book.l2_weight_alpha)
+                                } else {
+                                    ofi_val
+                                };
+
+                                let is_buying = if conf.order_book.use_l2_depth_imbalance {
+                                    ofi.is_buying_pressure() && l2_depth.is_buying_supported() && composite_signal >= conf.strategy.ofi_trigger_threshold
+                                } else {
+                                    ofi.is_buying_pressure()
+                                };
+
+                                let is_selling = if conf.order_book.use_l2_depth_imbalance {
+                                    ofi.is_selling_pressure() && l2_depth.is_selling_supported() && composite_signal <= -conf.strategy.ofi_trigger_threshold
+                                } else {
+                                    ofi.is_selling_pressure()
+                                };
+
+                                // Calculate dynamic adaptive ATR TP / SL distances
+                                let (tp_dist, sl_dist) = if conf.volatility.use_dynamic_atr {
+                                    atr.calculate_tp_sl_distances(
+                                        conf.volatility.atr_tp_multiplier,
+                                        conf.volatility.atr_sl_multiplier,
+                                        conf.volatility.min_tp_usd,
+                                        conf.volatility.max_tp_usd,
+                                        conf.volatility.min_sl_usd,
+                                        conf.volatility.max_sl_usd,
+                                    )
+                                } else {
+                                    (conf.strategy.take_profit_distance_usd, conf.strategy.stop_loss_distance_usd)
+                                };
+
+                                if is_buying {
                                     if current_btc >= conf.inventory.max_inventory_btc {
                                         tracing::warn!("Max BTC inventory reached ({}), skipping BUY", current_btc);
                                         return;
                                     }
                                     let p = SignalParams {
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
-                                        invalidation_level: price - conf.strategy.stop_loss_distance_usd,
-                                        volatility_adjusted_tp: price + conf.strategy.take_profit_distance_usd,
+                                        invalidation_level: price - sl_dist,
+                                        volatility_adjusted_tp: price + tp_dist,
                                         position_size_pct: conf.risk_management.position_size_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
+                                    let rationale_text = format!(
+                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1})",
+                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist
+                                    );
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::SpreadCapture,
                                         target_asset: Symbol::new("tBTCUSD"),
                                         confidence_score: conf.strategy.min_confidence_score,
                                         market_regime: MarketRegime::HighVolatilityTrending,
-                                        rationale: "OFI Buying Pressure".to_string(),
+                                        rationale: rationale_text,
                                         recommended_params: p.clone(),
                                         timestamp: chrono::Utc::now(),
                                         invalidation_level: p.invalidation_level,
@@ -677,14 +814,14 @@ async fn process_ws_message(
                                     match validator.validate(&sig) {
                                         Ok(ValidationResult::Approved { .. }) => {}
                                         Ok(other) => {
-                                            tracing::warn!("Signal rejected by validator: {:?}", other);
-                                            state.add_signal(signal_view);
-                                            return;
+                                             tracing::warn!("Signal rejected by validator: {:?}", other);
+                                             state.add_signal(signal_view);
+                                             return;
                                         }
                                         Err(e) => {
-                                            tracing::error!("Validator error: {}", e);
-                                            state.add_signal(signal_view);
-                                            return;
+                                             tracing::error!("Validator error: {}", e);
+                                             state.add_signal(signal_view);
+                                             return;
                                         }
                                     }
 
@@ -701,83 +838,83 @@ async fn process_ws_message(
                                         let final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
 
                                         if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
-                                            tracing::info!("🔒 [PAPER TRADING] OFI Buying Pressure -> Creating stínovou BUY pozici pro {:.6} BTC (Halted mode active)", final_trade_size);
+                                             tracing::info!("🔒 [PAPER TRADING] Buying Pressure (Composite: {:.2}) -> Creating stínovou BUY pozici pro {:.6} BTC (Halted mode active)", composite_signal, final_trade_size);
 
-                                            ofi.reset();
-                                            *last_trade_time = std::time::Instant::now();
+                                             ofi.reset();
+                                             *last_trade_time = std::time::Instant::now();
 
-                                            // Add executed signal locally to dashboard with Paper indicator
-                                            let mut executed_view = signal_view.clone();
-                                            executed_view.executed = true;
-                                            executed_view.rationale = format!("{} (PAPER)", executed_view.rationale);
-                                            state.add_signal(executed_view);
+                                             // Add executed signal locally to dashboard with Paper indicator
+                                             let mut executed_view = signal_view.clone();
+                                             executed_view.executed = true;
+                                             executed_view.rationale = format!("{} (PAPER)", executed_view.rationale);
+                                             state.add_signal(executed_view);
 
-                                            active_positions.write().push(ActivePosition {
-                                                entry_price: price,
-                                                quantity: final_trade_size,
-                                                side: Side::Buy,
-                                                tp_price: price + conf.strategy.take_profit_distance_usd,
-                                                sl_price: price - conf.strategy.stop_loss_distance_usd,
-                                                exposure_size: paper_position_size_pct,
-                                                is_paper: true, // Stínová pozice!
-                                            });
+                                             active_positions.write().push(ActivePosition {
+                                                 entry_price: price,
+                                                 quantity: final_trade_size,
+                                                 side: Side::Buy,
+                                                 tp_price: price + tp_dist,
+                                                 sl_price: price - sl_dist,
+                                                 exposure_size: paper_position_size_pct,
+                                                 is_paper: true, // Stínová pozice!
+                                             });
 
-                                            state.add_trade(pirana_dashboard::state::TradeView {
-                                                id: order_id.0.to_string(),
-                                                symbol: "tBTCUSD (Paper)".to_string(),
-                                                side: "BUY (Paper)".to_string(),
-                                                price,
-                                                quantity: final_trade_size,
-                                                pnl: 0.0,
-                                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                                order_type: "PAPER".to_string(),
-                                            });
+                                             state.add_trade(pirana_dashboard::state::TradeView {
+                                                 id: order_id.0.to_string(),
+                                                 symbol: "tBTCUSD (Paper)".to_string(),
+                                                 side: "BUY (Paper)".to_string(),
+                                                 price,
+                                                 quantity: final_trade_size,
+                                                 pnl: 0.0,
+                                                 timestamp: chrono::Utc::now().to_rfc3339(),
+                                                 order_type: "PAPER".to_string(),
+                                             });
                                         }
                                     } else {
                                         match risk_engine.evaluate_trade(&sig, price) {
-                                            Ok(assessment) if assessment.approved => {
-                                                // Calculate dynamic size
-                                                let current_usd = *state.usd_balance.read();
-                                                let total_portfolio_usd = current_btc * price + current_usd;
-                                                let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
-                                                let mut final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+                                             Ok(assessment) if assessment.approved => {
+                                                 // Calculate dynamic size
+                                                 let current_usd = *state.usd_balance.read();
+                                                 let total_portfolio_usd = current_btc * price + current_usd;
+                                                 let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
+                                                 let mut final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
 
-                                                let mut required_usd = final_trade_size * price;
-                                                if current_usd < required_usd {
-                                                    tracing::warn!("Dynamic BUY size {:.6} requires {:.2} USD, but only {:.2} USD is available. Adjusting size down.", final_trade_size, required_usd, current_usd);
-                                                    final_trade_size = (current_usd / price) * 0.99; // 1% buffer for fees/slippage
-                                                    required_usd = final_trade_size * price;
-                                                }
+                                                 let mut required_usd = final_trade_size * price;
+                                                 if current_usd < required_usd {
+                                                     tracing::warn!("Dynamic BUY size {:.6} requires {:.2} USD, but only {:.2} USD is available. Adjusting size down.", final_trade_size, required_usd, current_usd);
+                                                     final_trade_size = (current_usd / price) * 0.99; // 1% buffer for fees/slippage
+                                                     required_usd = final_trade_size * price;
+                                                 }
 
-                                                if final_trade_size < 0.00001 {
-                                                    tracing::warn!("Adjusted BUY size {:.6} is below minimum trade limit.", final_trade_size);
-                                                    state.add_signal(signal_view);
-                                                    return;
-                                                }
+                                                 if final_trade_size < 0.00001 {
+                                                     tracing::warn!("Adjusted BUY size {:.6} is below minimum trade limit.", final_trade_size);
+                                                     state.add_signal(signal_view);
+                                                     return;
+                                                 }
 
-                                                if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
-                                                    tracing::info!("OFI Buying Pressure -> Submitting BUY order asynchronously for {:.6} BTC", final_trade_size);
-                                                    
-                                                    // Cooldown and OFI reset immediately on main thread to prevent spamming!
-                                                    ofi.reset();
-                                                    *last_trade_time = std::time::Instant::now();
-                                                    *state.trades_today.write() += 1;
+                                                 if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
+                                                     tracing::info!("Buying Pressure (Composite: {:.2}) -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, SL: -{:.1})", composite_signal, final_trade_size, tp_dist, sl_dist);
+                                                     
+                                                     // Cooldown and OFI reset immediately on main thread to prevent spamming!
+                                                     ofi.reset();
+                                                     *last_trade_time = std::time::Instant::now();
+                                                     *state.trades_today.write() += 1;
 
-                                                    // Add executed signal locally to dashboard
-                                                    let mut executed_view = signal_view.clone();
-                                                    executed_view.executed = true;
-                                                    state.add_signal(executed_view);
+                                                     // Add executed signal locally to dashboard
+                                                     let mut executed_view = signal_view.clone();
+                                                     executed_view.executed = true;
+                                                     state.add_signal(executed_view);
 
-                                                    // Track active position BEFORE tokio::spawn to prevent race condition
-                                                    // where SELL arrives before BUY position is registered
-                                                    active_positions.write().push(ActivePosition {
-                                                        entry_price: price,
-                                                        quantity: final_trade_size,
-                                                        side: Side::Buy,
-                                                        tp_price: price + conf.strategy.take_profit_distance_usd,
-                                                        sl_price: price - conf.strategy.stop_loss_distance_usd,
-                                                        exposure_size: assessment.adjusted_position_size,
-                                                        is_paper: false,
+                                                     // Track active position BEFORE tokio::spawn to prevent race condition
+                                                     // where SELL arrives before BUY position is registered
+                                                     active_positions.write().push(ActivePosition {
+                                                         entry_price: price,
+                                                         quantity: final_trade_size,
+                                                         side: Side::Buy,
+                                                         tp_price: price + tp_dist,
+                                                         sl_price: price - sl_dist,
+                                                         exposure_size: assessment.adjusted_position_size,
+                                                         is_paper: false,
                                                     });
 
                                                     // Update balances locally BEFORE async to prevent stale reads
@@ -848,25 +985,29 @@ async fn process_ws_message(
                                             }
                                         }
                                     }
-                                } else if ofi.is_selling_pressure() {
+                                } else if is_selling {
                                     if current_btc <= conf.inventory.min_inventory_btc {
                                         tracing::warn!("Min BTC inventory reached ({}), skipping SELL", current_btc);
                                         return;
                                     }
                                     let p = SignalParams {
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
-                                        invalidation_level: price + conf.strategy.stop_loss_distance_usd,
-                                        volatility_adjusted_tp: price - conf.strategy.take_profit_distance_usd,
+                                        invalidation_level: price + sl_dist,
+                                        volatility_adjusted_tp: price - tp_dist,
                                         position_size_pct: conf.risk_management.position_size_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
+                                    let rationale_text = format!(
+                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1})",
+                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist
+                                    );
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::DistributionExit,
                                         target_asset: Symbol::new("tBTCUSD"),
                                         confidence_score: conf.strategy.min_confidence_score,
                                         market_regime: MarketRegime::HighVolatilityTrending,
-                                        rationale: "OFI Selling Pressure".to_string(),
+                                        rationale: rationale_text,
                                         recommended_params: p.clone(),
                                         timestamp: chrono::Utc::now(),
                                         invalidation_level: p.invalidation_level,
@@ -977,7 +1118,7 @@ async fn process_ws_message(
                                                 }
 
                                                 // Close the oldest BUY position NOW (before spawn) to prevent race condition
-                                                let mut realized_pnl = 0.0;
+                                                let realized_pnl;
                                                 let closed_entry_price;
                                                 {
                                                     let mut positions = active_positions.write();
@@ -1082,7 +1223,7 @@ async fn process_ws_message(
                                                                     entry_price: closed_entry_price,
                                                                     quantity: final_trade_size,
                                                                     side: Side::Buy,
-                                                                    tp_price: closed_entry_price + 350.0, // Conservative defaults for rollback
+                                                                    tp_price: closed_entry_price + 350.0,
                                                                     sl_price: closed_entry_price - 150.0,
                                                                     exposure_size: assessment.adjusted_position_size,
                                                                     is_paper: false,

@@ -1,5 +1,5 @@
 [system]
-reload_interval_seconds = 61
+reload_interval_seconds = 60
 
 [trading]
 trade_size_btc = 0.0002
@@ -22,3 +22,21 @@ max_inventory_btc = 0.01
 max_slippage_bps = 5
 position_size_pct = 2.0
 daily_loss_limit_usd = 1000.0
+
+[volatility]
+use_dynamic_atr = true
+atr_period = 14
+ticks_per_bar = 50
+atr_tp_multiplier = 0.5
+atr_sl_multiplier = 4.0
+min_tp_usd = 4.0
+max_tp_usd = 25.0
+min_sl_usd = 25.0
+max_sl_usd = 80.0
+
+[order_book]
+use_l2_depth_imbalance = true
+l2_depth_levels = 5
+l2_weight_decay = 0.5
+l2_weight_alpha = 0.40
+min_l2_imbalance_threshold = 0.15
