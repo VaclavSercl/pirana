@@ -7,11 +7,11 @@ max_open_orders = 3
 
 [strategy]
 entry_zone_spread_usd = 5.0
-take_profit_distance_usd = 13.0
-stop_loss_distance_usd = 30.0
-ofi_trigger_threshold = 0.90
+take_profit_distance_usd = 5.0
+stop_loss_distance_usd = 50.0
+ofi_trigger_threshold = 0.75
 ofi_window_size = 100
-trade_cooldown_ms = 15000
+trade_cooldown_ms = 28000
 min_confidence_score = 0.95
 
 [inventory]

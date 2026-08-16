@@ -50,7 +50,7 @@ PIRANA is NOT:
 ### AI Layer
 - regime classification, structural analysis, probabilistic reasoning
 - volatility adaptation, signal weighting, parameter optimization
-- Implemented using **Hermes Agent**
+- Implemented using **Hermes Agent (Gemini 3.7 Flash High Reasoning)**
 
 The AI layer NEVER participates directly inside the microsecond execution loop.
 
