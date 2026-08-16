@@ -19,16 +19,21 @@ Aplikuj následující exaktní postup:
    - Zkontroluj hodnoty:
      - system_mode: Pokud je 'Halted' nebo 'Defensive', zjisti proč.
      - btc_price: Ověř, že není zaseknutá (porovnej s externím Bitfinex API tickerem 'https://api-pub.bitfinex.com/v2/ticker/tBTCUSD' nebo zkontroluj, zda se v snapshots mění).
-     - consecutive_losses, daily_pnl, total_pnl, win_rate.
+     - consecutive_losses, daily_pnl, total_pnl, win_rate, exposure_pct.
 
-3. Analýza ziskovosti a úprava parametrů:
+3. Dynamická analýza úspěšnosti a adaptivní optimalizace AI (VŠE ŘÍDÍ AI DYNAMICKY):
    - Načti aktuální konfiguraci ze souboru '/home/wwwenda/workspace/pirana/strategy.toml'.
-   - Pokud snapshot ukazuje 'consecutive_losses > 3' nebo je PnL za posledních 24 hodin výrazně záporné:
-     - Přepni parametry na defenzivnější úroveň v strategy.toml.
-     - Doporučené úpravy: Zvyš 'ofi_trigger_threshold' (např. o 0.05, max do 0.90) pro snížení frekvence obchodování v šumu, nebo zvětši 'stop_loss_distance_usd' (např. o 5 USD) a zkrať 'take_profit_distance_usd' (o 2 USD), popřípadě prodluž 'trade_cooldown_ms' (např. o 5000 ms).
-     - Ulož upravený soubor strategy.toml a restartuj službu 'sudo systemctl restart pirana.service' pro načtení změn.
-   - Pokud je PnL kladné a stabilní:
-     - Můžeš parametry jemně uvolnit (např. snížit 'ofi_trigger_threshold' zpět k 0.70-0.75, nebo zkrátit cooldown).
+   - ZÁSADA: Žádný parametr nesmí být statický. AI vyhodnocuje všech 5 klíčových hodnot:
+     1. Velikost pozice ('position_size_pct' a 'use_dynamic_winrate_sizing'): Při vysokém win rate a růstu equity zvyšte až k 10-15 %, při propadu snižte na 1-2 %.
+     2. Agregovaná expozice ('max_aggregate_exposure_pct'): Povoleno až 90.0 % portfolia při silném tržním trendu / vysoké důvěře.
+     3. Bezpečnostní rezerva: AI dynamicky udržuje zbývající kapitál (100 % - expozice) pro zachycení hlubokých propadů a likvidity.
+     4. Riziko na obchod / ATR Stop-Loss: Adaptivní ('use_dynamic_atr = true', 'atr_tp_multiplier', 'atr_sl_multiplier').
+     5. Max inventory BTC ('use_dynamic_inventory = true'): Počítáno dynamicky z equity účtu a aktuální ceny BTC.
+   - Pokud snapshot ukazuje 'consecutive_losses > 3' nebo je PnL za posledních 24 hodin záporné:
+     - Přepni parametry na defenzivnější úroveň v strategy.toml (sniž position_size_pct, zvyš ofi_trigger_threshold o 0.05, uprav ATR násobky).
+     - Ulož upravený soubor strategy.toml (jádro si ho za běhu automaticky načte).
+   - Pokud je PnL kladné a win-rate stabilní:
+     - Optimalizuj parametry pro maximální akumulaci BTC (jemné navýšení dynamického position sizingu, optimální OFI práh 0.70-0.75).
 
 4. Vygenerování a odeslání reportu:
    - Sestav přehledný report pro uživatele (Václava) v češtině.

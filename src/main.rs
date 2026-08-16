@@ -50,16 +50,44 @@ pub struct StrategyParams {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct InventoryConfig {
+    #[serde(default = "default_min_inventory_btc")]
     pub min_inventory_btc: f64,
+    #[serde(default = "default_max_inventory_btc")]
     pub max_inventory_btc: f64,
+    #[serde(default = "default_true")]
+    pub use_dynamic_inventory: bool,
 }
+
+fn default_min_inventory_btc() -> f64 { 0.0001 }
+fn default_max_inventory_btc() -> f64 { 0.05 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RiskConfig {
+    #[serde(default = "default_max_slippage_bps")]
     pub max_slippage_bps: u32,
+    #[serde(default = "default_position_size_pct")]
     pub position_size_pct: f64,
+    #[serde(default = "default_max_aggregate_exposure_pct")]
+    pub max_aggregate_exposure_pct: f64,
+    #[serde(default = "default_max_single_trade_risk_pct")]
+    pub max_single_trade_risk_pct: f64,
+    #[serde(default = "default_daily_loss_limit_usd")]
     pub daily_loss_limit_usd: f64,
+    #[serde(default = "default_true")]
+    pub use_dynamic_winrate_sizing: bool,
+    #[serde(default = "default_min_position_size_pct")]
+    pub min_position_size_pct: f64,
+    #[serde(default = "default_max_position_size_pct")]
+    pub max_position_size_pct: f64,
 }
+
+fn default_max_slippage_bps() -> u32 { 5 }
+fn default_position_size_pct() -> f64 { 5.0 }
+fn default_max_aggregate_exposure_pct() -> f64 { 90.0 }
+fn default_max_single_trade_risk_pct() -> f64 { 5.0 }
+fn default_daily_loss_limit_usd() -> f64 { 1000.0 }
+fn default_min_position_size_pct() -> f64 { 1.0 }
+fn default_max_position_size_pct() -> f64 { 15.0 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct VolatilityStrategyConfig {
@@ -162,8 +190,21 @@ impl StrategyConfig {
                     trade_cooldown_ms: 28000,
                     min_confidence_score: 0.95,
                 },
-                inventory: InventoryConfig { min_inventory_btc: 0.0, max_inventory_btc: 0.01 },
-                risk_management: RiskConfig { max_slippage_bps: 5, position_size_pct: 2.0, daily_loss_limit_usd: 1000.0 },
+                inventory: InventoryConfig {
+                    min_inventory_btc: 0.0001,
+                    max_inventory_btc: 0.05,
+                    use_dynamic_inventory: true,
+                },
+                risk_management: RiskConfig {
+                    max_slippage_bps: 5,
+                    position_size_pct: 5.0,
+                    max_aggregate_exposure_pct: 90.0,
+                    max_single_trade_risk_pct: 5.0,
+                    daily_loss_limit_usd: 1000.0,
+                    use_dynamic_winrate_sizing: true,
+                    min_position_size_pct: 1.0,
+                    max_position_size_pct: 15.0,
+                },
                 volatility: VolatilityStrategyConfig::default(),
                 order_book: OrderBookStrategyConfig::default(),
             }
@@ -770,22 +811,47 @@ async fn process_ws_message(
                                 } else {
                                     (conf.strategy.take_profit_distance_usd, conf.strategy.stop_loss_distance_usd)
                                 };
+                                // Initialize DynamicSizer
+                                let current_usd = *state.usd_balance.read();
+                                let total_portfolio_usd = current_btc * price + current_usd;
+                                let dynamic_sizer = pirana_features::dynamic_sizing::DynamicSizer::new(
+                                    conf.risk_management.min_position_size_pct,
+                                    conf.risk_management.max_position_size_pct,
+                                    conf.risk_management.max_aggregate_exposure_pct,
+                                );
+
+                                let dynamic_pos_pct = if conf.risk_management.use_dynamic_winrate_sizing {
+                                    dynamic_sizer.calculate_dynamic_position_pct(
+                                        conf.risk_management.position_size_pct,
+                                        *state.win_rate.read(),
+                                        *state.trades_today.read(),
+                                        *state.consecutive_losses.read(),
+                                    )
+                                } else {
+                                    conf.risk_management.position_size_pct
+                                };
+
+                                let max_allowed_btc = if conf.inventory.use_dynamic_inventory {
+                                    dynamic_sizer.calculate_dynamic_max_inventory_btc(total_portfolio_usd, price)
+                                } else {
+                                    conf.inventory.max_inventory_btc
+                                };
 
                                 if is_buying {
-                                    if current_btc >= conf.inventory.max_inventory_btc {
-                                        tracing::warn!("Max BTC inventory reached ({}), skipping BUY", current_btc);
+                                    if current_btc >= max_allowed_btc {
+                                        tracing::warn!("Max dynamic BTC inventory reached ({:.6} >= {:.6} BTC), skipping BUY", current_btc, max_allowed_btc);
                                         return;
                                     }
                                     let p = SignalParams {
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
                                         invalidation_level: price - sl_dist,
                                         volatility_adjusted_tp: price + tp_dist,
-                                        position_size_pct: conf.risk_management.position_size_pct / 100.0,
+                                        position_size_pct: dynamic_pos_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
                                     let rationale_text = format!(
-                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1})",
-                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist
+                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}) | Dynamic Size: {:.2}%",
+                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
                                     );
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
@@ -994,12 +1060,12 @@ async fn process_ws_message(
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
                                         invalidation_level: price + sl_dist,
                                         volatility_adjusted_tp: price - tp_dist,
-                                        position_size_pct: conf.risk_management.position_size_pct / 100.0,
+                                        position_size_pct: dynamic_pos_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
                                     let rationale_text = format!(
-                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1})",
-                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist
+                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%",
+                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
                                     );
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),

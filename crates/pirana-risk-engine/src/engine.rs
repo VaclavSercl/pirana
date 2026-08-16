@@ -169,13 +169,12 @@ impl RiskEngine {
             0.0
         };
 
-        let mut single_trade_risk = position_size * stop_loss_pct;
+        let single_trade_risk = position_size * stop_loss_pct;
 
         // If single trade risk exceeds the limit, systematically adjust (reduce) the position size down
         if single_trade_risk > MAX_SINGLE_TRADE_RISK {
             let reduction_factor = MAX_SINGLE_TRADE_RISK / single_trade_risk;
             position_size *= reduction_factor;
-            single_trade_risk = position_size * stop_loss_pct;
             warn!(
                 "Single trade risk would exceed limit. Systematically adjusted position size down by {:.2}% to fit MAX_SINGLE_TRADE_RISK",
                 (1.0 - reduction_factor) * 100.0

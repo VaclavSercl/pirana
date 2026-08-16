@@ -7,11 +7,11 @@
 /// No panic selling — if price drops, we buy more or hold
 /// Short-term trades for maximum profit, long-term BTC appreciation
 
-/// Maximum aggregate exposure as a fraction of total capital (20%)
-pub const MAX_AGGREGATE_EXPOSURE: f64 = 0.20;
+/// Maximum aggregate exposure as a fraction of total capital (90%)
+pub const MAX_AGGREGATE_EXPOSURE: f64 = 0.90;
 
-/// Maximum single trade risk as a fraction of total capital (0.50%)
-pub const MAX_SINGLE_TRADE_RISK: f64 = 0.005;
+/// Maximum single trade risk as a fraction of total capital (5.0%)
+pub const MAX_SINGLE_TRADE_RISK: f64 = 0.05;
 
 /// Maximum daily drawdown before defensive mode (3%)
 pub const MAX_DAILY_DRAWDOWN: f64 = 0.03;

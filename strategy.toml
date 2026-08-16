@@ -16,12 +16,18 @@ min_confidence_score = 0.95
 
 [inventory]
 min_inventory_btc = 0.0001
-max_inventory_btc = 0.01
+max_inventory_btc = 0.05
+use_dynamic_inventory = true
 
 [risk_management]
 max_slippage_bps = 5
-position_size_pct = 2.0
+position_size_pct = 5.0
+max_aggregate_exposure_pct = 90.0
+max_single_trade_risk_pct = 5.0
 daily_loss_limit_usd = 1000.0
+use_dynamic_winrate_sizing = true
+min_position_size_pct = 1.0
+max_position_size_pct = 15.0
 
 [volatility]
 use_dynamic_atr = true
