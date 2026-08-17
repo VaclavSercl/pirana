@@ -183,12 +183,24 @@ def handle_reconcile(chat_id):
     except Exception as e:
         send_telegram(chat_id, f"❌ <b>Chyba při reconciliaci:</b> <code>{e}</code>")
 
+PROPOSAL_SCRIPT = "/home/wwwenda/workspace/pirana/scripts/send_monthly_proposal.py"
+
+def handle_proposal(chat_id):
+    """Handles /proposal command."""
+    try:
+        send_telegram(chat_id, "🔬 <b>Provádím hloubkovou analýzu trhu a generuji strategický návrh...</b>")
+        res = subprocess.run(["python3", PROPOSAL_SCRIPT, "--force-now"], capture_output=True, text=True, check=True)
+        # The script sends the proposal directly
+    except Exception as e:
+        send_telegram(chat_id, f"❌ <b>Chyba při generování návrhu:</b> <code>{e}</code>")
+
 def handle_help(chat_id):
     """Handles /help command."""
     msg = (
         "👑 <b>ČÁSLAV :: PŘÍKAZY VELENÍ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "• <code>/status</code> ➔ Živý přehled PnL, trezoru a zůstatků\n"
+        "• <code>/proposal</code> ➔ Měsíční strategický výzkumný návrh inovace\n"
         "• <code>/scale &lt;pct&gt;</code> ➔ Úprava velikosti pozice (např. <code>/scale 8.0</code>)\n"
         "• <code>/pause</code> ➔ Okamžité pozastavení tradingu\n"
         "• <code>/resume</code> ➔ Obnovení aktivního tradingu\n"
@@ -217,6 +229,8 @@ def process_message(msg):
         handle_help(chat_id)
     elif cmd == "/status":
         handle_status(chat_id)
+    elif cmd == "/proposal":
+        handle_proposal(chat_id)
     elif cmd == "/scale":
         handle_scale(chat_id, args)
     elif cmd == "/pause":
