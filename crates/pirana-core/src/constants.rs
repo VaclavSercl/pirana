@@ -44,7 +44,8 @@ pub const MAX_OPEN_ORDERS_PER_SYMBOL: usize = 10;
 pub const MAX_POSITION_SIZE_BTC: f64 = 1.0;
 
 /// Minimum order size on Bitfinex for BTC
-pub const MIN_ORDER_SIZE_BTC: f64 = 0.00001;
+/// Minimum order size in BTC (Bitfinex enforces minimum 0.00004 BTC for tBTCUSD)
+pub const MIN_ORDER_SIZE_BTC: f64 = 0.00004;
 
 /// WebSocket reconnection delay in milliseconds
 pub const WS_RECONNECT_DELAY_MS: u64 = 1000;

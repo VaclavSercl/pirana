@@ -39,6 +39,13 @@ impl BitfinexClient {
         quantity: f64,
         price: f64,
     ) -> PiranaResult<String> {
+        if quantity.abs() < MIN_ORDER_SIZE_BTC {
+            return Err(PiranaError::ExchangeApi {
+                code: 10001,
+                message: format!("Order quantity {:.6} is below exchange minimum size of {:.6} BTC", quantity, MIN_ORDER_SIZE_BTC),
+            });
+        }
+
         let nonce = chrono::Utc::now().timestamp_micros().to_string();
         let endpoint = "/api/v2/auth/w/order/submit";
 

@@ -63,7 +63,7 @@ impl DynamicSizer {
         }
         let max_exposure_usd = total_portfolio_usd * (self.max_aggregate_exposure_pct / 100.0);
         let max_btc = max_exposure_usd / current_btc_price;
-        max_btc.max(0.00001)
+        max_btc.max(0.00004)
     }
 
     /// Calculate dynamic capital reserve percentage

@@ -1,5 +1,6 @@
 use pirana_config::settings::PiranaConfig;
 use pirana_core::errors::PiranaResult;
+use pirana_core::constants::MIN_ORDER_SIZE_BTC;
 use pirana_core::types::{Signal, SignalType, SignalParams, Symbol, Side, Tick, MarketRegime, OrderStatus, SystemMode};
 use pirana_execution::bitfinex_client::BitfinexClient;
 use pirana_execution::order_router::OrderRouter;
@@ -901,7 +902,7 @@ async fn process_ws_message(
                                         // Use standard position sizing (e.g., 5.0% or strategy config)
                                         let paper_position_size_pct = conf.risk_management.position_size_pct / 100.0;
                                         let dynamic_trade_size = (paper_position_size_pct * total_portfolio_usd) / price;
-                                        let final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+                                        let final_trade_size = dynamic_trade_size.clamp(MIN_ORDER_SIZE_BTC, 1.0);
 
                                         if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                              tracing::info!("🔒 [PAPER TRADING] Buying Pressure (Composite: {:.2}) -> Creating stínovou BUY pozici pro {:.6} BTC (Halted mode active)", composite_signal, final_trade_size);
@@ -943,7 +944,7 @@ async fn process_ws_message(
                                                  let current_usd = *state.usd_balance.read();
                                                  let total_portfolio_usd = current_btc * price + current_usd;
                                                  let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
-                                                 let mut final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+                                                 let mut final_trade_size = dynamic_trade_size.clamp(MIN_ORDER_SIZE_BTC, 1.0);
 
                                                  let mut required_usd = final_trade_size * price;
                                                  if current_usd < required_usd {
@@ -952,8 +953,8 @@ async fn process_ws_message(
                                                      required_usd = final_trade_size * price;
                                                  }
 
-                                                 if final_trade_size < 0.00001 {
-                                                     tracing::warn!("Adjusted BUY size {:.6} is below minimum trade limit.", final_trade_size);
+                                                 if final_trade_size < MIN_ORDER_SIZE_BTC {
+                                                     tracing::warn!("Adjusted BUY size {:.6} is below minimum trade limit ({:.6} BTC).", final_trade_size, MIN_ORDER_SIZE_BTC);
                                                      state.add_signal(signal_view);
                                                      return;
                                                  }
@@ -1163,7 +1164,7 @@ async fn process_ws_message(
                                                 let current_usd = *state.usd_balance.read();
                                                 let total_portfolio_usd = current_btc * price + current_usd;
                                                 let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
-                                                let mut final_trade_size = dynamic_trade_size.clamp(0.00001, 1.0);
+                                                let mut final_trade_size = dynamic_trade_size.clamp(MIN_ORDER_SIZE_BTC, 1.0);
 
                                                 if current_btc < final_trade_size {
                                                     tracing::warn!("Dynamic SELL size {:.6} exceeds available balance ({:.6}). Adjusting size to maximum available balance.", final_trade_size, current_btc);
@@ -1177,8 +1178,8 @@ async fn process_ws_message(
                                                     final_trade_size = safe_btc;
                                                 }
 
-                                                if final_trade_size < 0.00001 {
-                                                    tracing::warn!("Adjusted SELL size {:.6} is below minimum trade limit.", final_trade_size);
+                                                if final_trade_size < MIN_ORDER_SIZE_BTC {
+                                                    tracing::warn!("Adjusted SELL size {:.6} is below minimum trade limit ({:.6} BTC).", final_trade_size, MIN_ORDER_SIZE_BTC);
                                                     state.add_signal(signal_view);
                                                     return;
                                                 }
