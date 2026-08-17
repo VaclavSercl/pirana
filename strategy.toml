@@ -21,7 +21,7 @@ use_dynamic_inventory = true
 
 [risk_management]
 max_slippage_bps = 5
-position_size_pct = 2.0
+position_size_pct = 10.0
 max_aggregate_exposure_pct = 90.0
 max_single_trade_risk_pct = 5.0
 daily_loss_limit_usd = 1000.0
