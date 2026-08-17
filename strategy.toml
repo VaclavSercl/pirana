@@ -24,7 +24,7 @@ max_slippage_bps = 5
 position_size_pct = 10.0
 max_aggregate_exposure_pct = 90.0
 max_single_trade_risk_pct = 5.0
-daily_loss_limit_usd = 1000.0
+daily_loss_limit_usd = 40.0
 use_dynamic_winrate_sizing = true
 min_position_size_pct = 1.0
 max_position_size_pct = 15.0
@@ -36,7 +36,7 @@ ticks_per_bar = 50
 atr_tp_multiplier = 0.4
 atr_sl_multiplier = 3.0
 min_tp_usd = 4.0
-max_tp_usd = 25.0
+max_tp_usd = 160.0
 min_sl_usd = 25.0
 max_sl_usd = 80.0
 
@@ -46,3 +46,18 @@ l2_depth_levels = 5
 l2_weight_decay = 0.5
 l2_weight_alpha = 0.40
 min_l2_imbalance_threshold = 0.15
+
+[trailing_stop]
+enabled = true
+min_trigger_usd = 4.0
+be_offset_usd = 1.0
+trail_multiplier = 0.5
+
+[profit_skimmer]
+enabled = true
+btc_lock_pct = 70.0
+
+[adaptive_cooldown]
+enabled = true
+min_ms = 8000
+max_ms = 60000
