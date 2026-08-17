@@ -35,6 +35,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def log_message(self, format, *args):
+        # Suppress periodic HTTP request logging to journalctl
+        pass
+
 print("Pirana Prometheus Exporter starting on port 9091...")
 server = HTTPServer(('0.0.0.0', 9091), MetricsHandler)
 server.serve_forever()

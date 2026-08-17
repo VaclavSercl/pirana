@@ -2,7 +2,6 @@ use pirana_core::order_book::OrderBook;
 use pirana_core::types::*;
 use pirana_core::errors::{PiranaError, PiranaResult};
 use std::collections::HashMap;
-use tracing::{info, debug};
 
 /// Manages order books for multiple symbols
 pub struct OrderBookManager {
@@ -20,13 +19,9 @@ impl OrderBookManager {
 
     /// Get or create an order book for a symbol
     pub fn get_or_create(&mut self, symbol: &str) -> &mut OrderBook {
-        if !self.books.contains_key(symbol) {
-            self.books.insert(
-                symbol.to_string(),
-                OrderBook::new(Symbol::new(symbol), 0.01),
-            );
-        }
-        self.books.get_mut(symbol).unwrap()
+        self.books.entry(symbol.to_string()).or_insert_with(|| {
+            OrderBook::new(Symbol::new(symbol), 0.01)
+        })
     }
 
     /// Process a raw order book update from Bitfinex WebSocket

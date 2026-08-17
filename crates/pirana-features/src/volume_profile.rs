@@ -54,10 +54,11 @@ impl VolumeProfile {
         }
 
         // Find POC (level with highest volume)
-        let (poc_key, _) = self.levels.iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap();
-        self.poc = self.key_to_price(*poc_key);
+        if let Some((poc_key, _)) = self.levels.iter().max_by(|a, b| {
+            a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            self.poc = self.key_to_price(*poc_key);
+        }
 
         // Compute Value Area (70% of total volume around POC)
         self.compute_value_area();

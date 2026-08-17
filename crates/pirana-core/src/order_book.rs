@@ -47,14 +47,14 @@ impl OrderBook {
 
         match side {
             Side::Buy => {
-                if quantity <= 0.0 {
+                if quantity <= 0.0 || order_count == 0 {
                     self.bids.remove(&key);
                 } else {
                     self.bids.insert(key, level);
                 }
             }
             Side::Sell => {
-                if quantity <= 0.0 {
+                if quantity <= 0.0 || order_count == 0 {
                     self.asks.remove(&key);
                 } else {
                     self.asks.insert(key, level);
@@ -205,5 +205,15 @@ mod tests {
 
         let imbalance = book.book_imbalance(5);
         assert!(imbalance > 0.0); // More bid volume = positive imbalance
+    }
+
+    #[test]
+    fn test_order_book_remove_level() {
+        let mut book = OrderBook::new(Symbol::new("tBTCUSD"), 0.01);
+        book.update_level(Side::Buy, 60000.0, 1.0, 5);
+        assert!(book.best_bid().is_some());
+        // Remove level via count == 0
+        book.update_level(Side::Buy, 60000.0, 1.0, 0);
+        assert!(book.best_bid().is_none());
     }
 }

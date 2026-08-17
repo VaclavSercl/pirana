@@ -188,6 +188,53 @@ impl BitfinexClient {
         Ok(balances)
     }
 
+    /// Get active open order IDs for a symbol (for orphan reconciliation)
+    pub async fn get_active_orders(&self, symbol: &str) -> PiranaResult<Vec<i64>> {
+        let nonce = chrono::Utc::now().timestamp_micros().to_string();
+        let endpoint = format!("/api/v2/auth/r/orders/{}", symbol);
+        let body = "{}";
+        let payload = format!("{}{}{}", endpoint, nonce, body);
+        let signature = self.sign(&payload);
+
+        let url = format!("{}/v2/auth/r/orders/{}", self.base_url, symbol);
+
+        let response = self.client
+            .post(&url)
+            .header("bfx-apikey", &self.api_key)
+            .header("bfx-nonce", &nonce)
+            .header("bfx-signature", &signature)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| PiranaError::ExchangeApi {
+                code: -1,
+                message: format!("Active orders request failed: {}", e),
+            })?;
+
+        let json: serde_json::Value = response.json().await.map_err(|e| {
+            PiranaError::ExchangeApi {
+                code: -1,
+                message: format!("Active orders parse failed: {}", e),
+            }
+        })?;
+
+        let mut order_ids = Vec::new();
+        if let Some(arr) = json.as_array() {
+            for item in arr {
+                if let Some(order_arr) = item.as_array() {
+                    if let Some(id_val) = order_arr.first() {
+                        if let Some(id) = id_val.as_i64() {
+                            order_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(order_ids)
+    }
+
     fn sign(&self, payload: &str) -> String {
         let mut mac = HmacSha384::new_from_slice(self.api_secret.as_bytes())
             .expect("HMAC can take key of any size");

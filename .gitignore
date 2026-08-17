@@ -42,3 +42,5 @@ logs/
 *.so
 *.dylib
 *.bak
+__pycache__/
+*.pyc
