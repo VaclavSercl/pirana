@@ -55,6 +55,7 @@ trail_multiplier = 0.5
 
 [profit_skimmer]
 enabled = true
+# 10 % z každého zisku ze spreadu se natrvalo uzamkne do BTC trezoru
 btc_lock_pct = 10.0
 
 [adaptive_cooldown]
