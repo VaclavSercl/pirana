@@ -58,6 +58,7 @@ enabled = true
 # 10 % z každého zisku ze spreadu se natrvalo uzamkne do BTC trezoru
 btc_lock_pct = 10.0
 # Uzamčené BTC se odečte z volné marže a bot na něj nikdy nesáhne
+exclude_from_trading_margin = true
 
 [adaptive_cooldown]
 enabled = true
