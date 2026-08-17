@@ -66,6 +66,12 @@ def commit_strategy(reason="Autonomous AI tuning by Caslav"):
         if res.returncode != 0:
             subprocess.run(["git", "commit", "-m", commit_msg], cwd=REPO_DIR, check=True)
             print(f"[OK] Strategy committed to Git: '{commit_msg}'")
+            # Push automatically to GitHub remote
+            try:
+                subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, timeout=15, check=True)
+                print("[OK] Pushed commit to GitHub (origin/main).")
+            except Exception as pe:
+                print(f"[WARN] Remote GitHub push deferred: {pe}")
         else:
             print("[INFO] No changes detected in strategy.toml to commit.")
         return True
