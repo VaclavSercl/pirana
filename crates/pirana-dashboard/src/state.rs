@@ -62,6 +62,14 @@ pub struct DashboardState {
     pub starting_equity: Arc<parking_lot::RwLock<f64>>,
     /// Locked BTC profit reserve (Asymmetric Profit Skimmer)
     pub locked_btc_reserve: Arc<parking_lot::RwLock<f64>>,
+    /// Binance BTC/USDT price
+    pub binance_btc_price: Arc<parking_lot::RwLock<f64>>,
+    /// Coinbase BTC-USD price
+    pub coinbase_btc_price: Arc<parking_lot::RwLock<f64>>,
+    /// Multi-Exchange Lead-Lag disparity in USD
+    pub lead_lag_disparity_usd: Arc<parking_lot::RwLock<f64>>,
+    /// Lead-Lag status / rationale
+    pub lead_lag_status: Arc<parking_lot::RwLock<String>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -164,6 +172,10 @@ pub struct DashboardSnapshot {
     pub avg_trade_size: f64,
     pub starting_equity: f64,
     pub locked_btc_reserve: f64,
+    pub binance_btc_price: f64,
+    pub coinbase_btc_price: f64,
+    pub lead_lag_disparity_usd: f64,
+    pub lead_lag_status: String,
     pub uptime_seconds: u64,
 }
 
@@ -202,6 +214,10 @@ impl DashboardState {
             avg_trade_size: Arc::new(parking_lot::RwLock::new(0.0)),
             starting_equity: Arc::new(parking_lot::RwLock::new(0.0)),
             locked_btc_reserve: Arc::new(parking_lot::RwLock::new(0.0)),
+            binance_btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
+            coinbase_btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
+            lead_lag_disparity_usd: Arc::new(parking_lot::RwLock::new(0.0)),
+            lead_lag_status: Arc::new(parking_lot::RwLock::new("Neutral".to_string())),
             start_time: Utc::now(),
         }
     }
@@ -237,6 +253,10 @@ impl DashboardState {
             avg_trade_size: *self.avg_trade_size.read(),
             starting_equity: *self.starting_equity.read(),
             locked_btc_reserve: *self.locked_btc_reserve.read(),
+            binance_btc_price: *self.binance_btc_price.read(),
+            coinbase_btc_price: *self.coinbase_btc_price.read(),
+            lead_lag_disparity_usd: *self.lead_lag_disparity_usd.read(),
+            lead_lag_status: self.lead_lag_status.read().clone(),
             uptime_seconds: uptime,
         }
     }

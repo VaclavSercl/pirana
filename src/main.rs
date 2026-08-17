@@ -7,6 +7,9 @@ use pirana_execution::order_router::OrderRouter;
 use pirana_features::ofi::OfiCalculator;
 use pirana_features::atr::AtrCalculator;
 use pirana_features::l2_depth::L2DepthCalculator;
+use pirana_features::cross_exchange::{LeadLagEngine, LeadLagConfig, LeadLagSignal, LeadLagSignalType};
+use pirana_market_data::binance_ws::{BinanceWebSocket, BinanceTradeTick};
+use pirana_market_data::coinbase_ws::{CoinbaseWebSocket, CoinbaseTradeTick};
 use pirana_dashboard::state::DashboardState;
 use pirana_signal_validator::validator::{SignalValidator, ValidationResult};
 use pirana_risk_engine::engine::RiskEngine;
@@ -31,6 +34,8 @@ pub struct StrategyConfig {
     pub profit_skimmer: ProfitSkimmerConfig,
     #[serde(default)]
     pub adaptive_cooldown: AdaptiveCooldownConfig,
+    #[serde(default)]
+    pub lead_lag: LeadLagConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -289,6 +294,7 @@ impl StrategyConfig {
                 trailing_stop: TrailingStopConfig::default(),
                 profit_skimmer: ProfitSkimmerConfig::default(),
                 adaptive_cooldown: AdaptiveCooldownConfig::default(),
+                lead_lag: LeadLagConfig::default(),
             }
         })
     }
@@ -525,6 +531,41 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         }
     });
 
+    let lead_lag_conf = strategy_config.read().lead_lag.clone();
+    let lead_lag_engine = Arc::new(parking_lot::RwLock::new(LeadLagEngine::new(lead_lag_conf)));
+
+    // Spawn Binance Public WebSocket worker
+    let (binance_tx, mut binance_rx) = tokio::sync::mpsc::channel::<BinanceTradeTick>(1000);
+    let binance_ws = BinanceWebSocket::new("wss://stream.binance.com:9443/ws/btcusdt@trade");
+    tokio::spawn(async move {
+        binance_ws.run_loop(binance_tx).await;
+    });
+
+    let lead_lag_bin = lead_lag_engine.clone();
+    let state_bin = state.clone();
+    tokio::spawn(async move {
+        while let Some(tick) = binance_rx.recv().await {
+            lead_lag_bin.write().update_binance(tick.price, tick.timestamp_ms);
+            *state_bin.binance_btc_price.write() = tick.price;
+        }
+    });
+
+    // Spawn Coinbase Public WebSocket worker
+    let (coinbase_tx, mut coinbase_rx) = tokio::sync::mpsc::channel::<CoinbaseTradeTick>(1000);
+    let coinbase_ws = CoinbaseWebSocket::new("wss://ws-feed.exchange.coinbase.com");
+    tokio::spawn(async move {
+        coinbase_ws.run_loop(coinbase_tx).await;
+    });
+
+    let lead_lag_cb = lead_lag_engine.clone();
+    let state_cb = state.clone();
+    tokio::spawn(async move {
+        while let Some(tick) = coinbase_rx.recv().await {
+            lead_lag_cb.write().update_coinbase(tick.price, tick.timestamp_ms);
+            *state_cb.coinbase_btc_price.write() = tick.price;
+        }
+    });
+
     let url = "wss://api-pub.bitfinex.com/ws/2";
 
     loop {
@@ -591,7 +632,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -642,6 +683,7 @@ async fn process_ws_message(
     strategy_config: &Arc<parking_lot::RwLock<StrategyConfig>>,
     last_trade_time: &mut std::time::Instant,
     active_positions: &Arc<parking_lot::RwLock<Vec<ActivePosition>>>,
+    lead_lag_engine: &Arc<parking_lot::RwLock<LeadLagEngine>>,
 ) {
     if let Some(array) = data.as_array() {
         if array.len() >= 2 {
@@ -653,6 +695,9 @@ async fn process_ws_message(
                         state.add_price_point(price);
                         *last_price = price;
                         atr.process_price(price);
+
+                        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                        lead_lag_engine.write().update_bitfinex(price, now_ms);
 
                         // Check active positions for Trailing Stop, Breakeven, Take Profit / Stop Loss
                         let mut positions_to_close = Vec::new();
@@ -1039,13 +1084,23 @@ async fn process_ws_message(
                                 };
                                 let current_btc = (total_btc - locked_btc).max(0.0);
 
-                                let is_buying = if conf.order_book.use_l2_depth_imbalance {
+                                let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                                lead_lag_engine.write().update_bitfinex(price, now_ms);
+                                let lead_lag_sig = lead_lag_engine.read().evaluate(now_ms);
+
+                                *state.lead_lag_disparity_usd.write() = lead_lag_sig.disparity_usd;
+                                *state.lead_lag_status.write() = lead_lag_sig.rationale.clone();
+
+                                let is_lead_lag_buy = lead_lag_sig.signal_type == LeadLagSignalType::FrontRunBuy;
+                                let is_lead_lag_sell = lead_lag_sig.signal_type == LeadLagSignalType::FrontRunSell;
+
+                                let is_buying = is_lead_lag_buy || if conf.order_book.use_l2_depth_imbalance {
                                     ofi.is_buying_pressure() && l2_depth.is_buying_supported() && composite_signal >= conf.strategy.ofi_trigger_threshold
                                 } else {
                                     ofi.is_buying_pressure()
                                 };
 
-                                let is_selling = if conf.order_book.use_l2_depth_imbalance {
+                                let is_selling = is_lead_lag_sell || if conf.order_book.use_l2_depth_imbalance {
                                     ofi.is_selling_pressure() && l2_depth.is_selling_supported() && composite_signal <= -conf.strategy.ofi_trigger_threshold
                                 } else {
                                     ofi.is_selling_pressure()
@@ -1104,10 +1159,17 @@ async fn process_ws_message(
                                         position_size_pct: dynamic_pos_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
-                                    let rationale_text = format!(
-                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}) | Dynamic Size: {:.2}%",
-                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
-                                    );
+                                    let rationale_text = if is_lead_lag_buy {
+                                        format!(
+                                            "⚡ [LEAD-LAG FRONT-RUN BUY] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
+                                            lead_lag_sig.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                        )
+                                    } else {
+                                        format!(
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}) | Dynamic Size: {:.2}%",
+                                            ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
+                                        )
+                                    };
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::SpreadCapture,
@@ -1332,10 +1394,17 @@ async fn process_ws_message(
                                         position_size_pct: dynamic_pos_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
-                                    let rationale_text = format!(
-                                        "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%",
-                                        ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
-                                    );
+                                    let rationale_text = if is_lead_lag_sell {
+                                        format!(
+                                            "⚡ [LEAD-LAG FRONT-RUN SELL] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
+                                            lead_lag_sig.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                        )
+                                    } else {
+                                        format!(
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%",
+                                            ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
+                                        )
+                                    };
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::DistributionExit,

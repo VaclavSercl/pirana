@@ -1,78 +1,328 @@
-use pirana_core::types::*;
-use pirana_core::errors::PiranaResult;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
-/// Cross-Exchange Spread Analysis
-/// Identifies temporary structural inefficiencies
-#[derive(Debug)]
-pub struct CrossExchangeAnalyzer {
-    /// Prices from different exchanges
-    prices: std::collections::HashMap<String, f64>,
-    /// Minimum spread to consider (in basis points)
-    min_spread_bps: f64,
+/// Lead-Lag Signal Direction
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeadLagSignalType {
+    FrontRunBuy,
+    FrontRunSell,
+    Neutral,
 }
 
-impl CrossExchangeAnalyzer {
-    pub fn new(min_spread_bps: f64) -> Self {
+/// Detailed Lead-Lag Signal Output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeadLagSignal {
+    pub signal_type: LeadLagSignalType,
+    pub leader_price: f64,
+    pub bitfinex_price: f64,
+    pub disparity_usd: f64,
+    pub binance_price: f64,
+    pub coinbase_price: f64,
+    pub binance_velocity_usd: f64,
+    pub coinbase_velocity_usd: f64,
+    pub composite_velocity_usd: f64,
+    pub confidence: f64,
+    pub rationale: String,
+}
+
+/// Price sample with timestamp
+#[derive(Debug, Clone, Copy)]
+struct PriceSample {
+    price: f64,
+    timestamp_ms: u64,
+}
+
+/// Configuration for the Multi-Exchange Lead-Lag Engine
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LeadLagConfig {
+    pub enabled: bool,
+    pub binance_enabled: bool,
+    pub coinbase_enabled: bool,
+    pub min_lead_disparity_usd: f64,
+    pub velocity_window_ms: u64,
+    pub weight_binance: f64,
+    pub weight_coinbase: f64,
+    pub min_confidence_score: f64,
+}
+
+impl Default for LeadLagConfig {
+    fn default() -> Self {
         Self {
-            prices: std::collections::HashMap::new(),
-            min_spread_bps,
+            enabled: true,
+            binance_enabled: true,
+            coinbase_enabled: true,
+            min_lead_disparity_usd: 15.0,
+            velocity_window_ms: 250,
+            weight_binance: 0.65,
+            weight_coinbase: 0.35,
+            min_confidence_score: 0.95,
+        }
+    }
+}
+
+/// Multi-Exchange Lead-Lag Momentum Engine
+/// Tracks Binance (BTC/USDT) and Coinbase (BTC-USD) in real-time to front-run Bitfinex (0% Fee)
+#[derive(Debug)]
+pub struct LeadLagEngine {
+    config: LeadLagConfig,
+    binance_samples: VecDeque<PriceSample>,
+    coinbase_samples: VecDeque<PriceSample>,
+    bitfinex_samples: VecDeque<PriceSample>,
+    last_binance_price: f64,
+    last_coinbase_price: f64,
+    last_bitfinex_price: f64,
+    last_binance_update_ms: u64,
+    last_coinbase_update_ms: u64,
+    last_bitfinex_update_ms: u64,
+}
+
+impl LeadLagEngine {
+    pub fn new(config: LeadLagConfig) -> Self {
+        Self {
+            config,
+            binance_samples: VecDeque::with_capacity(500),
+            coinbase_samples: VecDeque::with_capacity(500),
+            bitfinex_samples: VecDeque::with_capacity(500),
+            last_binance_price: 0.0,
+            last_coinbase_price: 0.0,
+            last_bitfinex_price: 0.0,
+            last_binance_update_ms: 0,
+            last_coinbase_update_ms: 0,
+            last_bitfinex_update_ms: 0,
         }
     }
 
-    /// Update price from an exchange
-    pub fn update_price(&mut self, exchange: &str, price: f64) {
-        self.prices.insert(exchange.to_string(), price);
-    }
-
-    /// Get the spread between two exchanges in basis points
-    pub fn spread_bps(&self, exchange_a: &str, exchange_b: &str) -> Option<f64> {
-        let price_a = self.prices.get(exchange_a)?;
-        let price_b = self.prices.get(exchange_b)?;
-        let avg = (price_a + price_b) / 2.0;
-        if avg > 0.0 {
-            Some(((price_b - price_a).abs() / avg) * 10_000.0)
-        } else {
-            None
+    /// Record a new Binance BTC/USDT price tick
+    pub fn update_binance(&mut self, price: f64, timestamp_ms: u64) {
+        if price > 0.0 {
+            self.last_binance_price = price;
+            self.last_binance_update_ms = timestamp_ms;
+            self.binance_samples.push_back(PriceSample { price, timestamp_ms });
+            self.prune_samples(timestamp_ms);
         }
     }
 
-    /// Find the best arbitrage opportunity
-    pub fn find_opportunity(&self) -> Option<ArbitrageOpportunity> {
-        let exchanges: Vec<&String> = self.prices.keys().collect();
-        let mut best: Option<ArbitrageOpportunity> = None;
+    /// Record a new Coinbase BTC-USD price tick
+    pub fn update_coinbase(&mut self, price: f64, timestamp_ms: u64) {
+        if price > 0.0 {
+            self.last_coinbase_price = price;
+            self.last_coinbase_update_ms = timestamp_ms;
+            self.coinbase_samples.push_back(PriceSample { price, timestamp_ms });
+            self.prune_samples(timestamp_ms);
+        }
+    }
 
-        for i in 0..exchanges.len() {
-            for j in (i + 1)..exchanges.len() {
-                let ex_a = exchanges[i];
-                let ex_b = exchanges[j];
-                if let Some(spread) = self.spread_bps(ex_a, ex_b) {
-                    if spread >= self.min_spread_bps {
-                        let buy_ex = if self.prices[ex_a] < self.prices[ex_b] { ex_a } else { ex_b };
-                        let sell_ex = if buy_ex == ex_a { ex_b } else { ex_a };
+    /// Record a new Bitfinex BTC/USD price tick
+    pub fn update_bitfinex(&mut self, price: f64, timestamp_ms: u64) {
+        if price > 0.0 {
+            self.last_bitfinex_price = price;
+            self.last_bitfinex_update_ms = timestamp_ms;
+            self.bitfinex_samples.push_back(PriceSample { price, timestamp_ms });
+            self.prune_samples(timestamp_ms);
+        }
+    }
 
-                        if best.as_ref().map_or(true, |b| spread > b.spread_bps) {
-                            best = Some(ArbitrageOpportunity {
-                                buy_exchange: buy_ex.clone(),
-                                sell_exchange: sell_ex.clone(),
-                                spread_bps: spread,
-                                buy_price: self.prices[buy_ex],
-                                sell_price: self.prices[sell_ex],
-                            });
-                        }
-                    }
-                }
+    /// Prune samples older than 5 seconds
+    fn prune_samples(&mut self, current_time_ms: u64) {
+        let cutoff = current_time_ms.saturating_sub(5000);
+        while let Some(sample) = self.binance_samples.front() {
+            if sample.timestamp_ms < cutoff {
+                self.binance_samples.pop_front();
+            } else {
+                break;
             }
         }
+        while let Some(sample) = self.coinbase_samples.front() {
+            if sample.timestamp_ms < cutoff {
+                self.coinbase_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        while let Some(sample) = self.bitfinex_samples.front() {
+            if sample.timestamp_ms < cutoff {
+                self.bitfinex_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
 
-        best
+    /// Calculate price velocity over velocity_window_ms
+    fn calculate_velocity(&self, samples: &VecDeque<PriceSample>, current_price: f64, current_time_ms: u64) -> f64 {
+        if samples.is_empty() || current_price <= 0.0 {
+            return 0.0;
+        }
+        let window_start = current_time_ms.saturating_sub(self.config.velocity_window_ms);
+        for sample in samples.iter() {
+            if sample.timestamp_ms >= window_start {
+                return current_price - sample.price;
+            }
+        }
+        0.0
+    }
+
+    /// Evaluates real-time Lead-Lag disparity between global leaders (Binance + Coinbase) and Bitfinex
+    pub fn evaluate(&self, current_time_ms: u64) -> LeadLagSignal {
+        if !self.config.enabled || self.last_bitfinex_price <= 0.0 {
+            return LeadLagSignal {
+                signal_type: LeadLagSignalType::Neutral,
+                leader_price: self.last_bitfinex_price,
+                bitfinex_price: self.last_bitfinex_price,
+                disparity_usd: 0.0,
+                binance_price: self.last_binance_price,
+                coinbase_price: self.last_coinbase_price,
+                binance_velocity_usd: 0.0,
+                coinbase_velocity_usd: 0.0,
+                composite_velocity_usd: 0.0,
+                confidence: 0.0,
+                rationale: "Lead-Lag engine disabled or awaiting Bitfinex price".to_string(),
+            };
+        }
+
+        // Calculate active weights based on enabled feeds
+        let (w_bin, w_cb) = match (self.config.binance_enabled && self.last_binance_price > 0.0, self.config.coinbase_enabled && self.last_coinbase_price > 0.0) {
+            (true, true) => {
+                let total_w = self.config.weight_binance + self.config.weight_coinbase;
+                (self.config.weight_binance / total_w, self.config.weight_coinbase / total_w)
+            }
+            (true, false) => (1.0, 0.0),
+            (false, true) => (0.0, 1.0),
+            (false, false) => {
+                return LeadLagSignal {
+                    signal_type: LeadLagSignalType::Neutral,
+                    leader_price: self.last_bitfinex_price,
+                    bitfinex_price: self.last_bitfinex_price,
+                    disparity_usd: 0.0,
+                    binance_price: self.last_binance_price,
+                    coinbase_price: self.last_coinbase_price,
+                    binance_velocity_usd: 0.0,
+                    coinbase_velocity_usd: 0.0,
+                    composite_velocity_usd: 0.0,
+                    confidence: 0.0,
+                    rationale: "No active leader market data feeds".to_string(),
+                };
+            }
+        };
+
+        let leader_price = (w_bin * self.last_binance_price) + (w_cb * self.last_coinbase_price);
+        let disparity_usd = leader_price - self.last_bitfinex_price;
+
+        let bin_vel = self.calculate_velocity(&self.binance_samples, self.last_binance_price, current_time_ms);
+        let cb_vel = self.calculate_velocity(&self.coinbase_samples, self.last_coinbase_price, current_time_ms);
+        let composite_velocity = (w_bin * bin_vel) + (w_cb * cb_vel);
+
+        let min_disparity = self.config.min_lead_disparity_usd;
+
+        let (signal_type, confidence, rationale) = if disparity_usd >= min_disparity && composite_velocity >= 0.0 {
+            let conf = (0.95 + (disparity_usd / 100.0).min(0.04)).min(0.99);
+            (
+                LeadLagSignalType::FrontRunBuy,
+                conf,
+                format!(
+                    "Leader premium +${:.2} USD (Binance=${:.1}, Coinbase=${:.1} vs BFX=${:.1}, Velocity=+${:.2})",
+                    disparity_usd, self.last_binance_price, self.last_coinbase_price, self.last_bitfinex_price, composite_velocity
+                ),
+            )
+        } else if disparity_usd <= -min_disparity && composite_velocity <= 0.0 {
+            let conf = (0.95 + (disparity_usd.abs() / 100.0).min(0.04)).min(0.99);
+            (
+                LeadLagSignalType::FrontRunSell,
+                conf,
+                format!(
+                    "Leader discount -${:.2} USD (Binance=${:.1}, Coinbase=${:.1} vs BFX=${:.1}, Velocity=-${:.2})",
+                    disparity_usd.abs(), self.last_binance_price, self.last_coinbase_price, self.last_bitfinex_price, composite_velocity.abs()
+                ),
+            )
+        } else {
+            (
+                LeadLagSignalType::Neutral,
+                0.50,
+                format!(
+                    "Disparity ${:+.2} USD within threshold (+/-${:.1} USD)",
+                    disparity_usd, min_disparity
+                ),
+            )
+        };
+
+        LeadLagSignal {
+            signal_type,
+            leader_price,
+            bitfinex_price: self.last_bitfinex_price,
+            disparity_usd,
+            binance_price: self.last_binance_price,
+            coinbase_price: self.last_coinbase_price,
+            binance_velocity_usd: bin_vel,
+            coinbase_velocity_usd: cb_vel,
+            composite_velocity_usd: composite_velocity,
+            confidence,
+            rationale,
+        }
+    }
+
+    pub fn last_binance_price(&self) -> f64 {
+        self.last_binance_price
+    }
+
+    pub fn last_coinbase_price(&self) -> f64 {
+        self.last_coinbase_price
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ArbitrageOpportunity {
-    pub buy_exchange: String,
-    pub sell_exchange: String,
-    pub spread_bps: f64,
-    pub buy_price: f64,
-    pub sell_price: f64,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lead_lag_neutral() {
+        let config = LeadLagConfig::default();
+        let mut engine = LeadLagEngine::new(config);
+
+        engine.update_binance(64500.0, 1000);
+        engine.update_coinbase(64500.0, 1000);
+        engine.update_bitfinex(64500.0, 1000);
+
+        let signal = engine.evaluate(1000);
+        assert_eq!(signal.signal_type, LeadLagSignalType::Neutral);
+        assert_eq!(signal.disparity_usd, 0.0);
+    }
+
+    #[test]
+    fn test_lead_lag_front_run_buy() {
+        let config = LeadLagConfig {
+            min_lead_disparity_usd: 15.0,
+            ..Default::default()
+        };
+        let mut engine = LeadLagEngine::new(config);
+
+        // Binance and Coinbase jump +$30 USD ahead of Bitfinex
+        engine.update_bitfinex(64400.0, 1000);
+        engine.update_binance(64410.0, 900);
+        engine.update_binance(64430.0, 1000); // +$20 velocity
+        engine.update_coinbase(64430.0, 1000);
+
+        let signal = engine.evaluate(1000);
+        assert_eq!(signal.signal_type, LeadLagSignalType::FrontRunBuy);
+        assert!(signal.disparity_usd >= 30.0);
+        assert!(signal.confidence >= 0.95);
+    }
+
+    #[test]
+    fn test_lead_lag_front_run_sell() {
+        let config = LeadLagConfig {
+            min_lead_disparity_usd: 15.0,
+            ..Default::default()
+        };
+        let mut engine = LeadLagEngine::new(config);
+
+        // Leaders dump -$30 USD ahead of Bitfinex
+        engine.update_bitfinex(64500.0, 1000);
+        engine.update_binance(64490.0, 900);
+        engine.update_binance(64470.0, 1000);
+        engine.update_coinbase(64470.0, 1000);
+
+        let signal = engine.evaluate(1000);
+        assert_eq!(signal.signal_type, LeadLagSignalType::FrontRunSell);
+        assert!(signal.disparity_usd <= -30.0);
+    }
 }
