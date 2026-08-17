@@ -55,7 +55,7 @@ trail_multiplier = 0.5
 
 [profit_skimmer]
 enabled = true
-btc_lock_pct = 70.0
+btc_lock_pct = 10.0
 
 [adaptive_cooldown]
 enabled = true
