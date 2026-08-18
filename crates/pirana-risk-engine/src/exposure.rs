@@ -1,5 +1,4 @@
 use pirana_core::types::*;
-use pirana_core::errors::PiranaResult;
 use std::collections::HashMap;
 
 /// Tracks exposure across all positions and orders
@@ -11,6 +10,12 @@ pub struct ExposureTracker {
     pending_orders: HashMap<String, Vec<PendingOrder>>,
     /// Total exposure in BTC terms
     total_exposure_btc: f64,
+}
+
+impl Default for ExposureTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone)]

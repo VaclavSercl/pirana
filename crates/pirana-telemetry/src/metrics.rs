@@ -1,6 +1,5 @@
 use metrics::{counter, gauge, histogram};
-use pirana_core::types::*;
-use std::time::Instant;
+use pirana_core::types::SystemMode;
 
 /// Initialize Prometheus metrics
 pub fn init_metrics() {

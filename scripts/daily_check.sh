@@ -13,8 +13,8 @@ mkdir -p "${WORKSPACE_DIR}/logs"
 
 # 1. Načtení proměnných prostředí
 if [ -f "$ENV_FILE" ]; then
-    TELEGRAM_TOKEN=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '"'"' | tr -d '[:space:]')
-    CHAT_ID=$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '"'"' | tr -d '[:space:]')
+    TELEGRAM_TOKEN=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '[:space:]"' | tr -d '\047')
+    CHAT_ID=$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '[:space:]"' | tr -d '\047')
 fi
 
 # Fallback tokeny

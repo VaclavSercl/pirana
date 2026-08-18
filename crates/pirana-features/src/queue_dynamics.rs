@@ -1,6 +1,3 @@
-use pirana_core::types::*;
-use pirana_core::errors::PiranaResult;
-
 /// Queue Position Dynamics — tracks order priority decay
 #[derive(Debug)]
 pub struct QueuePositionTracker {
@@ -12,6 +9,12 @@ pub struct QueuePositionTracker {
     estimated_fill_time: f64,
     /// Priority decay rate (orders/second)
     decay_rate: f64,
+}
+
+impl Default for QueuePositionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QueuePositionTracker {

@@ -14,6 +14,7 @@ pub struct MarketDataEngine {
     /// WebSocket connection for real-time data
     ws: BitfinexWebSocket,
     /// REST API for snapshots and historical data
+    #[allow(dead_code)]
     rest: BitfinexRestApi,
     /// Order book manager
     book_manager: OrderBookManager,
@@ -202,7 +203,7 @@ impl MarketDataEngine {
             quantity: amount.abs(),
             side,
             timestamp: chrono::DateTime::from_timestamp_millis(timestamp_ms)
-                .unwrap_or_else(|| chrono::Utc::now()),
+                .unwrap_or_else(chrono::Utc::now),
             trade_id,
         }))
     }

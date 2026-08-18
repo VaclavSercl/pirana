@@ -2,10 +2,8 @@ use pirana_core::errors::{PiranaError, PiranaResult};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use futures::{SinkExt, StreamExt};
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// WebSocket connection to Bitfinex
 pub struct BitfinexWebSocket {

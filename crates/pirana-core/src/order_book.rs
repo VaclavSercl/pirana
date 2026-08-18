@@ -32,6 +32,7 @@ impl OrderBook {
     }
 
     /// Convert integer key back to price
+    #[allow(dead_code)]
     fn key_to_price(&self, key: u64) -> f64 {
         key as f64 * self.tick_size
     }

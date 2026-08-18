@@ -1,7 +1,7 @@
 use pirana_core::errors::{PiranaError, PiranaResult};
 use reqwest::Client;
 use serde_json::Value;
-use tracing::{info, debug};
+use tracing::debug;
 
 /// Bitfinex REST API client for snapshots and auxiliary data
 pub struct BitfinexRestApi {

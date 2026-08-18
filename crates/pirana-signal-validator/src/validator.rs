@@ -1,7 +1,7 @@
 use pirana_core::types::*;
 use pirana_core::constants::*;
-use pirana_core::errors::{PiranaError, PiranaResult};
-use tracing::{info, warn, debug};
+use pirana_core::errors::PiranaResult;
+use tracing::debug;
 
 /// Signal validation engine — validates AI-generated signals
 /// before they reach the risk engine.
@@ -13,6 +13,12 @@ pub struct SignalValidator {
     total_signals: u64,
     /// Signals rejected
     rejected_signals: u64,
+}
+
+impl Default for SignalValidator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SignalValidator {
@@ -56,7 +62,7 @@ impl SignalValidator {
 
         // Validate invalidation level is below entry for buys, above for sells
         // (basic sanity check)
-        let entry_mid = (signal.recommended_params.entry_zone.0 + signal.recommended_params.entry_zone.1) / 2.0;
+        let _entry_mid = (signal.recommended_params.entry_zone.0 + signal.recommended_params.entry_zone.1) / 2.0;
         if signal.invalidation_level <= 0.0 {
             self.rejected_signals += 1;
             return Ok(ValidationResult::Rejected {

@@ -1,4 +1,3 @@
-use pirana_core::errors::PiranaResult;
 
 /// Funding rate pressure detector
 /// Identifies over-leveraged derivatives environments

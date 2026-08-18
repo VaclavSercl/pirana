@@ -2,7 +2,6 @@ use pirana_core::types::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 
 /// Shared state for the dashboard — all real-time data lives here.
 /// The trading engine writes to this, the web server reads from it.
@@ -195,6 +194,12 @@ pub struct DashboardSnapshot {
     pub vpin_score: f64,
     pub vpin_status: String,
     pub uptime_seconds: u64,
+}
+
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DashboardState {

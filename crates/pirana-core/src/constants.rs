@@ -1,11 +1,11 @@
-/// Hard risk limits — these are NON-NEGOTIABLE constants.
-/// The AI layer CANNOT override these values.
-
-/// HFT TRADING STRATEGY
-/// Buy and sell BTC in milliseconds — profit from spread capture
-/// Bitcoin is the base asset — we trade around it actively
-/// No panic selling — if price drops, we buy more or hold
-/// Short-term trades for maximum profit, long-term BTC appreciation
+//! Hard risk limits — these are NON-NEGOTIABLE constants.
+//! The AI layer CANNOT override these values.
+//!
+//! HFT TRADING STRATEGY
+//! Buy and sell BTC in milliseconds — profit from spread capture
+//! Bitcoin is the base asset — we trade around it actively
+//! No panic selling — if price drops, we buy more or hold
+//! Short-term trades for maximum profit, long-term BTC appreciation
 
 /// Maximum aggregate exposure as a fraction of total capital (90%)
 pub const MAX_AGGREGATE_EXPOSURE: f64 = 0.90;

@@ -1,4 +1,3 @@
-use pirana_core::errors::{PiranaError, PiranaResult};
 use tokio_tungstenite::connect_async;
 use futures::{SinkExt, StreamExt};
 use tracing::{info, warn, error, debug};

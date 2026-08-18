@@ -1,6 +1,6 @@
 use pirana_core::types::*;
 use pirana_core::constants::*;
-use pirana_core::errors::{PiranaError, PiranaResult};
+use pirana_core::errors::PiranaResult;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::{info, warn, error};
@@ -31,6 +31,7 @@ struct RiskState {
     /// Total trades today
     trades_today: u32,
     /// Open positions
+    #[allow(dead_code)]
     open_positions: Vec<Position>,
     /// Daily drawdown percentage
     daily_drawdown_pct: f64,
@@ -182,10 +183,7 @@ impl RiskEngine {
         }
 
         // Check aggregate exposure (only restrict increases in exposure, sells always reduce risk)
-        let is_sell = match signal.signal_type {
-            SignalType::DistributionExit => true,
-            _ => false,
-        };
+        let is_sell = matches!(signal.signal_type, SignalType::DistributionExit);
 
         let proposed_exposure = if is_sell {
             (state.aggregate_exposure - position_size).max(0.0)

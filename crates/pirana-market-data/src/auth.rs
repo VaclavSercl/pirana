@@ -1,7 +1,6 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha384;
 use zeroize::Zeroize;
-use tracing::debug;
 
 type HmacSha384 = Hmac<Sha384>;
 

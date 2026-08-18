@@ -1,7 +1,7 @@
 use pirana_core::types::*;
 use pirana_core::constants::*;
 use pirana_core::errors::{PiranaError, PiranaResult};
-use tracing::{info, warn, error, debug};
+use tracing::info;
 
 /// Order router — manages order lifecycle
 pub struct OrderRouter {
@@ -11,6 +11,12 @@ pub struct OrderRouter {
     order_history: Vec<OrderRecord>,
     /// Maximum open orders
     max_open_orders: usize,
+}
+
+impl Default for OrderRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +61,7 @@ impl OrderRouter {
     pub fn create_order(
         &mut self,
         signal: &Signal,
-        current_price: f64,
+        _current_price: f64,
         quantity: f64,
     ) -> PiranaResult<OrderId> {
         // Check open order limit

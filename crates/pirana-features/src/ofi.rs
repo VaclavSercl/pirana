@@ -2,7 +2,6 @@ use pirana_core::types::*;
 use pirana_core::constants::*;
 use pirana_core::errors::{PiranaError, PiranaResult};
 use std::collections::VecDeque;
-use tracing::debug;
 
 /// Order Flow Imbalance (OFI) calculator
 ///

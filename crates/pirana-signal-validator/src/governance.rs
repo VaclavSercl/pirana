@@ -9,6 +9,12 @@ pub struct GovernanceEngine {
     enabled: bool,
 }
 
+impl Default for GovernanceEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GovernanceEngine {
     pub fn new() -> Self {
         Self { enabled: true }

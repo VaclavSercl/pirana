@@ -394,7 +394,7 @@ async fn main() -> PiranaResult<()> {
     // Check exchange connectivity
     info!("Checking Bitfinex platform status...");
     match check_exchange_status().await {
-        Ok(status) if status == 1 => {
+        Ok(1) => {
             info!("✓ Bitfinex platform is OPERATIONAL");
         }
         Ok(_) => {
@@ -728,6 +728,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 }
 
 /// Process WebSocket message from Bitfinex
+#[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: &DashboardState,
     data: serde_json::Value,
@@ -919,7 +920,7 @@ async fn process_ws_message(
 
                                     tracing::info!("Executing asynchronous MARKET {:?} order for {:.6} BTC to close position (entry price: {})", close_side, pos_clone.quantity, pos_clone.entry_price);
 
-                                    match client_clone.submit_order("tBTCUSD", close_side.clone(), pirana_core::types::OrderType::Market, sign * pos_clone.quantity, price).await {
+                                    match client_clone.submit_order("tBTCUSD", close_side, pirana_core::types::OrderType::Market, sign * pos_clone.quantity, price).await {
                                         Ok(_) => {
                                             // Record metrics in risk engine
                                             let exposure_delta = match pos_clone.side {
