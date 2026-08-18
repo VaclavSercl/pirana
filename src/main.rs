@@ -9,6 +9,7 @@ use pirana_features::atr::AtrCalculator;
 use pirana_features::l2_depth::L2DepthCalculator;
 use pirana_features::cross_exchange::{LeadLagEngine, LeadLagConfig, LeadLagSignalType};
 use pirana_features::hawkes::{HawkesIntensity, HawkesConfig};
+use pirana_features::vpin::{VpinCalculator, VpinConfig};
 use pirana_market_data::binance_ws::{BinanceWebSocket, BinanceTradeTick};
 use pirana_market_data::coinbase_ws::{CoinbaseWebSocket, CoinbaseTradeTick};
 use pirana_dashboard::state::DashboardState;
@@ -39,6 +40,8 @@ pub struct StrategyConfig {
     pub lead_lag: LeadLagConfig,
     #[serde(default)]
     pub hawkes_process: HawkesConfig,
+    #[serde(default)]
+    pub vpin_guard: VpinConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -299,6 +302,7 @@ impl StrategyConfig {
                 adaptive_cooldown: AdaptiveCooldownConfig::default(),
                 lead_lag: LeadLagConfig::default(),
                 hawkes_process: HawkesConfig::default(),
+                vpin_guard: VpinConfig::default(),
             }
         })
     }
@@ -505,6 +509,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let mut l2_depth = L2DepthCalculator::new(initial_ob_conf.l2_depth_levels, initial_ob_conf.l2_weight_decay, initial_ob_conf.min_l2_imbalance_threshold);
     let initial_hawkes_conf = strategy_config.read().hawkes_process.clone();
     let mut hawkes = HawkesIntensity::new(initial_hawkes_conf);
+    let initial_vpin_conf = strategy_config.read().vpin_guard.clone();
+    let mut vpin = VpinCalculator::new(initial_vpin_conf);
     let mut order_book;
     let mut log_throttler = LogThrottler::new(std::time::Duration::from_secs(60));
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
@@ -638,7 +644,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -680,6 +686,7 @@ async fn process_ws_message(
     atr: &mut AtrCalculator,
     l2_depth: &mut L2DepthCalculator,
     hawkes: &mut HawkesIntensity,
+    vpin: &mut VpinCalculator,
     order_book: &mut pirana_core::order_book::OrderBook,
     log_throttler: &mut LogThrottler,
     router: &Arc<parking_lot::Mutex<OrderRouter>>,
@@ -1111,6 +1118,29 @@ async fn process_ws_message(
                                 let is_hawkes_buy = conf.hawkes_process.enabled && hawkes_eval.is_buy_cascade;
                                 let is_hawkes_sell = conf.hawkes_process.enabled && hawkes_eval.is_sell_cascade;
 
+                                vpin.process_trade(side, qty.abs());
+                                let vpin_score = vpin.calculate_vpin();
+                                let is_vpin_toxic = vpin.is_toxic();
+                                let is_vpin_emergency = vpin.is_emergency_toxic();
+
+                                *state.vpin_score.write() = vpin_score;
+                                *state.vpin_status.write() = vpin.status();
+
+                                // VPIN Adverse Selection & Emergency Flash Crash Guard
+                                if is_vpin_emergency {
+                                    if log_throttler.should_log("vpin_emergency_toxic") {
+                                        tracing::warn!("🚨 [VPIN EMERGENCY FLASH CRASH ALERT] VPIN={:.1}% >= 75% | Flash Crash Risk - Blocking new entries & safeguarding passive book", vpin_score * 100.0);
+                                    }
+                                    return;
+                                }
+
+                                if is_vpin_toxic && !is_lead_lag_buy && !is_hawkes_buy && !is_lead_lag_sell && !is_hawkes_sell {
+                                    if log_throttler.should_log("vpin_high_toxicity") {
+                                        tracing::warn!("⚠️ [VPIN HIGH TOXICITY] VPIN={:.1}% >= {:.0}% - Adverse selection guard active, skipping standard noise entries", vpin_score * 100.0, conf.vpin_guard.toxicity_threshold * 100.0);
+                                    }
+                                    return;
+                                }
+
                                 let is_buying = is_lead_lag_buy || is_hawkes_buy || if conf.order_book.use_l2_depth_imbalance {
                                     ofi.is_buying_pressure() && l2_depth.is_buying_supported() && composite_signal >= conf.strategy.ofi_trigger_threshold
                                 } else {
@@ -1178,18 +1208,18 @@ async fn process_ws_message(
                                     };
                                     let rationale_text = if is_lead_lag_buy {
                                         format!(
-                                            "⚡ [LEAD-LAG FRONT-RUN BUY] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
-                                            lead_lag_sig.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                            "⚡ [LEAD-LAG FRONT-RUN BUY] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
+                                            lead_lag_sig.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
                                         )
                                     } else if is_hawkes_buy {
                                         format!(
-                                            "🌊 [HAWKES BUY CASCADE] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
-                                            hawkes_eval.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                            "🌊 [HAWKES BUY CASCADE] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
+                                            hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
                                         )
                                     } else {
                                         format!(
-                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}) | Dynamic Size: {:.2}%",
-                                            ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}) | Dynamic Size: {:.2}%",
+                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
                                         )
                                     };
                                     let sig = Signal {
@@ -1418,18 +1448,18 @@ async fn process_ws_message(
                                     };
                                     let rationale_text = if is_lead_lag_sell {
                                         format!(
-                                            "⚡ [LEAD-LAG FRONT-RUN SELL] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
-                                            lead_lag_sig.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                            "⚡ [LEAD-LAG FRONT-RUN SELL] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
+                                            lead_lag_sig.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
                                         )
                                     } else if is_hawkes_sell {
                                         format!(
-                                            "🌊 [HAWKES SELL CASCADE] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
-                                            hawkes_eval.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                            "🌊 [HAWKES SELL CASCADE] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
+                                            hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
                                         )
                                     } else {
                                         format!(
-                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2} | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%",
-                                            ofi_val, l2_imb, composite_signal, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%",
+                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
                                         )
                                     };
                                     let sig = Signal {

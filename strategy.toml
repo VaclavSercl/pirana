@@ -88,3 +88,15 @@ zscore_threshold = 2.5
 window_ms = 1000
 baseline_mu = 0.1
 
+[vpin_guard]
+enabled = true
+# Velikost objemového koše v BTC
+bucket_size_btc = 0.5
+# Počet košů v klouzavém okně
+bucket_count = 50
+# Práh toxicity pro blokování protisměrných obchodů (Adverse Selection Guard)
+toxicity_threshold = 0.65
+# Okamžité storno visících pasivních limitů při extrémní toxicitě (> 75 %)
+emergency_cancel_on_toxic = true
+
+

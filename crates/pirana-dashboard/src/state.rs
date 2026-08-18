@@ -76,6 +76,10 @@ pub struct DashboardState {
     pub hawkes_zscore: Arc<parking_lot::RwLock<f64>>,
     /// Hawkes status / cascade rationale
     pub hawkes_status: Arc<parking_lot::RwLock<String>>,
+    /// VPIN (Volume-Synchronized Probability of Toxicity) score [0.0 - 1.0]
+    pub vpin_score: Arc<parking_lot::RwLock<f64>>,
+    /// VPIN status / adverse selection alert
+    pub vpin_status: Arc<parking_lot::RwLock<String>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -185,6 +189,8 @@ pub struct DashboardSnapshot {
     pub hawkes_intensity: f64,
     pub hawkes_zscore: f64,
     pub hawkes_status: String,
+    pub vpin_score: f64,
+    pub vpin_status: String,
     pub uptime_seconds: u64,
 }
 
@@ -230,6 +236,8 @@ impl DashboardState {
             hawkes_intensity: Arc::new(parking_lot::RwLock::new(0.0)),
             hawkes_zscore: Arc::new(parking_lot::RwLock::new(0.0)),
             hawkes_status: Arc::new(parking_lot::RwLock::new("Baseline".to_string())),
+            vpin_score: Arc::new(parking_lot::RwLock::new(0.0)),
+            vpin_status: Arc::new(parking_lot::RwLock::new("Low Toxicity / Initializing".to_string())),
             start_time: Utc::now(),
         }
     }
@@ -272,6 +280,8 @@ impl DashboardState {
             hawkes_intensity: *self.hawkes_intensity.read(),
             hawkes_zscore: *self.hawkes_zscore.read(),
             hawkes_status: self.hawkes_status.read().clone(),
+            vpin_score: *self.vpin_score.read(),
+            vpin_status: self.vpin_status.read().clone(),
             uptime_seconds: uptime,
         }
     }

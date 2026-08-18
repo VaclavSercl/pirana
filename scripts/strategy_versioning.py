@@ -24,7 +24,7 @@ def validate_strategy_file(file_path=STRATEGY_FILE):
         with open(file_path, "rb") as f:
             data = tomllib.load(f)
         
-        required_keys = ["system", "trading", "strategy", "inventory", "risk_management", "trailing_stop", "profit_skimmer", "adaptive_cooldown", "lead_lag", "hawkes_process"]
+        required_keys = ["system", "trading", "strategy", "inventory", "risk_management", "trailing_stop", "profit_skimmer", "adaptive_cooldown", "lead_lag", "hawkes_process", "vpin_guard"]
         for key in required_keys:
             if key not in data:
                 print(f"[ERROR] Missing required section: [{key}]", file=sys.stderr)

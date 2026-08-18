@@ -9,3 +9,4 @@ pub mod funding_rate;
 pub mod queue_dynamics;
 pub mod cross_exchange;
 pub mod hawkes;
+pub mod vpin;
