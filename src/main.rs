@@ -526,19 +526,68 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
     let active_positions = Arc::new(parking_lot::RwLock::new(Vec::<ActivePosition>::new()));
 
-    // Spawn a permanent, background balance reconciliation task (every 30 seconds)
-    // to prevent virtual wallet balance drift on the dashboard and in PnL calculations
+    // Spawn a permanent, background balance reconciliation task (every 15 seconds)
+    // to prevent virtual wallet balance drift, auto-clamp vault reserves, and protect PnL metrics
     let client_for_reconciliation = BitfinexClient::new(api_key.clone(), api_secret.clone());
     let state_for_reconciliation = state.clone();
+    let positions_for_reconciliation = active_positions.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             if let Ok(wallets) = client_for_reconciliation.get_wallets().await {
+                let mut btc_total = None;
+                let mut usd_total = None;
                 for w in wallets {
-                    if w.asset == "BTC" { *state_for_reconciliation.btc_balance.write() = w.total; }
-                    if w.asset == "USD" { *state_for_reconciliation.usd_balance.write() = w.total; }
+                    if w.asset == "BTC" { btc_total = Some(w.total); }
+                    if w.asset == "USD" { usd_total = Some(w.total); }
                 }
-                tracing::debug!("Wallet balances reconciled with Bitfinex successfully.");
+
+                if let (Some(new_btc), Some(new_usd)) = (btc_total, usd_total) {
+                    let old_btc = *state_for_reconciliation.btc_balance.read();
+                    let old_usd = *state_for_reconciliation.usd_balance.read();
+                    let btc_price = *state_for_reconciliation.btc_price.read();
+
+                    let delta_btc = new_btc - old_btc;
+                    let delta_usd = new_usd - old_usd;
+
+                    // 1. Vault Auto-Reconciliation & Invariant Enforcement
+                    {
+                        let mut active_locked = state_for_reconciliation.locked_btc_reserve.write();
+                        let lifetime_locked = *state_for_reconciliation.lifetime_skimmed_btc.read();
+                        if let Some(log_msg) = pirana_core::reconciliation::BalanceReconciliation::reconcile_vault(
+                            new_btc,
+                            &mut active_locked,
+                            lifetime_locked,
+                        ) {
+                            tracing::warn!("{}", log_msg);
+                        }
+                    }
+
+                    // 2. TWR Re-anchoring of Starting Equity (Preserving PnL on capital inflow/outflow)
+                    {
+                        let mut starting_equity = state_for_reconciliation.starting_equity.write();
+                        if let Some(log_msg) = pirana_core::reconciliation::BalanceReconciliation::reconcile_equity(
+                            delta_btc,
+                            delta_usd,
+                            btc_price,
+                            &mut starting_equity,
+                        ) {
+                            tracing::info!("{}", log_msg);
+                        }
+                    }
+
+                    // 3. Inventory synchronization on out-of-band manual sell
+                    if delta_btc < -0.00004 && delta_usd > (delta_btc.abs() * btc_price * 0.85) {
+                        tracing::info!("⚡ [AUTO-RECONCILE] Manual out-of-band sell detected (ΔBTC={:.8}, ΔUSD=+${:.2}). Cleaning active positions...", delta_btc.abs(), delta_usd);
+                        positions_for_reconciliation.write().retain(|p| p.side != Side::Buy);
+                    }
+
+                    // Update real-time wallet balances in state
+                    *state_for_reconciliation.btc_balance.write() = new_btc;
+                    *state_for_reconciliation.usd_balance.write() = new_usd;
+
+                    tracing::debug!("Wallet balances auto-reconciled with Bitfinex: BTC={:.8}, USD={:.2}", new_btc, new_usd);
+                }
             }
         }
     });
@@ -906,7 +955,9 @@ async fn process_ws_message(
                                                     let lock_amount = profit_btc * (skimmer_cfg.btc_lock_pct / 100.0);
                                                     let mut reserve = state_clone.locked_btc_reserve.write();
                                                     *reserve += lock_amount;
-                                                    tracing::info!("🔒 [PROFIT SKIMMER] Locked {:.8} BTC into vault reserve (Total: {:.8} BTC)", lock_amount, *reserve);
+                                                    let mut lifetime = state_clone.lifetime_skimmed_btc.write();
+                                                    *lifetime += lock_amount;
+                                                    tracing::info!("🔒 [PROFIT SKIMMER] Locked {:.8} BTC into vault reserve (Active on exchange: {:.8} BTC | Lifetime accumulated: {:.8} BTC)", lock_amount, *reserve, *lifetime);
                                                 }
                                             }
 
@@ -1096,7 +1147,7 @@ async fn process_ws_message(
                                 } else {
                                     0.0
                                 };
-                                let current_btc = (total_btc - locked_btc).max(0.0);
+                                let current_btc = pirana_core::reconciliation::BalanceReconciliation::calculate_tradable_margin(total_btc, locked_btc);
 
                                 let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                                 lead_lag_engine.write().update_bitfinex(price, now_ms);
