@@ -99,4 +99,10 @@ toxicity_threshold = 0.65
 # Okamžité storno visících pasivních limitů při extrémní toxicitě (> 75 %)
 emergency_cancel_on_toxic = true
 
+[avellaneda_stoikov]
+enabled = true
+risk_aversion_gamma = 0.10
+order_book_liquidity_kappa = 1.50
+time_horizon_dt = 1.0
+
 

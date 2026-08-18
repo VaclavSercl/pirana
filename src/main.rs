@@ -4,6 +4,7 @@ use pirana_core::constants::MIN_ORDER_SIZE_BTC;
 use pirana_core::types::{Signal, SignalType, SignalParams, Symbol, Side, Tick, MarketRegime, OrderStatus, SystemMode};
 use pirana_execution::bitfinex_client::BitfinexClient;
 use pirana_execution::order_router::OrderRouter;
+use pirana_execution::avellaneda_stoikov::{AvellanedaStoikovModel, AvellanedaStoikovConfig};
 use pirana_features::ofi::OfiCalculator;
 use pirana_features::atr::AtrCalculator;
 use pirana_features::l2_depth::L2DepthCalculator;
@@ -42,6 +43,8 @@ pub struct StrategyConfig {
     pub hawkes_process: HawkesConfig,
     #[serde(default)]
     pub vpin_guard: VpinConfig,
+    #[serde(default)]
+    pub avellaneda_stoikov: AvellanedaStoikovConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -303,6 +306,7 @@ impl StrategyConfig {
                 lead_lag: LeadLagConfig::default(),
                 hawkes_process: HawkesConfig::default(),
                 vpin_guard: VpinConfig::default(),
+                avellaneda_stoikov: AvellanedaStoikovConfig::default(),
             }
         })
     }
@@ -511,6 +515,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let mut hawkes = HawkesIntensity::new(initial_hawkes_conf);
     let initial_vpin_conf = strategy_config.read().vpin_guard.clone();
     let mut vpin = VpinCalculator::new(initial_vpin_conf);
+    let initial_as_conf = strategy_config.read().avellaneda_stoikov.clone();
+    let mut as_model = AvellanedaStoikovModel::from_config(&initial_as_conf);
     let mut order_book;
     let mut log_throttler = LogThrottler::new(std::time::Duration::from_secs(60));
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
@@ -693,7 +699,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -737,6 +743,7 @@ async fn process_ws_message(
     l2_depth: &mut L2DepthCalculator,
     hawkes: &mut HawkesIntensity,
     vpin: &mut VpinCalculator,
+    as_model: &mut AvellanedaStoikovModel,
     order_book: &mut pirana_core::order_book::OrderBook,
     log_throttler: &mut LogThrottler,
     router: &Arc<parking_lot::Mutex<OrderRouter>>,
@@ -762,6 +769,28 @@ async fn process_ws_message(
 
                         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                         lead_lag_engine.write().update_bitfinex(price, now_ms);
+
+                        let conf = strategy_config.read().clone();
+                        if conf.avellaneda_stoikov.enabled {
+                            as_model.gamma = conf.avellaneda_stoikov.risk_aversion_gamma;
+                            as_model.kappa = conf.avellaneda_stoikov.order_book_liquidity_kappa;
+                            as_model.dt = conf.avellaneda_stoikov.time_horizon_dt;
+                        }
+                        let total_btc = *state.btc_balance.read();
+                        let locked_btc = if conf.profit_skimmer.exclude_from_trading_margin {
+                            *state.locked_btc_reserve.read()
+                        } else {
+                            0.0
+                        };
+                        let q_active = AvellanedaStoikovModel::calculate_active_inventory(
+                            total_btc,
+                            locked_btc,
+                            conf.inventory.min_inventory_btc,
+                        );
+                        let sigma = atr.current_atr();
+                        let as_quote = as_model.compute_quotes(price, q_active, sigma);
+                        *state.reservation_price.write() = as_quote.reservation_price;
+                        *state.as_spread_skew.write() = as_quote.spread_skew;
 
                         // Check active positions for Trailing Stop, Breakeven, Take Profit / Stop Loss
                         let mut positions_to_close = Vec::new();
@@ -1083,6 +1112,25 @@ async fn process_ws_message(
                                 mid_price: mid,
                             };
                             *state.spread.write() = spread;
+
+                            if mid > 0.0 {
+                                let conf = strategy_config.read().clone();
+                                let total_btc = *state.btc_balance.read();
+                                let locked_btc = if conf.profit_skimmer.exclude_from_trading_margin {
+                                    *state.locked_btc_reserve.read()
+                                } else {
+                                    0.0
+                                };
+                                let q_active = AvellanedaStoikovModel::calculate_active_inventory(
+                                    total_btc,
+                                    locked_btc,
+                                    conf.inventory.min_inventory_btc,
+                                );
+                                let sigma = atr.current_atr();
+                                let as_quote = as_model.compute_quotes(mid, q_active, sigma);
+                                *state.reservation_price.write() = as_quote.reservation_price;
+                                *state.as_spread_skew.write() = as_quote.spread_skew;
+                            }
                         }
                     }
                 }
@@ -1111,6 +1159,11 @@ async fn process_ws_message(
                                 ofi.process_tick(&tick, *last_price);
                                 
                                 let conf = strategy_config.read().clone();
+                                if conf.avellaneda_stoikov.enabled {
+                                    as_model.gamma = conf.avellaneda_stoikov.risk_aversion_gamma;
+                                    as_model.kappa = conf.avellaneda_stoikov.order_book_liquidity_kappa;
+                                    as_model.dt = conf.avellaneda_stoikov.time_horizon_dt;
+                                }
 
                                 // Adaptive Cooldown & Market Sweep Detection
                                 let is_sweep = qty.abs() >= 0.20;
@@ -1149,6 +1202,15 @@ async fn process_ws_message(
                                     0.0
                                 };
                                 let current_btc = pirana_core::reconciliation::BalanceReconciliation::calculate_tradable_margin(total_btc, locked_btc);
+                                let q_active = AvellanedaStoikovModel::calculate_active_inventory(
+                                    total_btc,
+                                    locked_btc,
+                                    conf.inventory.min_inventory_btc,
+                                );
+                                let sigma = atr.current_atr();
+                                let as_quote = as_model.compute_quotes(price, q_active, sigma);
+                                *state.reservation_price.write() = as_quote.reservation_price;
+                                *state.as_spread_skew.write() = as_quote.spread_skew;
 
                                 let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                                 lead_lag_engine.write().update_bitfinex(price, now_ms);
@@ -1227,7 +1289,7 @@ async fn process_ws_message(
                                     conf.risk_management.max_aggregate_exposure_pct,
                                 );
 
-                                let dynamic_pos_pct = if conf.risk_management.use_dynamic_winrate_sizing {
+                                let dynamic_pos_pct_raw = if conf.risk_management.use_dynamic_winrate_sizing {
                                     dynamic_sizer.calculate_dynamic_position_pct(
                                         conf.risk_management.position_size_pct,
                                         *state.win_rate.read(),
@@ -1237,6 +1299,17 @@ async fn process_ws_message(
                                 } else {
                                     conf.risk_management.position_size_pct
                                 };
+
+                                let as_multiplier_buy = if conf.avellaneda_stoikov.enabled {
+                                    as_model.calculate_inventory_skew_multiplier(
+                                        as_quote.reservation_price,
+                                        price,
+                                        Side::Buy,
+                                    )
+                                } else {
+                                    1.0
+                                };
+                                let dynamic_pos_pct = dynamic_sizer.calculate_as_adjusted_position_pct(dynamic_pos_pct_raw, as_multiplier_buy);
 
                                 let max_allowed_btc = if conf.inventory.use_dynamic_inventory {
                                     dynamic_sizer.calculate_dynamic_max_inventory_btc(total_portfolio_usd, price)
@@ -1258,20 +1331,25 @@ async fn process_ws_message(
                                         position_size_pct: dynamic_pos_pct / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
+                                    let as_info = if conf.avellaneda_stoikov.enabled {
+                                        format!(" | AS Skew: {:+.2} USD (r: {:.1})", as_quote.spread_skew, as_quote.reservation_price)
+                                    } else {
+                                        String::new()
+                                    };
                                     let rationale_text = if is_lead_lag_buy {
                                         format!(
-                                            "⚡ [LEAD-LAG FRONT-RUN BUY] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
-                                            lead_lag_sig.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
+                                            "⚡ [LEAD-LAG FRONT-RUN BUY] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%{}",
+                                            lead_lag_sig.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct, as_info
                                         )
                                     } else if is_hawkes_buy {
                                         format!(
-                                            "🌊 [HAWKES BUY CASCADE] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
-                                            hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
+                                            "🌊 [HAWKES BUY CASCADE] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%{}",
+                                            hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct, as_info
                                         )
                                     } else {
                                         format!(
-                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}) | Dynamic Size: {:.2}%",
-                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}) | Dynamic Size: {:.2}%{}",
+                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct, as_info
                                         )
                                     };
                                     let sig = Signal {
@@ -1491,27 +1569,42 @@ async fn process_ws_message(
                                         }
                                         return;
                                     }
+                                    let as_multiplier_sell = if conf.avellaneda_stoikov.enabled {
+                                        as_model.calculate_inventory_skew_multiplier(
+                                            as_quote.reservation_price,
+                                            price,
+                                            Side::Sell,
+                                        )
+                                    } else {
+                                        1.0
+                                    };
+                                    let dynamic_pos_pct_sell = dynamic_sizer.calculate_as_adjusted_position_pct(dynamic_pos_pct_raw, as_multiplier_sell);
                                     let p = SignalParams {
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
                                         invalidation_level: price + sl_dist,
                                         volatility_adjusted_tp: price - tp_dist,
-                                        position_size_pct: dynamic_pos_pct / 100.0,
+                                        position_size_pct: dynamic_pos_pct_sell / 100.0,
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
+                                    };
+                                    let as_info = if conf.avellaneda_stoikov.enabled {
+                                        format!(" | AS Skew: {:+.2} USD (r: {:.1})", as_quote.spread_skew, as_quote.reservation_price)
+                                    } else {
+                                        String::new()
                                     };
                                     let rationale_text = if is_lead_lag_sell {
                                         format!(
-                                            "⚡ [LEAD-LAG FRONT-RUN SELL] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
-                                            lead_lag_sig.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
+                                            "⚡ [LEAD-LAG FRONT-RUN SELL] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%{}",
+                                            lead_lag_sig.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct_sell, as_info
                                         )
                                     } else if is_hawkes_sell {
                                         format!(
-                                            "🌊 [HAWKES SELL CASCADE] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%",
-                                            hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct
+                                            "🌊 [HAWKES SELL CASCADE] {} | OFI: {:.2}, L2: {:.2}, VPIN: {:.1}% | Dynamic Size: {:.2}%{}",
+                                            hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct_sell, as_info
                                         )
                                     } else {
                                         format!(
-                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%",
-                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%{}",
+                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct_sell, as_info
                                         )
                                     };
                                     let sig = Signal {

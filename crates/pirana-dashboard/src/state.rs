@@ -81,6 +81,10 @@ pub struct DashboardState {
     pub vpin_score: Arc<parking_lot::RwLock<f64>>,
     /// VPIN status / adverse selection alert
     pub vpin_status: Arc<parking_lot::RwLock<String>>,
+    /// Avellaneda-Stoikov reservation price
+    pub reservation_price: Arc<parking_lot::RwLock<f64>>,
+    /// Avellaneda-Stoikov spread skew (r - s) in USD
+    pub as_spread_skew: Arc<parking_lot::RwLock<f64>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -193,6 +197,8 @@ pub struct DashboardSnapshot {
     pub hawkes_status: String,
     pub vpin_score: f64,
     pub vpin_status: String,
+    pub reservation_price: f64,
+    pub as_spread_skew: f64,
     pub uptime_seconds: u64,
 }
 
@@ -247,6 +253,8 @@ impl DashboardState {
             hawkes_status: Arc::new(parking_lot::RwLock::new("Baseline".to_string())),
             vpin_score: Arc::new(parking_lot::RwLock::new(0.0)),
             vpin_status: Arc::new(parking_lot::RwLock::new("Low Toxicity / Initializing".to_string())),
+            reservation_price: Arc::new(parking_lot::RwLock::new(0.0)),
+            as_spread_skew: Arc::new(parking_lot::RwLock::new(0.0)),
             start_time: Utc::now(),
         }
     }
@@ -292,6 +300,8 @@ impl DashboardState {
             hawkes_status: self.hawkes_status.read().clone(),
             vpin_score: *self.vpin_score.read(),
             vpin_status: self.vpin_status.read().clone(),
+            reservation_price: *self.reservation_price.read(),
+            as_spread_skew: *self.as_spread_skew.read(),
             uptime_seconds: uptime,
         }
     }

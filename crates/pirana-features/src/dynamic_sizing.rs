@@ -70,6 +70,21 @@ impl DynamicSizer {
     pub fn calculate_capital_reserve_pct(&self, current_exposure_pct: f64) -> f64 {
         (100.0 - current_exposure_pct).max(0.0)
     }
+
+    /// Dynamically adjust position size using Avellaneda-Stoikov inventory skew multiplier.
+    /// Čím dále je tržní cena od rezervační ceny r, tím větší velikost pozice systém alokuje pro vyrovnání inventáře.
+    pub fn calculate_as_adjusted_position_pct(
+        &self,
+        base_calculated_pct: f64,
+        as_multiplier: f64,
+    ) -> f64 {
+        let mult = if as_multiplier.is_finite() && as_multiplier > 0.0 {
+            as_multiplier
+        } else {
+            1.0
+        };
+        (base_calculated_pct * mult).clamp(self.min_position_pct, self.max_position_pct)
+    }
 }
 
 #[cfg(test)]
@@ -98,5 +113,19 @@ mod tests {
         let max_btc = sizer.calculate_dynamic_max_inventory_btc(390.0, 65000.0);
         // 390 * 0.90 / 65000 = 351 / 65000 = 0.0054 BTC
         assert!((max_btc - 0.0054).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_as_adjusted_position_pct() {
+        let sizer = DynamicSizer::new(1.0, 15.0, 90.0);
+        let base_pct = 5.0;
+        let boosted = sizer.calculate_as_adjusted_position_pct(base_pct, 1.5);
+        assert_eq!(boosted, 7.5);
+
+        let capped = sizer.calculate_as_adjusted_position_pct(base_pct, 4.0);
+        assert_eq!(capped, 15.0); // clamped to max_position_pct
+
+        let reduced = sizer.calculate_as_adjusted_position_pct(base_pct, 0.5);
+        assert_eq!(reduced, 2.5);
     }
 }
