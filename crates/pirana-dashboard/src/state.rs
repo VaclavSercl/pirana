@@ -85,6 +85,16 @@ pub struct DashboardState {
     pub reservation_price: Arc<parking_lot::RwLock<f64>>,
     /// Avellaneda-Stoikov spread skew (r - s) in USD
     pub as_spread_skew: Arc<parking_lot::RwLock<f64>>,
+    /// Dynamic order book liquidity kappa
+    pub dynamic_kappa: Arc<parking_lot::RwLock<f64>>,
+    /// Real-time post-trade markout drift at +100ms
+    pub markout_100ms: Arc<parking_lot::RwLock<f64>>,
+    /// Real-time post-trade markout drift at +1s
+    pub markout_1s: Arc<parking_lot::RwLock<f64>>,
+    /// Real-time post-trade markout drift at +5s
+    pub markout_5s: Arc<parking_lot::RwLock<f64>>,
+    /// Real-time post-trade markout drift at +30s
+    pub markout_30s: Arc<parking_lot::RwLock<f64>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -199,6 +209,11 @@ pub struct DashboardSnapshot {
     pub vpin_status: String,
     pub reservation_price: f64,
     pub as_spread_skew: f64,
+    pub dynamic_kappa: f64,
+    pub markout_100ms: f64,
+    pub markout_1s: f64,
+    pub markout_5s: f64,
+    pub markout_30s: f64,
     pub uptime_seconds: u64,
 }
 
@@ -255,6 +270,11 @@ impl DashboardState {
             vpin_status: Arc::new(parking_lot::RwLock::new("Low Toxicity / Initializing".to_string())),
             reservation_price: Arc::new(parking_lot::RwLock::new(0.0)),
             as_spread_skew: Arc::new(parking_lot::RwLock::new(0.0)),
+            dynamic_kappa: Arc::new(parking_lot::RwLock::new(1.50)),
+            markout_100ms: Arc::new(parking_lot::RwLock::new(0.0)),
+            markout_1s: Arc::new(parking_lot::RwLock::new(0.0)),
+            markout_5s: Arc::new(parking_lot::RwLock::new(0.0)),
+            markout_30s: Arc::new(parking_lot::RwLock::new(0.0)),
             start_time: Utc::now(),
         }
     }
@@ -302,6 +322,11 @@ impl DashboardState {
             vpin_status: self.vpin_status.read().clone(),
             reservation_price: *self.reservation_price.read(),
             as_spread_skew: *self.as_spread_skew.read(),
+            dynamic_kappa: *self.dynamic_kappa.read(),
+            markout_100ms: *self.markout_100ms.read(),
+            markout_1s: *self.markout_1s.read(),
+            markout_5s: *self.markout_5s.read(),
+            markout_30s: *self.markout_30s.read(),
             uptime_seconds: uptime,
         }
     }

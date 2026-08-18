@@ -1,3 +1,10 @@
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use pirana_config::settings::PiranaConfig;
 use pirana_core::errors::PiranaResult;
 use pirana_core::constants::MIN_ORDER_SIZE_BTC;
@@ -11,6 +18,7 @@ use pirana_features::l2_depth::L2DepthCalculator;
 use pirana_features::cross_exchange::{LeadLagEngine, LeadLagConfig, LeadLagSignalType};
 use pirana_features::hawkes::{HawkesIntensity, HawkesConfig};
 use pirana_features::vpin::{VpinCalculator, VpinConfig};
+use pirana_telemetry::markout::MarkoutTracker;
 use pirana_market_data::binance_ws::{BinanceWebSocket, BinanceTradeTick};
 use pirana_market_data::coinbase_ws::{CoinbaseWebSocket, CoinbaseTradeTick};
 use pirana_dashboard::state::DashboardState;
@@ -517,6 +525,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let mut vpin = VpinCalculator::new(initial_vpin_conf);
     let initial_as_conf = strategy_config.read().avellaneda_stoikov.clone();
     let mut as_model = AvellanedaStoikovModel::from_config(&initial_as_conf);
+    let mut markout_tracker = MarkoutTracker::new(100);
     let mut order_book;
     let mut log_throttler = LogThrottler::new(std::time::Duration::from_secs(60));
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
@@ -699,7 +708,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &mut markout_tracker, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -715,7 +724,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                             connection_active = false;
                         }
                         Err(_) => {
-                            error!("WebSocket read timeout (no message for 30s) — reconnecting...");
+                            error!("WebSocket timeout — no message for 30s");
                             connection_active = false;
                         }
                         _ => {}
@@ -723,7 +732,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                 }
                 _ = price_update_interval.tick() => {
                     notify_systemd_watchdog();
-                    // Periodic snapshot update
+                    // Periodic check
                 }
             }
         }
@@ -733,7 +742,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     }
 }
 
-/// Process WebSocket message from Bitfinex
+/// Process a single WebSocket message from Bitfinex
 #[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: &DashboardState,
@@ -744,6 +753,7 @@ async fn process_ws_message(
     hawkes: &mut HawkesIntensity,
     vpin: &mut VpinCalculator,
     as_model: &mut AvellanedaStoikovModel,
+    markout_tracker: &mut MarkoutTracker,
     order_book: &mut pirana_core::order_book::OrderBook,
     log_throttler: &mut LogThrottler,
     router: &Arc<parking_lot::Mutex<OrderRouter>>,
@@ -769,6 +779,12 @@ async fn process_ws_message(
 
                         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                         lead_lag_engine.write().update_bitfinex(price, now_ms);
+
+                        let markout_summary = markout_tracker.process_price(price, now_ms);
+                        *state.markout_100ms.write() = markout_summary.markout_100ms;
+                        *state.markout_1s.write() = markout_summary.markout_1s;
+                        *state.markout_5s.write() = markout_summary.markout_5s;
+                        *state.markout_30s.write() = markout_summary.markout_30s;
 
                         let conf = strategy_config.read().clone();
                         if conf.avellaneda_stoikov.enabled {
@@ -1106,15 +1122,26 @@ async fn process_ws_message(
                             let mid = order_book.mid_price().unwrap_or(0.0);
 
                             *state.order_book.write() = pirana_dashboard::state::OrderBookView {
-                                bids: bids_view,
-                                asks: asks_view,
+                                bids: bids_view.clone(),
+                                asks: asks_view.clone(),
                                 spread,
                                 mid_price: mid,
                             };
                             *state.spread.write() = spread;
 
+                            let conf = strategy_config.read().clone();
+                            let bids_slice: Vec<(f64, f64)> = bids_view.iter().map(|b| (b.price, b.quantity)).collect();
+                            let asks_slice: Vec<(f64, f64)> = asks_view.iter().map(|a| (a.price, a.quantity)).collect();
+                            let base_kappa = if conf.avellaneda_stoikov.enabled {
+                                conf.avellaneda_stoikov.order_book_liquidity_kappa
+                            } else {
+                                1.50
+                            };
+                            let dynamic_kappa = l2_depth.estimate_dynamic_kappa(&bids_slice, &asks_slice, base_kappa);
+                            as_model.kappa = dynamic_kappa;
+                            *state.dynamic_kappa.write() = dynamic_kappa;
+
                             if mid > 0.0 {
-                                let conf = strategy_config.read().clone();
                                 let total_btc = *state.btc_balance.read();
                                 let locked_btc = if conf.profit_skimmer.exclude_from_trading_margin {
                                     *state.locked_btc_reserve.read()
@@ -1474,6 +1501,8 @@ async fn process_ws_message(
                                                      executed_view.executed = true;
                                                      state.add_signal(executed_view);
 
+                                                     markout_tracker.record_trade(order_id.0.to_string(), Side::Buy, price, chrono::Utc::now().timestamp_millis() as u64);
+
                                                      // Track active position BEFORE tokio::spawn to prevent race condition
                                                      // where SELL arrives before BUY position is registered
                                                      active_positions.write().push(ActivePosition {
@@ -1747,6 +1776,13 @@ async fn process_ws_message(
                                                     }
                                                 };
 
+                                                markout_tracker.record_trade(
+                                                    "SELL_CLOSE".to_string(), 
+                                                    Side::Buy, 
+                                                    closed_pos.entry_price, 
+                                                    chrono::Utc::now().timestamp_millis() as u64
+                                                );
+
                                                 let realized_pnl = (price - closed_pos.entry_price) * closed_pos.quantity;
                                                 tracing::info!("OFI Selling Pressure closed BUY position (entry price: {}, qty: {:.6}). Realized PnL: {:.2} USD", closed_pos.entry_price, closed_pos.quantity, realized_pnl);
 
@@ -1762,6 +1798,13 @@ async fn process_ws_message(
                                                     let mut executed_view = signal_view.clone();
                                                     executed_view.executed = true;
                                                     state.add_signal(executed_view);
+
+                                                    markout_tracker.record_trade(
+                                                        order_id.0.to_string(),
+                                                        Side::Sell,
+                                                        price,
+                                                        chrono::Utc::now().timestamp_millis() as u64
+                                                    );
 
                                                     // Record in risk engine BEFORE async
                                                     risk_engine.update_exposure(-assessment.adjusted_position_size);

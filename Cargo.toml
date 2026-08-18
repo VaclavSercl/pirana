@@ -83,6 +83,9 @@ base64 = "0.22"
 # Security
 zeroize = { version = "1", features = ["derive"] }
 
+# Memory allocator for HFT
+tikv-jemallocator = { version = "0.6" }
+
 # Configuration
 config = "0.14"
 dotenvy = "0.15"
@@ -99,6 +102,7 @@ pirana-risk-engine = { path = "crates/pirana-risk-engine" }
 pirana-execution = { path = "crates/pirana-execution" }
 pirana-dashboard = { path = "crates/pirana-dashboard" }
 
+tikv-jemallocator = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -113,7 +117,7 @@ futures = { workspace = true }
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 16
+codegen-units = 1
 panic = "abort"
 strip = true
 

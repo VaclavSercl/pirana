@@ -65,6 +65,40 @@ impl L2DepthCalculator {
         let alpha = l2_alpha.clamp(0.0, 1.0);
         ((1.0 - alpha) * ofi_value) + (alpha * self.last_imbalance)
     }
+
+    /// Estimate dynamic liquidity parameter kappa from L2 order book depth
+    /// Higher book liquidity (steep density slope) -> higher kappa (tighter optimal spread)
+    /// Thin book (flat density slope / low volume) -> lower kappa (wider protective spread)
+    pub fn estimate_dynamic_kappa(&self, bids: &[(f64, f64)], asks: &[(f64, f64)], base_kappa: f64) -> f64 {
+        if bids.is_empty() || asks.is_empty() {
+            return base_kappa.clamp(0.20, 10.0);
+        }
+
+        let k = self.levels.min(bids.len()).min(asks.len());
+        if k == 0 {
+            return base_kappa.clamp(0.20, 10.0);
+        }
+
+        let mut total_qty = 0.0;
+        for i in 0..k {
+            total_qty += bids[i].1.max(0.0) + asks[i].1.max(0.0);
+        }
+
+        let best_bid = bids[0].0;
+        let best_ask = asks[0].0;
+        let deep_bid = bids[k - 1].0;
+        let deep_ask = asks[k - 1].0;
+
+        let price_span = (deep_ask - deep_bid).max(best_ask - best_bid).max(1.0);
+        let density = total_qty / price_span; // BTC per USD depth
+
+        // Baseline benchmark: 0.05 BTC over $50 span = 0.001 BTC/USD
+        let baseline_density = 0.001;
+        let ratio = (density / baseline_density).clamp(0.2, 5.0);
+        
+        let estimated_kappa = (base_kappa * ratio.sqrt()).clamp(0.20, 10.0);
+        estimated_kappa
+    }
 }
 
 #[cfg(test)]
@@ -85,5 +119,22 @@ mod tests {
 
         let composite = calc.composite_signal(0.8, 0.4);
         assert!(composite > 0.6);
+    }
+
+    #[test]
+    fn test_estimate_dynamic_kappa() {
+        let calc = L2DepthCalculator::new(5, 0.5, 0.15);
+        
+        // Deep book
+        let deep_bids = vec![(60000.0, 2.0), (59995.0, 3.0)];
+        let deep_asks = vec![(60005.0, 2.0), (60010.0, 3.0)];
+        let kappa_deep = calc.estimate_dynamic_kappa(&deep_bids, &deep_asks, 1.5);
+        assert!(kappa_deep > 1.5);
+
+        // Thin book
+        let thin_bids = vec![(60000.0, 0.001), (59900.0, 0.001)];
+        let thin_asks = vec![(60010.0, 0.001), (60100.0, 0.001)];
+        let kappa_thin = calc.estimate_dynamic_kappa(&thin_bids, &thin_asks, 1.5);
+        assert!(kappa_thin < 1.5);
     }
 }
