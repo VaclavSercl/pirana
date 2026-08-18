@@ -77,7 +77,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vault_complete_drain_zeros_active_locked() {
+    fn test_vault_zero_balance_clamp() {
         let mut active_locked = 0.25;
         let lifetime_locked = 0.45;
         let total_btc = 0.0;
@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vault_partial_drain_clamps_to_total_btc() {
+    fn test_vault_partial_reduction() {
         let mut active_locked = 0.20;
         let lifetime_locked = 0.45;
         let total_btc = 0.08;
@@ -98,6 +98,16 @@ mod tests {
         assert_eq!(active_locked, 0.08);
         assert!(log.is_some());
         assert!(log.unwrap().contains("[VAULT REBALANCE]"));
+    }
+
+    #[test]
+    fn test_lifetime_preservation() {
+        let mut active_locked = 0.25;
+        let lifetime_locked = 0.45;
+        let total_btc = 0.0;
+
+        BalanceReconciliation::reconcile_vault(total_btc, &mut active_locked, lifetime_locked);
+        assert_eq!(lifetime_locked, 0.45); // Lifetime counter is strictly preserved and never decreased
     }
 
     #[test]
