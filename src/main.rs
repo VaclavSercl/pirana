@@ -7,7 +7,8 @@ use pirana_execution::order_router::OrderRouter;
 use pirana_features::ofi::OfiCalculator;
 use pirana_features::atr::AtrCalculator;
 use pirana_features::l2_depth::L2DepthCalculator;
-use pirana_features::cross_exchange::{LeadLagEngine, LeadLagConfig, LeadLagSignal, LeadLagSignalType};
+use pirana_features::cross_exchange::{LeadLagEngine, LeadLagConfig, LeadLagSignalType};
+use pirana_features::hawkes::{HawkesIntensity, HawkesConfig};
 use pirana_market_data::binance_ws::{BinanceWebSocket, BinanceTradeTick};
 use pirana_market_data::coinbase_ws::{CoinbaseWebSocket, CoinbaseTradeTick};
 use pirana_dashboard::state::DashboardState;
@@ -36,6 +37,8 @@ pub struct StrategyConfig {
     pub adaptive_cooldown: AdaptiveCooldownConfig,
     #[serde(default)]
     pub lead_lag: LeadLagConfig,
+    #[serde(default)]
+    pub hawkes_process: HawkesConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -295,6 +298,7 @@ impl StrategyConfig {
                 profit_skimmer: ProfitSkimmerConfig::default(),
                 adaptive_cooldown: AdaptiveCooldownConfig::default(),
                 lead_lag: LeadLagConfig::default(),
+                hawkes_process: HawkesConfig::default(),
             }
         })
     }
@@ -499,6 +503,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let initial_ob_conf = strategy_config.read().order_book.clone();
     let mut atr = AtrCalculator::new(initial_vol_conf.atr_period, initial_vol_conf.ticks_per_bar, 10.0);
     let mut l2_depth = L2DepthCalculator::new(initial_ob_conf.l2_depth_levels, initial_ob_conf.l2_weight_decay, initial_ob_conf.min_l2_imbalance_threshold);
+    let initial_hawkes_conf = strategy_config.read().hawkes_process.clone();
+    let mut hawkes = HawkesIntensity::new(initial_hawkes_conf);
     let mut order_book;
     let mut log_throttler = LogThrottler::new(std::time::Duration::from_secs(60));
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
@@ -632,7 +638,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut order_book, &mut log_throttler, &router, &mut validator, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -673,6 +679,7 @@ async fn process_ws_message(
     ofi: &mut OfiCalculator,
     atr: &mut AtrCalculator,
     l2_depth: &mut L2DepthCalculator,
+    hawkes: &mut HawkesIntensity,
     order_book: &mut pirana_core::order_book::OrderBook,
     log_throttler: &mut LogThrottler,
     router: &Arc<parking_lot::Mutex<OrderRouter>>,
@@ -1094,13 +1101,23 @@ async fn process_ws_message(
                                 let is_lead_lag_buy = lead_lag_sig.signal_type == LeadLagSignalType::FrontRunBuy;
                                 let is_lead_lag_sell = lead_lag_sig.signal_type == LeadLagSignalType::FrontRunSell;
 
-                                let is_buying = is_lead_lag_buy || if conf.order_book.use_l2_depth_imbalance {
+                                hawkes.process_trade(side, qty, now_ms);
+                                let hawkes_eval = hawkes.evaluate(now_ms);
+
+                                *state.hawkes_intensity.write() = hawkes_eval.total_intensity;
+                                *state.hawkes_zscore.write() = if side == Side::Buy { hawkes_eval.buy_zscore } else { hawkes_eval.sell_zscore };
+                                *state.hawkes_status.write() = hawkes_eval.rationale.clone();
+
+                                let is_hawkes_buy = conf.hawkes_process.enabled && hawkes_eval.is_buy_cascade;
+                                let is_hawkes_sell = conf.hawkes_process.enabled && hawkes_eval.is_sell_cascade;
+
+                                let is_buying = is_lead_lag_buy || is_hawkes_buy || if conf.order_book.use_l2_depth_imbalance {
                                     ofi.is_buying_pressure() && l2_depth.is_buying_supported() && composite_signal >= conf.strategy.ofi_trigger_threshold
                                 } else {
                                     ofi.is_buying_pressure()
                                 };
 
-                                let is_selling = is_lead_lag_sell || if conf.order_book.use_l2_depth_imbalance {
+                                let is_selling = is_lead_lag_sell || is_hawkes_sell || if conf.order_book.use_l2_depth_imbalance {
                                     ofi.is_selling_pressure() && l2_depth.is_selling_supported() && composite_signal <= -conf.strategy.ofi_trigger_threshold
                                 } else {
                                     ofi.is_selling_pressure()
@@ -1163,6 +1180,11 @@ async fn process_ws_message(
                                         format!(
                                             "⚡ [LEAD-LAG FRONT-RUN BUY] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
                                             lead_lag_sig.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                        )
+                                    } else if is_hawkes_buy {
+                                        format!(
+                                            "🌊 [HAWKES BUY CASCADE] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
+                                            hawkes_eval.rationale, ofi_val, l2_imb, dynamic_pos_pct
                                         )
                                     } else {
                                         format!(
@@ -1398,6 +1420,11 @@ async fn process_ws_message(
                                         format!(
                                             "⚡ [LEAD-LAG FRONT-RUN SELL] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
                                             lead_lag_sig.rationale, ofi_val, l2_imb, dynamic_pos_pct
+                                        )
+                                    } else if is_hawkes_sell {
+                                        format!(
+                                            "🌊 [HAWKES SELL CASCADE] {} | OFI: {:.2}, L2: {:.2} | Dynamic Size: {:.2}%",
+                                            hawkes_eval.rationale, ofi_val, l2_imb, dynamic_pos_pct
                                         )
                                     } else {
                                         format!(

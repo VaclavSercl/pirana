@@ -70,6 +70,12 @@ pub struct DashboardState {
     pub lead_lag_disparity_usd: Arc<parking_lot::RwLock<f64>>,
     /// Lead-Lag status / rationale
     pub lead_lag_status: Arc<parking_lot::RwLock<String>>,
+    /// Hawkes point process total intensity
+    pub hawkes_intensity: Arc<parking_lot::RwLock<f64>>,
+    /// Hawkes point process Z-score
+    pub hawkes_zscore: Arc<parking_lot::RwLock<f64>>,
+    /// Hawkes status / cascade rationale
+    pub hawkes_status: Arc<parking_lot::RwLock<String>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -176,6 +182,9 @@ pub struct DashboardSnapshot {
     pub coinbase_btc_price: f64,
     pub lead_lag_disparity_usd: f64,
     pub lead_lag_status: String,
+    pub hawkes_intensity: f64,
+    pub hawkes_zscore: f64,
+    pub hawkes_status: String,
     pub uptime_seconds: u64,
 }
 
@@ -218,6 +227,9 @@ impl DashboardState {
             coinbase_btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
             lead_lag_disparity_usd: Arc::new(parking_lot::RwLock::new(0.0)),
             lead_lag_status: Arc::new(parking_lot::RwLock::new("Neutral".to_string())),
+            hawkes_intensity: Arc::new(parking_lot::RwLock::new(0.0)),
+            hawkes_zscore: Arc::new(parking_lot::RwLock::new(0.0)),
+            hawkes_status: Arc::new(parking_lot::RwLock::new("Baseline".to_string())),
             start_time: Utc::now(),
         }
     }
@@ -257,6 +269,9 @@ impl DashboardState {
             coinbase_btc_price: *self.coinbase_btc_price.read(),
             lead_lag_disparity_usd: *self.lead_lag_disparity_usd.read(),
             lead_lag_status: self.lead_lag_status.read().clone(),
+            hawkes_intensity: *self.hawkes_intensity.read(),
+            hawkes_zscore: *self.hawkes_zscore.read(),
+            hawkes_status: self.hawkes_status.read().clone(),
             uptime_seconds: uptime,
         }
     }

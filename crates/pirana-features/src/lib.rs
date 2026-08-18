@@ -8,3 +8,4 @@ pub mod volume_profile;
 pub mod funding_rate;
 pub mod queue_dynamics;
 pub mod cross_exchange;
+pub mod hawkes;

@@ -75,3 +75,16 @@ velocity_window_ms = 250
 weight_binance = 0.65
 weight_coinbase = 0.35
 min_confidence_score = 0.95
+
+[hawkes_process]
+enabled = true
+# Koeficient excitace intenzity při příchodu agresivní objednávky
+alpha = 0.8
+# Míra exponenciálního rozpadu intenzity (decay rate)
+beta = 1.2
+# Z-Score práh pro detekci kaskádových likvidací (Cascade Avalanche)
+zscore_threshold = 2.5
+# Časové okno pro shlukování toku v milisekundách
+window_ms = 1000
+baseline_mu = 0.1
+
