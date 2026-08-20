@@ -7,11 +7,11 @@ max_open_orders = 3
 
 [strategy]
 entry_zone_spread_usd = 5.0
-take_profit_distance_usd = 5.0
-stop_loss_distance_usd = 50.0
-ofi_trigger_threshold = 0.85
+take_profit_distance_usd = 15.0
+stop_loss_distance_usd = 400.0
+ofi_trigger_threshold = 0.80
 ofi_window_size = 100
-trade_cooldown_ms = 28000
+trade_cooldown_ms = 20000
 min_confidence_score = 0.95
 
 [inventory]
@@ -21,10 +21,10 @@ use_dynamic_inventory = true
 
 [risk_management]
 max_slippage_bps = 5
-position_size_pct = 1.0
+position_size_pct = 5.0
 max_aggregate_exposure_pct = 90.0
 max_single_trade_risk_pct = 5.0
-daily_loss_limit_usd = 40.0
+daily_loss_limit_usd = 50.0
 use_dynamic_winrate_sizing = true
 min_position_size_pct = 1.0
 max_position_size_pct = 15.0
@@ -34,11 +34,11 @@ use_dynamic_atr = true
 atr_period = 14
 ticks_per_bar = 50
 atr_tp_multiplier = 0.4
-atr_sl_multiplier = 3.0
-min_tp_usd = 4.0
-max_tp_usd = 160.0
-min_sl_usd = 25.0
-max_sl_usd = 80.0
+atr_sl_multiplier = 2.5
+min_tp_usd = 10.0
+max_tp_usd = 300.0
+min_sl_usd = 350.0
+max_sl_usd = 1200.0
 
 [order_book]
 use_l2_depth_imbalance = true
@@ -49,8 +49,8 @@ min_l2_imbalance_threshold = 0.15
 
 [trailing_stop]
 enabled = true
-min_trigger_usd = 4.0
-be_offset_usd = 1.0
+min_trigger_usd = 10.0
+be_offset_usd = 2.0
 trail_multiplier = 0.5
 
 [profit_skimmer]
