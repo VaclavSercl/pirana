@@ -53,8 +53,30 @@ impl OrderRouter {
         Self {
             active_orders: Vec::new(),
             order_history: Vec::new(),
+            // Strop poctu soucasne otevrenych orderu na symbol.
+            // Bezparametricky konstruktor drzi konzervativni konstantu;
+            // `with_max_open_orders` umoznuje nacist hodnotu ze strategy.toml.
             max_open_orders: MAX_OPEN_ORDERS_PER_SYMBOL,
         }
+    }
+
+    /// Router se stropem otevrenych orderu ze strategy.toml.
+    ///
+    /// `max_open_orders` z konfigurace byl drive mrtvy klic — router vzdy
+    /// pouzil konstantu MAX_OPEN_ORDERS_PER_SYMBOL. Hodnota se orizne do
+    /// ⟨1; MAX_OPEN_ORDERS_PER_SYMBOL⟩: konfigurace smi strop jen SNIZIT,
+    /// nikdy zvysit nad tvrdy limit z constants.rs.
+    pub fn with_max_open_orders(max_open: usize) -> Self {
+        Self {
+            active_orders: Vec::new(),
+            order_history: Vec::new(),
+            max_open_orders: max_open.clamp(1, MAX_OPEN_ORDERS_PER_SYMBOL),
+        }
+    }
+
+    /// Aktualni strop otevrenych orderu na symbol.
+    pub fn max_open_orders(&self) -> usize {
+        self.max_open_orders
     }
 
     /// Create a new order from a validated signal

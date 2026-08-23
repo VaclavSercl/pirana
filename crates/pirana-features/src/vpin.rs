@@ -109,6 +109,20 @@ impl VpinCalculator {
         self.current_sell_vol = 0.0;
     }
 
+    /// Prah, nad kterym se vyhlasuje emergency (flash crash) rezim.
+    ///
+    /// Odvozuje se od konfigurovaneho `toxicity_threshold`, nikoli z pevne
+    /// konstanty. Duvod: uroven VPIN zavisi na velikosti kose — pri malem
+    /// kosi je i vyvazeny tok vysoko (kos 0,5 BTC dava VPIN ~0,56 i pri
+    /// nulove toxicite). Zadratovana 0,75 proto pri jedne konfiguraci
+    /// blokuje trvale a pri jine nikdy.
+    ///
+    /// Emergency lezi o 15,4 % vys nez bezny prah toxicity — zachovava
+    /// puvodni pomer 0,75 / 0,65 z doby, kdy byly obe hodnoty pevne.
+    pub fn emergency_threshold(&self) -> f64 {
+        (self.config.toxicity_threshold * 1.1538).clamp(0.05, 0.99)
+    }
+
     /// Calculates current VPIN metric in range [0.0, 1.0]
     pub fn calculate_vpin(&self) -> f64 {
         if !self.config.enabled {
@@ -175,7 +189,9 @@ impl VpinCalculator {
 
     /// Check if market toxicity is extreme (Emergency Flash Crash / Sweep)
     pub fn is_emergency_toxic(&self) -> bool {
-        self.config.enabled && self.config.emergency_cancel_on_toxic && self.calculate_vpin() >= 0.75
+        self.config.enabled
+            && self.config.emergency_cancel_on_toxic
+            && self.calculate_vpin() >= self.emergency_threshold()
     }
 
     /// Human-readable toxicity status
@@ -188,7 +204,7 @@ impl VpinCalculator {
         let buckets = self.completed_buckets.len();
         let target_buckets = self.config.bucket_count;
 
-        if vpin >= 0.75 {
+        if vpin >= self.emergency_threshold() {
             format!("🚨 [EMERGENCY TOXICITY] VPIN={:.1}% >= 75% | Flash Crash Risk ({}/{} buckets)", vpin * 100.0, buckets, target_buckets)
         } else if vpin >= self.config.toxicity_threshold {
             format!("⚠️ [HIGH TOXICITY] VPIN={:.1}% >= {:.0}% | Adverse Selection Alert ({}/{} buckets)", vpin * 100.0, self.config.toxicity_threshold * 100.0, buckets, target_buckets)

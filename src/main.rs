@@ -568,7 +568,13 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         }
     }
 
-    let router = Arc::new(parking_lot::Mutex::new(OrderRouter::new()));
+    // Strop otevrenych orderu ze strategy.toml (drive mrtvy klic — router
+    // vzdy pouzil konstantu 10). Konfigurace smi strop jen SNIZIT pod tvrdy
+    // limit MAX_OPEN_ORDERS_PER_SYMBOL, nikdy ho zvysit.
+    let max_open = strategy_config.read().trading.max_open_orders as usize;
+    let router = Arc::new(parking_lot::Mutex::new(
+        OrderRouter::with_max_open_orders(max_open),
+    ));
     let initial_ofi_window = strategy_config.read().strategy.ofi_window_size;
     let initial_ofi_threshold = strategy_config.read().strategy.ofi_trigger_threshold;
     let mut ofi = OfiCalculator::with_threshold(initial_ofi_window, initial_ofi_threshold);
@@ -609,7 +615,11 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
     // Spawn a permanent, background balance reconciliation task (every 15 seconds)
     // to prevent virtual wallet balance drift, auto-clamp vault reserves, and protect PnL metrics
-    let client_for_reconciliation = BitfinexClient::new(api_key.clone(), api_secret.clone());
+    // Sdili rozpocet rate limitu i citac nonce s hlavnim klientem.
+    // Limit burzy plati na API KLIC, ne na instanci — dva nezavisle rozpocty
+    // 80/min by dohromady poslaly az 160/min proti stropu 90/min.
+    let client_for_reconciliation =
+        BitfinexClient::with_shared_limiter(api_key.clone(), api_secret.clone(), &client);
     let state_for_reconciliation = state.clone();
     let positions_for_reconciliation = active_positions.clone();
     let risk_engine_for_reconciliation = risk_engine.clone();

@@ -48,6 +48,12 @@ pub struct OrderExecutionResult {
 }
 
 impl BitfinexClient {
+    /// Novy klient s VLASTNIM rozpoctem rate limitu.
+    ///
+    /// POZOR: kazde volani vytvori samostatny rozpocet. Limit burzy je ale
+    /// na KLIC, ne na klienta — dva klienti s vlastnim limiterem 80/min
+    /// dohromady poslou az 160/min proti stropu 90/min. Pro dalsi klienty
+    /// nad tymz klicem pouzij [`Self::with_shared_limiter`].
     pub fn new(api_key: String, api_secret: String) -> Self {
         Self {
             client: Client::builder()
@@ -90,6 +96,26 @@ impl BitfinexClient {
                 Ok(_) => return next.to_string(),
                 Err(actual) => cur = actual, // jine vlakno bylo rychlejsi, zkus znovu
             }
+        }
+    }
+
+    /// Klient sdilejici rozpocet rate limitu s jinym klientem.
+    ///
+    /// Limit burzy plati na API KLIC, ne na instanci klienta. Vsichni klienti
+    /// nad tymz klicem proto musi sdilet jeden rozpocet, jinak jejich soucet
+    /// strop prekroci. Sdili se i citac nonce — Bitfinex vyzaduje striktne
+    /// rostouci nonce na klic, takze dva nezavisle citace by se srazily.
+    pub fn with_shared_limiter(api_key: String, api_secret: String, other: &Self) -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("Failed to build HTTP client"),
+            base_url: BITFINEX_REST_URL.to_string(),
+            api_key,
+            api_secret,
+            rate_limiter: other.rate_limiter.clone(),
+            nonce_counter: Arc::clone(&other.nonce_counter),
         }
     }
 
