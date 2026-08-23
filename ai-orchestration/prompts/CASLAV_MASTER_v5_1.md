@@ -234,7 +234,11 @@ inicializátory → teprve pak `check`. Skill: `struct-field-sync`.
 → `py_compile`, `bash -n`, `shellcheck` (podle jazyka).
 
 Nikdy ne obráceně. `cargo build --release` bez předchozího `check` je
-plýtvání 7 minutami ARM buildu na chybu, kterou `check` najde za 3 sekundy.
+plýtvání **26 minutami** ARM buildu na chybu, kterou `check` najde za 4 s.
+Naměřeno 23. 8. 2026 na repu pirana, stejná jednosouborová změna:
+`check` 4,15 s vs `build --release` 1 551 s = **374×**. Release build vždy
+`background=True` s timeoutem ≥ 2400 s — foreground strop je 600 s.
+Skill: `build-before-release`.
 
 `systemctl status`, `journalctl --no-pager`, `list-timers`.
 Ověř **funkční** chování, ne jen absenci chyby.
@@ -283,13 +287,23 @@ přesné příkazy a pasti — je to procedurální paměť, ne dokumentace.
 
 ## §5c — TŘI PRAVIDLA KTERÁ SE NESMĚJÍ OPAKOVAT
 
-Z dnešních selhání (23. 8. 2026) vyplynula tři pravidla, která se nesmějí stát znovu:
+Z dnešních selhání (23. 8. 2026) vyplynula tři pravidla. **Plné postupy
+včetně naměřených čísel a ověřovacích příkazů jsou uložené jako skills**
+(prompt zůstává krátký, skill nese detail) — načti je podle §5b:
 
-1. **Struct Field Sync.** Přidáváš-li pole do Rust structu, uprav **všechny** jeho inicializátory v tom samém patchi. Nikdy ne postupně. `cargo check --all-targets` je součást editu, ne následná fáze. Důkaz: `defensive_since` přidán do struct, ne do inicializátoru → `BUILD_EXIT=101` po 80 s.
+1. **`struct-field-sync`.** Přidáváš-li pole do Rust structu, uprav **všechny**
+   jeho inicializátory v tom samém patchi. `cargo check --all-targets` je
+   součást editu, ne následná fáze. Důkaz: `defensive_since` přidán do struct,
+   ne do inicializátoru → `BUILD_EXIT=101` po 80 s.
 
-2. **Build Before Release.** Nikdy `cargo build --release` bez předchozího `cargo check`. Na ARM je to rozdíl 3 sekund vs 7 minut. Zakázán jakýkoliv pipe (`| tail`, `| grep`) na verifikačním příkazu — maskuje exit kód.
+2. **`build-before-release`.** Nikdy `cargo build --release` bez předchozího
+   `cargo check`. Naměřeno na tomto stroji: 4,15 s vs 1 551 s = **374×**.
+   Zakázán jakýkoliv pipe na verifikačním příkazu — maskuje exit kód (§4/4).
 
-3. **Single Poller.** Telegram bot = jediný `getUpdates` poller. Dva boti na stejném tokenu = `409 Conflict` a tichá ztráta zpráv. Před nasazením ověř: `pgrep -af "bot.py"` a `journalctl | grep -c 409`.
+3. **`single-poller`.** Telegram bot = jediný `getUpdates` poller. Dva boti na
+   stejném tokenu = `409 Conflict` a tichá ztráta zpráv. Kontroluj **obě**
+   systemd scope: `pgrep -cf '[c]aslav_bot.py'` == 1, a `409` v system
+   i user journalu == 0.
 
 ---
 
