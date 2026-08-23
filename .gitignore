@@ -44,3 +44,5 @@ logs/
 *.bak
 __pycache__/
 *.pyc
+debug_auth
+debug_auth.rs

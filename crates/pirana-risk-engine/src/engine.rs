@@ -304,6 +304,11 @@ impl RiskEngine {
         self.state.read().paper_consecutive_wins
     }
 
+    /// Get current consecutive losses (for dashboard sync after trade closes)
+    pub fn consecutive_losses(&self) -> u32 {
+        self.state.read().consecutive_losses
+    }
+
     /// Reset daily counters (call at day boundary)
     pub fn reset_daily(&self, new_balance: f64) {
         let mut state = self.state.write();
@@ -312,6 +317,32 @@ impl RiskEngine {
         state.daily_drawdown_pct = 0.0;
         state.trades_today = 0;
         info!("Daily risk counters reset");
+    }
+
+    /// Atomically re-anchor risk engine equity anchors after an external
+    /// capital flow (deposit / withdrawal) was detected by BalanceReconciliation.
+    /// `new_starting_equity` is the TWR-adjusted equity already computed for the
+    /// dashboard; applying the same anchor here keeps drawdown math consistent.
+    pub fn reanchor_equity(&self, new_starting_equity: f64) {
+        if new_starting_equity <= 0.0 || !new_starting_equity.is_finite() {
+            return;
+        }
+        let mut state = self.state.write();
+        let ratio = if state.daily_start_balance > 0.0 {
+            new_starting_equity / state.daily_start_balance
+        } else {
+            1.0
+        };
+        state.daily_start_balance = new_starting_equity;
+        state.weekly_start_balance = if state.weekly_start_balance > 0.0 {
+            state.weekly_start_balance * ratio
+        } else {
+            new_starting_equity
+        };
+        info!(
+            "Risk Engine: TWR re-anchor applied — daily_start={:.2}, weekly_start={:.2}",
+            state.daily_start_balance, state.weekly_start_balance
+        );
     }
 
     /// Reset weekly counters (call at week boundary)
@@ -338,5 +369,76 @@ impl RiskEngine {
             state.consecutive_losses = 0;
             info!("Risk Engine: Resumed to Active");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_signal(position_size_pct: f64, invalidation: f64) -> Signal {
+        Signal {
+            id: SignalId::new(),
+            signal_type: SignalType::SpreadCapture,
+            target_asset: Symbol::new("tBTCUSD"),
+            confidence_score: 0.99,
+            market_regime: MarketRegime::HighVolatilityTrending,
+            rationale: "test".to_string(),
+            recommended_params: SignalParams {
+                entry_zone: (76000.0, 76100.0),
+                invalidation_level: invalidation,
+                volatility_adjusted_tp: 15.0,
+                position_size_pct,
+                max_slippage_bps: 5,
+            },
+            timestamp: chrono::Utc::now(),
+            invalidation_level: invalidation,
+        }
+    }
+
+    #[test]
+    fn test_exposure_units_are_fractional() {
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+        // 1% position as FRACTION (0.01), consistent with engine constants (MAX_AGGREGATE_EXPOSURE=0.90)
+        let sig = make_signal(0.01, 76000.0);
+        let assessment = engine.evaluate_trade(&sig, 76200.0).unwrap();
+        assert!(assessment.approved);
+        engine.update_exposure(assessment.adjusted_position_size);
+        // Exposure must stay a small fraction, not explode to percentage-scale values
+        let exp = {
+            let s = engine.state.read();
+            s.aggregate_exposure
+        };
+        assert!(exp > 0.0 && exp < 0.5, "exposure {:?} must be fractional", exp);
+    }
+
+    #[test]
+    fn test_reanchor_equity_scales_anchors() {
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+        engine.reanchor_equity(200.0);
+        let s = engine.state.read();
+        assert!((s.daily_start_balance - 200.0).abs() < 1e-9);
+        assert!((s.weekly_start_balance - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_reanchor_equity_ignores_invalid() {
+        let engine = RiskEngine::new(400.0);
+        engine.reanchor_equity(0.0);
+        engine.reanchor_equity(f64::NAN);
+        let s = engine.state.read();
+        assert_eq!(s.daily_start_balance, 400.0);
+    }
+
+    #[test]
+    fn test_consecutive_losses_getter() {
+        let engine = RiskEngine::new(400.0);
+        assert_eq!(engine.consecutive_losses(), 0);
+        engine.record_trade_result(-1.0);
+        assert_eq!(engine.consecutive_losses(), 1);
+        engine.record_trade_result(0.5);
+        assert_eq!(engine.consecutive_losses(), 0);
     }
 }

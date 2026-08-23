@@ -17,6 +17,19 @@ pub struct BitfinexClient {
     api_secret: String,
 }
 
+/// Result of a successfully submitted order, parsed from the exchange response
+#[derive(Debug, Clone)]
+pub struct OrderExecutionResult {
+    /// Exchange-assigned order ID
+    pub exchange_order_id: i64,
+    /// Real average execution price parsed from the exchange fill (falls back to requested price)
+    pub avg_fill_price: f64,
+    /// Real executed quantity (absolute value)
+    pub filled_qty: f64,
+    /// Raw response body for auditing
+    pub raw: String,
+}
+
 impl BitfinexClient {
     pub fn new(api_key: String, api_secret: String) -> Self {
         Self {
@@ -31,6 +44,12 @@ impl BitfinexClient {
     }
 
     /// Submit a new order to Bitfinex
+    ///
+    /// Returns a parsed `OrderExecutionResult` containing the REAL average
+    /// execution price reported by the exchange (index 16 of the order array
+    /// in the `on-req` notification payload). Callers MUST use
+    /// `avg_fill_price` for PnL accounting instead of the ticker price at
+    /// submission time — market orders slip.
     pub async fn submit_order(
         &self,
         symbol: &str,
@@ -38,7 +57,7 @@ impl BitfinexClient {
         order_type: OrderType,
         quantity: f64,
         price: f64,
-    ) -> PiranaResult<String> {
+    ) -> PiranaResult<OrderExecutionResult> {
         if quantity.abs() < MIN_ORDER_SIZE_BTC {
             return Err(PiranaError::ExchangeApi {
                 code: 10001,
@@ -98,7 +117,56 @@ impl BitfinexClient {
         }
 
         info!("Order submitted successfully: {}", text);
-        Ok(text)
+        Ok(Self::parse_order_execution(&text, price, quantity))
+    }
+
+    /// Parse the Bitfinex `on-req` notification payload:
+    /// [ MTS, "on-req", null, null, [ [ ORDER_ARRAY ] ], null, "SUCCESS", "..." ]
+    /// ORDER_ARRAY layout (relevant indices):
+    ///   [0]  = exchange order id (u64)
+    ///   [6]  = amount (signed)
+    ///   [7]  = amount_orig (signed)
+    ///   [16] = price_avg (f64, 0.0 if not filled yet)
+    fn parse_order_execution(text: &str, requested_price: f64, requested_qty: f64) -> OrderExecutionResult {
+        let mut exchange_order_id: i64 = 0;
+        let mut avg_fill_price: f64 = 0.0;
+        let mut filled_qty: f64 = requested_qty.abs();
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            // Navigate to the innermost order array at json[4][0]
+            if let Some(order_arr) = json
+                .get(4)
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_array())
+            {
+                if let Some(id) = order_arr.get(0).and_then(|v| v.as_i64()) {
+                    exchange_order_id = id;
+                }
+                if let Some(p) = order_arr.get(16).and_then(|v| v.as_f64()) {
+                    avg_fill_price = p;
+                }
+                if let Some(a) = order_arr.get(6).and_then(|v| v.as_f64()) {
+                    if a.abs() > 0.0 {
+                        filled_qty = a.abs();
+                    }
+                }
+            }
+        }
+
+        // Fallback: market order ACK may arrive before fill registration.
+        // Never report 0.0 as a fill price — fall back to the requested price
+        // so downstream PnL math stays finite.
+        if !avg_fill_price.is_finite() || avg_fill_price <= 0.0 {
+            avg_fill_price = requested_price;
+        }
+
+        OrderExecutionResult {
+            exchange_order_id,
+            avg_fill_price,
+            filled_qty,
+            raw: text.to_string(),
+        }
     }
 
     /// Cancel an order
@@ -248,5 +316,35 @@ fn side_str(side: Side) -> &'static str {
     match side {
         Side::Buy => "BUY",
         Side::Sell => "SELL",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_order_execution_extracts_avg_price() {
+        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,-0.000052,-0.000052,"EXCHANGE MARKET",null,null,null,0,"ACTIVE",null,null,76285,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{"source":"api"}]],null,"SUCCESS","Submitting 1 orders."]"#;
+        let r = BitfinexClient::parse_order_execution(sample, 76288.0, -0.000052);
+        assert_eq!(r.exchange_order_id, 242489181632);
+        assert!((r.avg_fill_price - 76285.0).abs() < 1e-9);
+        assert!((r.filled_qty - 0.000052).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_order_execution_fallback_on_zero_price() {
+        // ACK received before fill registration: price_avg == 0 -> fallback to requested price
+        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,-0.000052,-0.000052,"EXCHANGE MARKET",null,null,null,0,"ACTIVE",null,null,0,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
+        let r = BitfinexClient::parse_order_execution(sample, 76288.0, -0.000052);
+        assert_eq!(r.avg_fill_price, 76288.0);
+    }
+
+    #[test]
+    fn test_parse_order_execution_garbage_falls_back() {
+        let r = BitfinexClient::parse_order_execution("not json", 76288.0, 0.001);
+        assert_eq!(r.avg_fill_price, 76288.0);
+        assert_eq!(r.filled_qty, 0.001);
+        assert_eq!(r.exchange_order_id, 0);
     }
 }
