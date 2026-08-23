@@ -9,6 +9,7 @@ pirana-core = { path = "../pirana-core" }
 pirana-risk-engine = { path = "../pirana-risk-engine" }
 pirana-telemetry = { path = "../pirana-telemetry" }
 tokio = { workspace = true }
+parking_lot = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

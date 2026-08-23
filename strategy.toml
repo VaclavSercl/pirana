@@ -11,7 +11,16 @@ take_profit_distance_usd = 15.0
 stop_loss_distance_usd = 400.0
 ofi_trigger_threshold = 0.85
 ofi_window_size = 100
-trade_cooldown_ms = 20000
+# HFT frekvence (2026-08-23): 20000 -> 2000 ms
+# Tvrdý strop je Bitfinex: 90 orderů/min = 1,5 obchodu/s (0,67 s).
+# Expektace na obchod je kladná: +0,296 sats (win rate 39,1 %, payoff 2,14),
+# takže vyšší frekvence násobí zisk. 2 s ponechává ~3x rezervu k limitu burzy
+# pro TP/SL a rebalance ordery, které jdou mimo tento cooldown.
+#   20 s ->  4 320 obchodů/den ->  ~1 277 sats/den
+#    2 s -> 43 200 obchodů/den -> ~12 772 sats/den
+# POZOR: kladná expektace je podmínkou. Klesne-li pod nulu, rychlost násobí
+# ztrátu — sleduj markouty a Profit Factor v denním reportu.
+trade_cooldown_ms = 2000
 min_confidence_score = 0.95
 
 [inventory]
@@ -62,8 +71,12 @@ exclude_from_trading_margin = true
 
 [adaptive_cooldown]
 enabled = true
-min_ms = 8000
-max_ms = 60000
+# Adaptivní rozpětí (2026-08-23): 8000-60000 -> 1000-20000 ms
+# min_ms = 1000: nejsilnější signál (composite >= 0,85) smí obchodovat 1x/s,
+#   stále 1,5x pod limitem burzy.
+# max_ms = 20000: nejslabší signál čeká 20 s (dřívější základní cooldown).
+min_ms = 1000
+max_ms = 20000
 
 [lead_lag]
 enabled = true
@@ -90,8 +103,26 @@ baseline_mu = 0.1
 
 [vpin_guard]
 enabled = true
-# Velikost objemového koše v BTC
-bucket_size_btc = 0.5
+# Velikost objemového koše v BTC.
+#
+# KALIBRACE (2026-08-23): 0.5 -> 5.0
+# Koš 0,5 BTC byl 190x menší, než předepisuje standard (Easley/Lopez de Prado/
+# O'Hara: 1/50 denního objemu = ~95 BTC na tBTCUSD). Naměřeno na burze:
+# průtok 3,31 BTC/min, medián obchodu 0,00129 BTC, max 1,11 BTC.
+# Koš 0,5 BTC pojal jen 22 obchodů a naplnil se za 9 s; jediný velký taker
+# (3,5 % obchodů má >= 0,25 BTC) ho zaplnil z poloviny jedním směrem.
+#
+# Simulace při DOKONALE VYVÁŽENÉM toku (50 % buy / 50 % sell), 300 běhů:
+#     koš 0,5 BTC ->  VPIN 0,557   (emergency práh 0,75 => trvalé blokování)
+#     koš 2,0 BTC ->  VPIN 0,361
+#     koš 5,0 BTC ->  VPIN 0,230   <- zvoleno
+#     koš 25  BTC ->  VPIN 0,104   (už necitlivý na skutečnou toxicitu)
+#
+# VPIN tedy neměřil toxicitu toku, ale granularitu košů. Důsledek: 251
+# emergency alertů za den a 3,5 h zastaveného obchodování 23. 8. od 13:06.
+# 5,0 BTC = 217 obchodů na koš, naplní se za ~91 s — dost na vyhlazení šumu,
+# stále dost citlivé na reálný jednosměrný tok.
+bucket_size_btc = 5.0
 # Počet košů v klouzavém okně
 bucket_count = 50
 # Práh toxicity pro blokování protisměrných obchodů (Adverse Selection Guard)

@@ -5,6 +5,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha384;
 use reqwest::Client;
 use tracing::{info, debug, error};
+use crate::rate_limiter::RateLimiter;
 
 type HmacSha384 = Hmac<Sha384>;
 
@@ -15,6 +16,9 @@ pub struct BitfinexClient {
     base_url: String,
     api_key: String,
     api_secret: String,
+    /// Ochrana proti prekroceni limitu burzy (90 req/min) a ban u klice.
+    /// Sdilena mezi vsemi klony klienta — jeden rozpocet pro cely proces.
+    rate_limiter: RateLimiter,
 }
 
 /// Result of a successfully submitted order, parsed from the exchange response
@@ -40,7 +44,13 @@ impl BitfinexClient {
             base_url: BITFINEX_REST_URL.to_string(),
             api_key,
             api_secret,
+            rate_limiter: RateLimiter::with_default(),
         }
+    }
+
+    /// Pristup k rate limiteru — pro telemetrii a dashboard.
+    pub fn rate_limiter(&self) -> &RateLimiter {
+        &self.rate_limiter
     }
 
     /// Submit a new order to Bitfinex
@@ -88,6 +98,9 @@ impl BitfinexClient {
 
         debug!("Submitting order: {} {} {} @ {}", side_str(side), quantity, symbol, price);
 
+        // Rate limit: pockat na token, nez zatizime burzu.
+        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
+        self.rate_limiter.acquire().await;
         let response = self.client
             .post(&url)
             .header("bfx-apikey", &self.api_key)
@@ -108,6 +121,17 @@ impl BitfinexClient {
             message: format!("Failed to read response: {}", e),
         })?;
 
+        // HTTP 429 = prekrocili jsme tempo. Aktivovat exponencialni backoff,
+        // aby dalsi volani pockala. Ban od burzy je horsi nez zmeskany obchod.
+        if status.as_u16() == 429 {
+            self.rate_limiter.record_rate_limited();
+            error!("Bitfinex rate limit (429): {}", text);
+            return Err(PiranaError::ExchangeApi {
+                code: 429,
+                message: format!("rate limited: {text}"),
+            });
+        }
+
         if !status.is_success() {
             error!("Order rejected: {} - {}", status, text);
             return Err(PiranaError::ExchangeApi {
@@ -115,6 +139,8 @@ impl BitfinexClient {
                 message: text,
             });
         }
+
+        self.rate_limiter.record_success();
 
         info!("Order submitted successfully: {}", text);
         Ok(Self::parse_order_execution(&text, price, quantity))
@@ -180,6 +206,9 @@ impl BitfinexClient {
 
         let url = format!("{}/v2/auth/w/order/cancel", self.base_url);
 
+        // Rate limit: pockat na token, nez zatizime burzu.
+        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
+        self.rate_limiter.acquire().await;
         let response = self.client
             .post(&url)
             .header("bfx-apikey", &self.api_key)
@@ -213,6 +242,9 @@ impl BitfinexClient {
 
         let url = format!("{}/v2/auth/r/wallets", self.base_url);
 
+        // Rate limit: pockat na token, nez zatizime burzu.
+        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
+        self.rate_limiter.acquire().await;
         let response = self.client
             .post(&url)
             .header("bfx-apikey", &self.api_key)
@@ -266,6 +298,9 @@ impl BitfinexClient {
 
         let url = format!("{}/v2/auth/r/orders/{}", self.base_url, symbol);
 
+        // Rate limit: pockat na token, nez zatizime burzu.
+        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
+        self.rate_limiter.acquire().await;
         let response = self.client
             .post(&url)
             .header("bfx-apikey", &self.api_key)
