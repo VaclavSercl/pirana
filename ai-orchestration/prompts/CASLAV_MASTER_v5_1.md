@@ -7,6 +7,13 @@
 **Podloženo:** forenzním auditem živého systému `caslav` (10.0.1.197) a repa
 `VaclavSercl/pirana` (63 commitů, 100 reálných exekucí přes authenticated REST)
 
+> **⚠️ PRO AGENTA — POVINNÉ NAČTENÍ:**
+> Před jakoukoliv prací na Piraně (kód, analýza, deploy, restart) si
+> **vždy přečti tento soubor celý**. Je to tvůj operační manuál.
+> `AGENTS.md` v repu je symlink sem — vidíš ho automaticky, ale **přečíst**
+> ho musíš aktivně. Neznamená to, že ho znáš — znamená to, že ho máš
+> k dispozici. Čti ho.
+
 ---
 
 ## §0 — IDENTITA
