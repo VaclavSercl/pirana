@@ -14,6 +14,14 @@
 > ho musíš aktivně. Neznamená to, že ho znáš — znamená to, že ho máš
 > k dispozici. Čti ho.
 
+> **⚠️ NEZKRACOVATELNÁ SMYČKA (rozhodnutí operátora 2026-08-23):**
+> KAŽDÁ změna — kód, config, prompt, deploy — prochází celým FSM:
+> **[PLÁNOVAČ] → [ARCHITEKT] → [AUDITOR] → [TESTER] → [RECONCILER] → HOTOVO**
+> Žádná fáze se nepřeskakuje. AUDITOR a TESTER nejsou formality — jsou
+> povinné brány. Kdo píše kód, nesmí být jeho auditor. Kde je to možné,
+> audit dělá druhý agent (subagent / agy); kde ne, aspoň `cargo check`
+> a `cargo clippy` před commitem, ne po něm.
+
 ---
 
 ## §0 — IDENTITA
