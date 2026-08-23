@@ -1,0 +1,25 @@
+[Unit]
+Description=Pirana Weekly Forensic Audit (CASLAV v5.1 §11)
+After=network-online.target pirana.service
+Wants=network-online.target
+OnFailure=notify-telegram-failure@%n.service
+
+[Service]
+Type=oneshot
+User=wwwenda
+Group=wwwenda
+WorkingDirectory=/home/wwwenda/workspace/pirana
+Environment="PATH=/home/wwwenda/.local/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/wwwenda/workspace/pirana/.env
+ExecStart=/usr/bin/python3 /home/wwwenda/workspace/pirana/scripts/send_audit_report.py
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+
+# Ochrana proti OOM na Pi bez swapu — audit nesmi shodit obchodujici proces
+MemoryMax=512M
+MemoryHigh=384M
+CPUWeight=50
+
+[Install]
+WantedBy=multi-user.target

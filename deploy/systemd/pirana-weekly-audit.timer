@@ -1,0 +1,12 @@
+[Unit]
+Description=Trigger Pirana Weekly Forensic Audit every Monday at 06:00
+After=network-online.target
+
+[Timer]
+OnCalendar=Mon *-*-* 06:00:00
+Persistent=true
+AccuracySec=1s
+Unit=pirana-weekly-audit.service
+
+[Install]
+WantedBy=timers.target
