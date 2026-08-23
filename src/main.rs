@@ -1609,6 +1609,22 @@ async fn process_ws_message(
                                         if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                              tracing::info!("🔒 [PAPER TRADING] Buying Pressure (Composite: {:.2}) -> Creating stínovou BUY pozici pro {:.6} BTC (Halted mode active)", composite_signal, final_trade_size);
 
+                                             // Paper obchod slot v routeru okamzite uvolni.
+                                             //
+                                             // update_order() volaji VYHRADNE realne cesty (r. 1757/1762/2049/2143).
+                                             // Bez tohoto radku by paper obchody v Halted rezimu trvale zaplnily
+                                             // active_orders az na max_open_orders a create_order by pak vracel
+                                             // Err("Max open orders reached"). Volajici pouziva `if let Ok(..)`,
+                                             // takze by se chyba TISE spolkla a bot by prestal obchodovat i po
+                                             // navratu do Active — bez jedineho chyboveho logu.
+                                             let _ = router.lock().update_order(
+                                                 order_id,
+                                                 OrderStatus::Filled,
+                                                 final_trade_size,
+                                                 price,
+                                                 None,
+                                             );
+
                                              ofi.reset();
                                              *last_trade_time = std::time::Instant::now();
 
@@ -1909,6 +1925,22 @@ async fn process_ws_message(
 
                                         if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                             tracing::info!("🔒 [PAPER TRADING] OFI Selling Pressure -> Closing stínové pozice (Halted mode active)");
+
+                                            // Paper obchod slot v routeru okamzite uvolni.
+                                            //
+                                            // update_order() volaji VYHRADNE realne cesty (r. 1757/1762/2049/2143).
+                                            // Bez tohoto radku by paper obchody v Halted rezimu trvale zaplnily
+                                            // active_orders az na max_open_orders a create_order by pak vracel
+                                            // Err("Max open orders reached"). Volajici pouziva `if let Ok(..)`,
+                                            // takze by se chyba TISE spolkla a bot by prestal obchodovat i po
+                                            // navratu do Active — bez jedineho chyboveho logu.
+                                            let _ = router.lock().update_order(
+                                                order_id,
+                                                OrderStatus::Filled,
+                                                final_trade_size,
+                                                price,
+                                                None,
+                                            );
 
                                             ofi.reset();
                                             *last_trade_time = std::time::Instant::now();

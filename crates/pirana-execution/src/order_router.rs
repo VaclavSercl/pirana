@@ -225,3 +225,81 @@ impl OrderRouter {
         cancelled
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  REGRESNI TESTY — vycerpani slotu (P0 z 2026-08-23)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod slot_exhaustion_tests {
+    use super::*;
+    use pirana_core::types::{MarketRegime, Signal, SignalId, SignalParams, SignalType, Symbol};
+    use chrono::Utc;
+
+    fn signal() -> Signal {
+        Signal {
+            id: SignalId::new(),
+            signal_type: SignalType::SpreadCapture,
+            target_asset: Symbol::new("tBTCUSD"),
+            confidence_score: 0.9,
+            market_regime: MarketRegime::HighVolatilityTrending,
+            rationale: "test".to_string(),
+            recommended_params: SignalParams {
+                entry_zone: (99_000.0, 101_000.0),
+                invalidation_level: 99_000.0,
+                volatility_adjusted_tp: 101_000.0,
+                position_size_pct: 0.01,
+                max_slippage_bps: 5,
+            },
+            timestamp: Utc::now(),
+            invalidation_level: 99_000.0,
+        }
+    }
+
+    #[test]
+    fn orders_without_update_exhaust_all_slots() {
+        // Presne scenar, ktery bota zastavil: create_order bez update_order.
+        // Paper cesty v Halted rezimu volaly jen create_order — sloty se
+        // nikdy neuvolnily a po naplneni vracel router Err natrvalo.
+        let mut r = OrderRouter::with_max_open_orders(3);
+        for i in 0..3 {
+            assert!(r.create_order(&signal(), 100_000.0, 0.001).is_ok(), "order {i} mel projit");
+        }
+        // Ctvrty uz neprojde — a bez update_order to tak zustane navzdy.
+        assert!(
+            r.create_order(&signal(), 100_000.0, 0.001).is_err(),
+            "po vycerpani slotu musi create_order selhat"
+        );
+    }
+
+    #[test]
+    fn update_order_frees_the_slot() {
+        // Oprava: kdyz se order uzavre, slot se uvolni a lze obchodovat dal.
+        let mut r = OrderRouter::with_max_open_orders(1);
+        let id = r.create_order(&signal(), 100_000.0, 0.001).expect("prvni order");
+        assert!(r.create_order(&signal(), 100_000.0, 0.001).is_err(), "slot je plny");
+
+        let _ = r.update_order(id, OrderStatus::Filled, 0.001, 100_000.0, None);
+
+        assert!(
+            r.create_order(&signal(), 100_000.0, 0.001).is_ok(),
+            "po uzavreni orderu musi byt slot volny"
+        );
+    }
+
+    #[test]
+    fn config_can_only_lower_the_cap_never_raise_it() {
+        // Konfigurace smi strop jen SNIZIT pod tvrdy limit z constants.rs.
+        assert_eq!(OrderRouter::with_max_open_orders(3).max_open_orders(), 3);
+        assert_eq!(
+            OrderRouter::with_max_open_orders(9_999).max_open_orders(),
+            MAX_OPEN_ORDERS_PER_SYMBOL,
+            "konfigurace nesmi prekrocit tvrdy limit"
+        );
+        assert_eq!(
+            OrderRouter::with_max_open_orders(0).max_open_orders(),
+            1,
+            "nula by znamenala uplne zastaveni obchodovani"
+        );
+    }
+}

@@ -192,6 +192,17 @@ Rollback plán před změnou.
 se `set -euo pipefail`. Idempotence povinná. Žádný kód bez testu, žádná služba
 bez `Restart=`, `OnFailure=`, cgroup limitů. Chybu neomlouváš — opravuješ.
 
+**Pravidlo Kodéra (z §4.1, posíleno):** Výstupem je vždy ucelený,
+spustitelný celek — nikdy nedokončený kód ani fragmenty. Pokud měníš
+struct, změň všechny jeho inicializátory ve stejném kroku. Neexistuje
+"něco udělám teď, zbytek dodělám později" — to vytváří `BUILD_EXIT=101`
+po 80 vteřinách místo po 3.
+
+`cargo check --all-targets` je **součást editu, ne následná fáze.**
+Edit není hotový, dokud `check` nevrátí 0. Postup při změně structu:
+`search_files` na `NazevStruct {` → aktualizuj VŠECHNY nalezené
+inicializátory → teprve pak `check`. Skill: `struct-field-sync`.
+
 **[AUDITOR]** Cizíma očima, hledáš důvod k zamítnutí.
 `cargo clippy --all-targets -- -D warnings`, `ruff`, `shellcheck`.
 - **Math safety:** každý jmenovatel `.max(EPSILON)`, výsledky `.clamp()`,
@@ -208,8 +219,16 @@ bez `Restart=`, `OnFailure=`, cgroup limitů. Chybu neomlouváš — opravuješ.
 - Verdikt `[AUDIT: PASSED|FAILED — <výhrady>]`. Nikdy neschvaluješ vlastní
   kód „protože ho znáš".
 
-**[TESTER]** Skutečně spustíš. `cargo check --all-targets` → `clippy -D warnings`
-→ `cargo test --workspace` → `py_compile` → `bash -n` → `shellcheck`.
+**[TESTER]** Skutečně spustíš — ale v tomto pořadí, od rychlého k pomalému:
+`cargo check --all-targets` (sekundy, chyby typů a syntaxe)
+→ `cargo clippy --all-targets -- -D warnings` (sekundy, chyby logiky)
+→ `cargo test --workspace` (minuty, chyby chování)
+→ `cargo build --release` (minuty, jen pro nasazení)
+→ `py_compile`, `bash -n`, `shellcheck` (podle jazyka).
+
+Nikdy ne obráceně. `cargo build --release` bez předchozího `check` je
+plýtvání 7 minutami ARM buildu na chybu, kterou `check` najde za 3 sekundy.
+
 `systemctl status`, `journalctl --no-pager`, `list-timers`.
 Ověř **funkční** chování, ne jen absenci chyby.
 
@@ -252,6 +271,18 @@ přesné příkazy a pasti — je to procedurální paměť, ne dokumentace.
    skill s neplatnými limity aktivně škodí, protože podle něj uvažuješ.
 6. **Ověřuj sám.** Existenci skillu, jeho obsah i platnost jeho tvrzení
    si potvrď příkazem, ne pamětí.
+
+---
+
+## §5c — TŘI PRAVIDLA KTERÁ SE NESMĚJÍ OPAKOVAT
+
+Z dnešních selhání (23. 8. 2026) vyplynula tři pravidla, která se nesmějí stát znovu:
+
+1. **Struct Field Sync.** Přidáváš-li pole do Rust structu, uprav **všechny** jeho inicializátory v tom samém patchi. Nikdy ne postupně. `cargo check --all-targets` je součást editu, ne následná fáze. Důkaz: `defensive_since` přidán do struct, ne do inicializátoru → `BUILD_EXIT=101` po 80 s.
+
+2. **Build Before Release.** Nikdy `cargo build --release` bez předchozího `cargo check`. Na ARM je to rozdíl 3 sekund vs 7 minut. Zakázán jakýkoliv pipe (`| tail`, `| grep`) na verifikačním příkazu — maskuje exit kód.
+
+3. **Single Poller.** Telegram bot = jediný `getUpdates` poller. Dva boti na stejném tokenu = `409 Conflict` a tichá ztráta zpráv. Před nasazením ověř: `pgrep -af "bot.py"` a `journalctl | grep -c 409`.
 
 ---
 

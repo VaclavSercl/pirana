@@ -8,6 +8,15 @@ use crate::limits::{
     effective_consecutive_loss_threshold, effective_max_aggregate_exposure,
     effective_max_daily_drawdown, effective_max_single_trade_risk, effective_max_weekly_drawdown,
 };
+
+/// Po vstupu do Defensive se system automaticky vrati do Active po N minutach,
+/// POKUD mezitim nedoslo k dalsi ztrate. Defensive pak slouzi jako cooldown,
+/// ne jako permanentni uvaznuti.
+const DEFENSIVE_COOLDOWN_SECS: i64 = 15 * 60;
+
+/// Max. relativni snizeni sizingu po navratu z Defensive cooldownu.
+/// Cooldown nevraci system do plne sily — jde o sondu.
+const DEFENSIVE_RECOVERY_POSITION_FRACTION: f64 = 0.5;
 // POZOR na kolizi jmen: nize v tomto souboru je privatni `struct RiskState`
 // (bezici stav enginu). `self_calibration::RiskState` je neco jineho —
 // sada kalibrovanych parametru. Alias je nutny.
@@ -71,6 +80,8 @@ struct RiskState {
     weekly_drawdown_pct: f64,
     /// Consecutive wins counter for paper trading in Halted mode
     paper_consecutive_wins: u32,
+    /// Kdy system vstoupil do Defensive (Unix timestamp). 0 = neni Defensive.
+    defensive_since: i64,
 }
 
 impl RiskEngine {
@@ -146,6 +157,7 @@ impl RiskEngine {
                 daily_drawdown_pct: 0.0,
                 weekly_drawdown_pct: 0.0,
                 paper_consecutive_wins: 0,
+                defensive_since: 0,
             })),
             calibrated: Arc::new(RwLock::new(calibrated)),
             ledger: Arc::new(Mutex::new(TradeLedger::new())),
@@ -382,6 +394,7 @@ impl RiskEngine {
         // Check daily drawdown
         if state.daily_drawdown_pct >= lim_daily_dd {
             state.mode = SystemMode::Defensive;
+            state.defensive_since = chrono::Utc::now().timestamp();
             warn!("Daily drawdown limit reached! Entering DEFENSIVE MODE");
             return Ok(RiskAssessment {
                 approved: false,
@@ -421,13 +434,16 @@ impl RiskEngine {
         if state.consecutive_losses >= lim_consecutive {
             if state.mode == SystemMode::Active {
                 state.mode = SystemMode::Defensive;
+                state.defensive_since = chrono::Utc::now().timestamp();
                 warn!("Consecutive loss threshold reached! Transitioning to DEFENSIVE MODE");
             }
 
             // Hard limit: If losses continue even in defensive mode and reach double threshold (10), HALT the system
             if state.consecutive_losses >= lim_consecutive.saturating_mul(2) {
                 state.mode = SystemMode::Halted;
-                error!("Critical consecutive loss threshold reached in defensive mode! System HALTED");
+                error!(
+                    "Critical consecutive loss threshold reached in defensive mode! System HALTED"
+                );
                 return Ok(RiskAssessment {
                     approved: false,
                     rejection_reason: Some(format!(
@@ -444,8 +460,32 @@ impl RiskEngine {
             }
         }
 
+        // Defensive cooldown: po N minutach bez dalsi ztraty automaticky zpet do Active
+        // s redukovanym sizingem (sonda), aby system neuvazl do doby, nez nekdo rucne zasahne.
+        // Cooldown se vyhodnocuje PRED sizingem — musime zachytit, ze k nemu doslo,
+        // abychom na prvni obchod po navratu aplikovali redukovany sizing.
+        let was_defensive_cooldown = state.mode == SystemMode::Defensive
+            && state.defensive_since > 0
+            && chrono::Utc::now().timestamp() - state.defensive_since >= DEFENSIVE_COOLDOWN_SECS;
+
+        if state.mode == SystemMode::Defensive && state.defensive_since > 0 {
+            let now = chrono::Utc::now().timestamp();
+            if now - state.defensive_since >= DEFENSIVE_COOLDOWN_SECS {
+                info!(
+                    "Defensive cooldown ({} min) elapsed — resuming Active with reduced sizing",
+                    DEFENSIVE_COOLDOWN_SECS / 60
+                );
+                state.mode = SystemMode::Active;
+                state.consecutive_losses = 0;
+                state.defensive_since = 0;
+            }
+        }
+
         // Determine the base position size allowed by the system mode
-        let mut position_size = if state.mode == SystemMode::Defensive {
+        // Po cooldownu se pouziva redukovany sizing (sonda), ne plny Kelly.
+        let mut position_size = if was_defensive_cooldown {
+            signal.recommended_params.position_size_pct * DEFENSIVE_RECOVERY_POSITION_FRACTION
+        } else if state.mode == SystemMode::Defensive {
             signal.recommended_params.position_size_pct * 0.5
         } else {
             signal.recommended_params.position_size_pct
@@ -529,10 +569,12 @@ impl RiskEngine {
 
         if pnl < 0.0 {
             state.consecutive_losses += 1;
+            state.defensive_since = chrono::Utc::now().timestamp();
         } else {
             state.consecutive_losses = 0;
             if state.mode == SystemMode::Defensive {
                 state.mode = SystemMode::Active;
+                state.defensive_since = 0;
                 info!("Risk Engine: Profitable trade recorded, automatically resuming SystemMode::Active");
             }
         }
@@ -704,6 +746,98 @@ mod tests {
             s.aggregate_exposure
         };
         assert!(exp > 0.0 && exp < 0.5, "exposure {:?} must be fractional", exp);
+    }
+
+    #[test]
+    fn test_defensive_cooldown_returns_to_active_after_timeout() {
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+
+        // Drive into Defensive via consecutive losses
+        for _ in 0..5 {
+            engine.record_trade_result(-1.0);
+        }
+        // record_trade_result only increments the counter — Defensive mode is set
+        // by evaluate_trade on the NEXT call. Trigger it now.
+        let sig = make_signal(0.10, 76000.0);
+        let _ = engine.evaluate_trade(&sig, 76200.0);
+        assert_eq!(engine.mode(), SystemMode::Defensive);
+
+        // Simulate 16 minutes elapsed (cooldown is 15 min)
+        {
+            let mut s = engine.state.write();
+            s.defensive_since = chrono::Utc::now().timestamp() - (16 * 60);
+        }
+
+        // Next evaluation must flip back to Active with reduced sizing
+        let sig = make_signal(0.10, 76000.0);
+        let a = engine.evaluate_trade(&sig, 76200.0).unwrap();
+        assert!(a.approved);
+        assert_eq!(engine.mode(), SystemMode::Active);
+        // Recovery sizing = 50% of requested (DEFENSIVE_RECOVERY_POSITION_FRACTION)
+        assert!(
+            (a.adjusted_position_size - 0.05).abs() < 1e-12,
+            "expected 0.05 (50% of 0.10), got {}",
+            a.adjusted_position_size
+        );
+        assert_eq!(engine.consecutive_losses(), 0);
+    }
+
+    #[test]
+    fn test_defensive_cooldown_does_not_fire_before_timeout() {
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+
+        for _ in 0..5 {
+            engine.record_trade_result(-1.0);
+        }
+        let sig = make_signal(0.10, 76000.0);
+        let _ = engine.evaluate_trade(&sig, 76200.0);
+        assert_eq!(engine.mode(), SystemMode::Defensive);
+
+        // Only 5 minutes elapsed — cooldown (15 min) must NOT fire
+        {
+            let mut s = engine.state.write();
+            s.defensive_since = chrono::Utc::now().timestamp() - (5 * 60);
+        }
+
+        let sig = make_signal(0.10, 76000.0);
+        let _ = engine.evaluate_trade(&sig, 76200.0);
+        assert_eq!(
+            engine.mode(),
+            SystemMode::Defensive,
+            "cooldown must not fire before timeout"
+        );
+    }
+
+    #[test]
+    fn test_new_loss_during_defensive_resets_cooldown_clock() {
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+
+        for _ in 0..5 {
+            engine.record_trade_result(-1.0);
+        }
+        let sig = make_signal(0.10, 76000.0);
+        let _ = engine.evaluate_trade(&sig, 76200.0);
+        assert_eq!(engine.mode(), SystemMode::Defensive);
+
+        // 14 min elapsed — almost at cooldown
+        let old_since = {
+            let mut s = engine.state.write();
+            s.defensive_since = chrono::Utc::now().timestamp() - (14 * 60);
+            s.defensive_since
+        };
+
+        // A new loss during Defensive resets the clock
+        engine.record_trade_result(-1.0);
+        let new_since = engine.state.read().defensive_since;
+        assert!(
+            new_since > old_since,
+            "new loss must reset defensive_since ({} vs {})",
+            old_since,
+            new_since
+        );
     }
 
     #[test]
