@@ -368,6 +368,62 @@ impl LogThrottler {
     }
 }
 
+/// [CASLAV v5.1] Mapovani kalibrovaneho rizikoveho stavu na dashboard view.
+///
+/// `pirana-dashboard` zamerne nezavisi na `pirana-risk-engine`, takze
+/// prevod bydli tady v main.rs, ktery vidi na obe strany.
+///
+/// Publikuji se EFEKTIVNI hodnoty (uz oramovane tvrdym stropem), protoze
+/// dashboard ma ukazovat to, podle ceho se skutecne obchoduje. Surovy navrh
+/// kalibrace zustava viditelny ve `formula`/`inputs`, takze je pri diagnostice
+/// stale poznat, co kalibrace chtela a kde ji strop zastavil.
+fn build_calibration_view(
+    snap: &pirana_risk_engine::self_calibration::RiskState,
+    engine: &RiskEngine,
+) -> pirana_dashboard::state::CalibrationView {
+    use pirana_dashboard::state::{CalibrationView, DerivedParamView};
+    use pirana_risk_engine::self_calibration::DerivedParam;
+
+    /// Prevod s explicitne dosazenou efektivni hodnotou.
+    fn view_of(p: &DerivedParam, effective: f64) -> DerivedParamView {
+        DerivedParamView {
+            value: effective,
+            formula: p.formula.clone(),
+            inputs: p.inputs.clone(),
+            computed_at: p.computed_at,
+            is_seed: p.is_seed(),
+        }
+    }
+
+    CalibrationView {
+        generation: snap.calibration_generation,
+        sample_size: engine.ledger_len(),
+        max_aggregate_exposure: view_of(
+            &snap.max_aggregate_exposure,
+            engine.max_aggregate_exposure(),
+        ),
+        max_single_trade_risk: view_of(
+            &snap.max_single_trade_risk,
+            engine.max_single_trade_risk(),
+        ),
+        max_daily_drawdown: view_of(&snap.max_daily_drawdown, engine.max_daily_drawdown()),
+        max_weekly_drawdown: view_of(&snap.max_weekly_drawdown, engine.max_weekly_drawdown()),
+        consecutive_loss_threshold: view_of(
+            &snap.consecutive_loss_threshold,
+            engine.consecutive_loss_threshold() as f64,
+        ),
+        vpin_toxicity_threshold: view_of(
+            &snap.vpin_toxicity_threshold,
+            engine.vpin_toxicity_threshold(),
+        ),
+        // P(ruin) neni limit, nic se neoramovava — publikuje se jak vyslo.
+        p_ruin_1y: view_of(&snap.p_ruin_1y, snap.p_ruin_1y.value),
+        hard_cap_aggregate_exposure: pirana_core::constants::MAX_AGGREGATE_EXPOSURE,
+        hard_cap_single_trade_risk: pirana_core::constants::MAX_SINGLE_TRADE_RISK,
+        calibrated_at: snap.calibrated_at,
+    }
+}
+
 #[tokio::main]
 async fn main() -> PiranaResult<()> {
     // Load configuration (uses dotenvy internally)
@@ -550,8 +606,16 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let positions_for_reconciliation = active_positions.clone();
     let risk_engine_for_reconciliation = risk_engine.clone();
     tokio::spawn(async move {
+        // [CASLAV v5.1] Citac ticku pro kadenci rekalibrace.
+        // Rekonciliace bezi kazdych 15 s; rekalibrace 1x za 60 ticku = 15 min.
+        // Casteji nema smysl: MAX_RELATIVE_CHANGE=0,30 stejne omezuje skoky
+        // a kalibrace ma reagovat na rezim trhu, ne na jednotlivy obchod.
+        const RECALIBRATION_EVERY_N_TICKS: u64 = 60;
+        let mut tick: u64 = 0;
+
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            tick = tick.wrapping_add(1);
             if let Ok(wallets) = client_for_reconciliation.get_wallets().await {
                 let mut btc_total = None;
                 let mut usd_total = None;
@@ -607,6 +671,27 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     *state_for_reconciliation.usd_balance.write() = new_usd;
 
                     tracing::debug!("Wallet balances auto-reconciled with Bitfinex: BTC={:.8}, USD={:.2}", new_btc, new_usd);
+
+                    // [CASLAV v5.1] Periodicka rekalibrace rizika (1x za 15 min).
+                    // Az ZDE, po rekonciliaci — equity i cena jsou cerstve.
+                    // Nikdy v hot loopu: kalibrace ma reagovat na rezim trhu,
+                    // ne na jednotlivy tick. Metoda sama loguje a nic nevyhazuje;
+                    // pri malem vzorku jen debug hlaska a puvodni stav zustava.
+                    if tick % RECALIBRATION_EVERY_N_TICKS == 0 && btc_price > 0.0 {
+                        let equity_usd = new_btc * btc_price + new_usd;
+                        risk_engine_for_reconciliation.recalibrate_and_log(equity_usd, btc_price);
+
+                        // Publikace kalibrovaneho stavu do dashboardu (/api/risk_state).
+                        // Publikuji se EFEKTIVNI hodnoty — tedy uz po oramovani
+                        // tvrdym stropem — aby dashboard ukazoval to, podle ceho
+                        // se skutecne obchoduje, ne surovy navrh kalibrace.
+                        let snap = risk_engine_for_reconciliation.calibration_snapshot();
+                        let view = build_calibration_view(
+                            &snap,
+                            &risk_engine_for_reconciliation,
+                        );
+                        *state_for_reconciliation.calibration.write() = view;
+                    }
                 }
             }
         }
@@ -1001,6 +1086,21 @@ async fn process_ws_message(
                                                     *state_clone.btc_balance.write() -= filled_qty;
                                                     *state_clone.usd_balance.write() += filled_qty * fill_price;
                                                 }
+                                            }
+
+                                            // [CASLAV v5.1] Uzavreny round-trip do ucetni knihy sebekalibrace.
+                                            // Az ZDE, po realnem fillu a po aktualizaci zustatku — equity
+                                            // uz odpovida skutecnosti. Paper trady se sem nedostanou.
+                                            {
+                                                let equity_usd = *state_clone.btc_balance.read() * fill_price
+                                                    + *state_clone.usd_balance.read();
+                                                let vpin_now = *state_clone.vpin_score.read();
+                                                risk_engine_clone.record_closed_trade(
+                                                    pnl,
+                                                    fill_price,
+                                                    equity_usd,
+                                                    vpin_now,
+                                                );
                                             }
 
                                             // Asymmetric BTC Profit Skimmer: Lock profit portion in BTC reserve
@@ -1931,6 +2031,20 @@ async fn process_ws_message(
                                                                 // Balances at real fill
                                                                 *state_clone.btc_balance.write() -= filled_qty;
                                                                 *state_clone.usd_balance.write() += filled_qty * fill_price;
+
+                                                                // [CASLAV v5.1] Uzavreny round-trip do ucetni knihy sebekalibrace.
+                                                                // Az ZDE, po realnem fillu a po aktualizaci zustatku.
+                                                                {
+                                                                    let equity_usd = *state_clone.btc_balance.read() * fill_price
+                                                                        + *state_clone.usd_balance.read();
+                                                                    let vpin_now = *state_clone.vpin_score.read();
+                                                                    risk_engine_clone.record_closed_trade(
+                                                                        realized_pnl,
+                                                                        fill_price,
+                                                                        equity_usd,
+                                                                        vpin_now,
+                                                                    );
+                                                                }
 
                                                                 // Asymmetric BTC Profit Skimmer: lock profit portion in BTC reserve
                                                                 if realized_pnl > 0.0 && fill_price > 0.0 {

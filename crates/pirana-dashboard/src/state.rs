@@ -85,6 +85,8 @@ pub struct DashboardState {
     pub vpin_score: Arc<parking_lot::RwLock<f64>>,
     /// VPIN status / adverse selection alert
     pub vpin_status: Arc<parking_lot::RwLock<String>>,
+    /// [CASLAV v5.1] Kalibrovany rizikovy stav (sebekalibrace)
+    pub calibration: Arc<parking_lot::RwLock<CalibrationView>>,
     /// Avellaneda-Stoikov reservation price
     pub reservation_price: Arc<parking_lot::RwLock<f64>>,
     /// Avellaneda-Stoikov spread skew (r - s) in USD
@@ -172,6 +174,58 @@ pub struct BookLevel {
     pub total: f64,
 }
 
+/// [CASLAV v5.1] Odvozeny parametr vcetne sveho puvodu.
+///
+/// Hodnota bez vzorce je v tomto systemu neplatna — kdyz se limit zmeni,
+/// musi byt z dashboardu poznat PROC. `formula` a `inputs` se prenaseji
+/// zamerne, i kdyz je UI zrovna nezobrazuje.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivedParamView {
+    pub value: f64,
+    pub formula: String,
+    pub inputs: String,
+    pub computed_at: i64,
+    /// true = dosud nekalibrovano, drzi se konzervativni seed
+    pub is_seed: bool,
+}
+
+impl Default for DerivedParamView {
+    fn default() -> Self {
+        Self {
+            value: 0.0,
+            formula: "SEED (nekalibrovano)".to_string(),
+            inputs: "n/a".to_string(),
+            computed_at: 0,
+            is_seed: true,
+        }
+    }
+}
+
+/// [CASLAV v5.1] Kalibrovany rizikovy stav pro dashboard a denni report.
+///
+/// `pirana-dashboard` zamerne NEZAVISI na `pirana-risk-engine` — mapovani
+/// z `RiskState` dela `main.rs`, ktery vidi na obe strany.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalibrationView {
+    /// Generace kalibrace; 0 = jeste nikdy nekalibrovano.
+    pub generation: u64,
+    /// Pocet uzavrenych round-tripu v ucetni knize.
+    pub sample_size: usize,
+    /// Efektivni limity PO oramovani tvrdym stropem z constants.rs.
+    pub max_aggregate_exposure: DerivedParamView,
+    pub max_single_trade_risk: DerivedParamView,
+    pub max_daily_drawdown: DerivedParamView,
+    pub max_weekly_drawdown: DerivedParamView,
+    pub consecutive_loss_threshold: DerivedParamView,
+    pub vpin_toxicity_threshold: DerivedParamView,
+    pub p_ruin_1y: DerivedParamView,
+    /// Tvrde stropy z constants.rs — aby bylo videt, jak daleko je
+    /// kalibrovana hodnota od nepresazitelne hranice.
+    pub hard_cap_aggregate_exposure: f64,
+    pub hard_cap_single_trade_risk: f64,
+    pub calibrated_at: i64,
+}
+
 /// Full dashboard snapshot sent to clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
@@ -213,6 +267,7 @@ pub struct DashboardSnapshot {
     pub hawkes_status: String,
     pub vpin_score: f64,
     pub vpin_status: String,
+    pub calibration: CalibrationView,
     pub reservation_price: f64,
     pub as_spread_skew: f64,
     pub dynamic_kappa: f64,
@@ -276,6 +331,7 @@ impl DashboardState {
             hawkes_status: Arc::new(parking_lot::RwLock::new("Baseline".to_string())),
             vpin_score: Arc::new(parking_lot::RwLock::new(0.0)),
             vpin_status: Arc::new(parking_lot::RwLock::new("Low Toxicity / Initializing".to_string())),
+            calibration: Arc::new(parking_lot::RwLock::new(CalibrationView::default())),
             reservation_price: Arc::new(parking_lot::RwLock::new(0.0)),
             as_spread_skew: Arc::new(parking_lot::RwLock::new(0.0)),
             dynamic_kappa: Arc::new(parking_lot::RwLock::new(1.50)),
@@ -330,6 +386,7 @@ impl DashboardState {
             hawkes_status: self.hawkes_status.read().clone(),
             vpin_score: *self.vpin_score.read(),
             vpin_status: self.vpin_status.read().clone(),
+            calibration: self.calibration.read().clone(),
             reservation_price: *self.reservation_price.read(),
             as_spread_skew: *self.as_spread_skew.read(),
             dynamic_kappa: *self.dynamic_kappa.read(),

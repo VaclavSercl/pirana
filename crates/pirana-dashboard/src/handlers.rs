@@ -23,6 +23,7 @@ pub fn create_router(state: Arc<DashboardState>) -> Router {
         .route("/", get(landing_handler))
         .route("/trading", get(trading_handler))
         .route("/api/snapshot", get(snapshot_handler))
+        .route("/api/risk_state", get(risk_state_handler))
         .route("/ws", get(ws_handler))
         .route("/api/health", get(health_handler))
         .nest_service("/assets", ServeDir::new("crates/pirana-dashboard/static"))
@@ -45,6 +46,16 @@ async fn snapshot_handler(
 ) -> impl IntoResponse {
     let snapshot = state.snapshot();
     Json(snapshot)
+}
+
+/// GET /api/risk_state — kalibrovany rizikovy stav (ČÁSLAV v5.1)
+async fn risk_state_handler(
+    State(state): State<Arc<DashboardState>>,
+) -> impl IntoResponse {
+    // [CASLAV v5.1] Kalibrovany rizikovy stav vcetne vzorcu a vstupu.
+    // Bez `formula`/`inputs` nikdo nepozna, PROC se limit zmenil —
+    // proto se vraci cely DerivedParamView, ne jen holá čísla.
+    Json(state.calibration.read().clone())
 }
 
 /// GET /api/health — simple health check
