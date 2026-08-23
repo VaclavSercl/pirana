@@ -6,6 +6,8 @@ use sha2::Sha384;
 use reqwest::Client;
 use tracing::{info, debug, error};
 use crate::rate_limiter::RateLimiter;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 type HmacSha384 = Hmac<Sha384>;
 
@@ -19,6 +21,17 @@ pub struct BitfinexClient {
     /// Ochrana proti prekroceni limitu burzy (90 req/min) a ban u klice.
     /// Sdilena mezi vsemi klony klienta — jeden rozpocet pro cely proces.
     rate_limiter: RateLimiter,
+    /// Monotonni citac nonce, sdileny pres vsechny klony klienta.
+    ///
+    /// Bitfinex vyzaduje STRIKTNE ROSTOUCI nonce na klic. Puvodni kod bral
+    /// `Utc::now().timestamp_micros()` v miste sestaveni pozadavku — jenze
+    /// mezi sestavenim a odeslanim je `rate_limiter.acquire().await`, ktery
+    /// muze pozadavek pozdrzet. Dva soubezne tasky pak dorazily na burzu
+    /// v obracenem poradi a starsi nonce vyvolal chybu 10114 "nonce: small".
+    ///
+    /// `fetch_max` zaruci, ze vraceny nonce je vzdy vetsi nez predchozi,
+    /// i kdyz systemovy cas skoci zpet (NTP).
+    nonce_counter: Arc<AtomicI64>,
 }
 
 /// Result of a successfully submitted order, parsed from the exchange response
@@ -45,6 +58,38 @@ impl BitfinexClient {
             api_key,
             api_secret,
             rate_limiter: RateLimiter::with_default(),
+            nonce_counter: Arc::new(AtomicI64::new(
+                chrono::Utc::now().timestamp_micros(),
+            )),
+        }
+    }
+
+    /// Dalsi striktne rostouci nonce.
+    ///
+    /// Bere maximum z aktualniho casu a predchozi hodnoty + 1, takze:
+    /// * za normalniho provozu sleduje realny cas,
+    /// * pri soubeznych volanich nikdy nevrati stejnou hodnotu dvakrat,
+    /// * pri skoku casu zpet (NTP) pokracuje monotonne dal.
+    fn next_nonce(&self) -> String {
+        // Compare-and-swap smycka. `fetch_max` + `store` NENI atomicke:
+        // mezi obema operacemi muze jine vlakno precist tutez hodnotu a oba
+        // pak vydaji stejny nonce. Test `nonce_survives_concurrent_threads`
+        // to spolehlive odhali. CAS zaruci, ze hodnotu vyda prave jedno vlakno.
+        let mut cur = self.nonce_counter.load(Ordering::SeqCst);
+        loop {
+            let now = chrono::Utc::now().timestamp_micros();
+            // Vzdy aspon o 1 vic nez predchozi -> striktne rostouci i pri
+            // skoku systemoveho casu zpet (NTP).
+            let next = cur.max(now).saturating_add(1);
+            match self.nonce_counter.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next.to_string(),
+                Err(actual) => cur = actual, // jine vlakno bylo rychlejsi, zkus znovu
+            }
         }
     }
 
@@ -75,7 +120,7 @@ impl BitfinexClient {
             });
         }
 
-        let nonce = chrono::Utc::now().timestamp_micros().to_string();
+        let nonce = self.next_nonce();
         let endpoint = "/api/v2/auth/w/order/submit";
 
         let type_str = match order_type {
@@ -197,7 +242,7 @@ impl BitfinexClient {
 
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: i64) -> PiranaResult<String> {
-        let nonce = chrono::Utc::now().timestamp_micros().to_string();
+        let nonce = self.next_nonce();
         let endpoint = "/api/v2/auth/w/order/cancel";
 
         let body_str = format!(r#"{{"id":{}}}"#, order_id);
@@ -234,7 +279,7 @@ impl BitfinexClient {
 
     /// Get wallet balances
     pub async fn get_wallets(&self) -> PiranaResult<Vec<Balance>> {
-        let nonce = chrono::Utc::now().timestamp_micros().to_string();
+        let nonce = self.next_nonce();
         let endpoint = "/api/v2/auth/r/wallets";
         let body = "{}";
         let payload = format!("{}{}{}", endpoint, nonce, body);
@@ -290,7 +335,7 @@ impl BitfinexClient {
 
     /// Get active open order IDs for a symbol (for orphan reconciliation)
     pub async fn get_active_orders(&self, symbol: &str) -> PiranaResult<Vec<i64>> {
-        let nonce = chrono::Utc::now().timestamp_micros().to_string();
+        let nonce = self.next_nonce();
         let endpoint = format!("/api/v2/auth/r/orders/{}", symbol);
         let body = "{}";
         let payload = format!("{}{}{}", endpoint, nonce, body);
@@ -381,5 +426,80 @@ mod tests {
         assert_eq!(r.avg_fill_price, 76288.0);
         assert_eq!(r.filled_qty, 0.001);
         assert_eq!(r.exchange_order_id, 0);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TESTY — monotonni nonce (regrese chyby 10114 "nonce: small")
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+
+    fn client() -> BitfinexClient {
+        BitfinexClient::new("test_key".into(), "test_secret".into())
+    }
+
+    #[test]
+    fn nonce_is_strictly_increasing() {
+        let c = client();
+        let mut prev: i64 = 0;
+        for i in 0..10_000 {
+            let n: i64 = c.next_nonce().parse().expect("nonce musi byt cislo");
+            assert!(n > prev, "nonce #{i} neroste: {n} <= {prev}");
+            prev = n;
+        }
+    }
+
+    #[test]
+    fn nonce_unique_across_clones() {
+        // Klony sdili tentyz citac — dva klienty nesmi vydat stejny nonce.
+        let a = client();
+        let b = a.clone();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(seen.insert(a.next_nonce()), "duplicitni nonce z klienta A");
+            assert!(seen.insert(b.next_nonce()), "duplicitni nonce z klonu B");
+        }
+    }
+
+    #[test]
+    fn nonce_survives_concurrent_threads() {
+        // Realny scenar: nekolik tokio tasku posila ordery soubezne.
+        use std::sync::Arc as StdArc;
+        let c = StdArc::new(client());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = StdArc::clone(&c);
+            handles.push(std::thread::spawn(move || {
+                (0..500).map(|_| c.next_nonce()).collect::<Vec<_>>()
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().expect("vlakno panikarilo"));
+        }
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "soubezne vlakna vydala duplicitni nonce ({} unikatnich z {})",
+            unique.len(),
+            all.len()
+        );
+    }
+
+    #[test]
+    fn nonce_is_near_current_time() {
+        // Nonce ma sledovat realny cas, ne utect do budoucnosti.
+        let c = client();
+        let now = chrono::Utc::now().timestamp_micros();
+        let n: i64 = c.next_nonce().parse().unwrap();
+        let diff = (n - now).abs();
+        assert!(
+            diff < 5_000_000,
+            "nonce {n} je {diff} us od aktualniho casu {now}"
+        );
     }
 }
