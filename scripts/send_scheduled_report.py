@@ -12,7 +12,7 @@ import urllib.error
 import subprocess
 from datetime import datetime
 
-TELEGRAM_TOKEN = os.environ.get("CASLAV_TELEGRAM_TOKEN", "***REVOKED_TELEGRAM_TOKEN***")
+TELEGRAM_TOKEN = os.environ.get("CASLAV_TELEGRAM_TOKEN") or os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = int(os.environ.get("CASLAV_ALLOWED_USER_ID", "1076582576"))
 API_URL = "http://localhost:80/api/snapshot"
 

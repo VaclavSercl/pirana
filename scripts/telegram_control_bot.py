@@ -31,7 +31,7 @@ def load_env():
     return env
 
 ENV = load_env()
-BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN", "***REVOKED_TELEGRAM_TOKEN***")
+BOT_TOKEN = ENV["TELEGRAM_BOT_TOKEN"]
 AUTHORIZED_CHAT_ID = int(ENV.get("TELEGRAM_CHAT_ID", "1076582576"))
 
 def send_telegram(chat_id, text):

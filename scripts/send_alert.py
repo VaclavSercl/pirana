@@ -37,8 +37,8 @@ def get_journal_snippet(unit_name):
 
 def send_alert():
     env = load_env()
-    token = env.get("TELEGRAM_BOT_TOKEN", "***REVOKED_TELEGRAM_TOKEN***")
-    chat_id = env.get("TELEGRAM_CHAT_ID", "1076582576")
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     unit = sys.argv[1] if len(sys.argv) > 1 else "unknown.service"
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S CEST")

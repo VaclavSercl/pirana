@@ -1,7 +1,7 @@
 #!/bin/bash
 
-TELEGRAM_TOKEN="***REVOKED_TELEGRAM_TOKEN***"
-CHAT_ID="1076582576"
+TELEGRAM_TOKEN="${TELEGRAM_BOT_TOKEN:?chybi promenna TELEGRAM_BOT_TOKEN}"
+CHAT_ID="${TELEGRAM_CHAT_ID:?chybi promenna TELEGRAM_CHAT_ID}"
 API_URL="http://localhost:80/api/snapshot"
 
 # Nacteni dat z bota

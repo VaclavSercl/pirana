@@ -18,7 +18,7 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 # Fallback tokeny
-TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-***REVOKED_TELEGRAM_TOKEN***}"
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:?chybi promenna TELEGRAM_TOKEN}"
 CHAT_ID="${CHAT_ID:-1076582576}"
 
 # 2. Definice promptu pro Agenta Čáslav
