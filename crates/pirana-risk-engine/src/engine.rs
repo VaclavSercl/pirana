@@ -1,15 +1,37 @@
 use pirana_core::types::*;
-use pirana_core::constants::*;
 use pirana_core::errors::PiranaResult;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
+
+use crate::limits::{
+    effective_consecutive_loss_threshold, effective_max_aggregate_exposure,
+    effective_max_daily_drawdown, effective_max_single_trade_risk, effective_max_weekly_drawdown,
+};
+// POZOR na kolizi jmen: nize v tomto souboru je privatni `struct RiskState`
+// (bezici stav enginu). `self_calibration::RiskState` je neco jineho —
+// sada kalibrovanych parametru. Alias je nutny.
+use crate::self_calibration::{
+    RiskError, RiskState as CalibratedRisk, SelfCalibration, TradingStats,
+};
+use crate::trade_ledger::TradeLedger;
 
 /// Central risk engine — enforces ALL risk limits
 /// This is the FINAL gate before any order reaches the exchange.
+///
+/// ## Sebekalibrace
+///
+/// Engine drzi kalibrovany stav (`CalibratedRisk`) a ucetni knihu uzavrenych
+/// obchodu (`TradeLedger`). Vsechny limity se ctou z kalibrovaneho stavu,
+/// ale VZDY pres fasadu `limits.rs`, ktera je oramuje tvrdym stropem
+/// z `constants.rs`. Kalibrace smi riziko jen snizovat pod strop.
 #[derive(Debug, Clone)]
 pub struct RiskEngine {
     state: Arc<RwLock<RiskState>>,
+    /// Kalibrovane rizikove parametry (seed dokud neni dost vzorku).
+    calibrated: Arc<RwLock<CalibratedRisk>>,
+    /// Ucetni kniha realnych uzavrenych round-tripu.
+    ledger: Arc<Mutex<TradeLedger>>,
 }
 
 #[derive(Debug)]
@@ -58,6 +80,152 @@ impl RiskEngine {
                 weekly_drawdown_pct: 0.0,
                 paper_consecutive_wins: 0,
             })),
+            calibrated: Arc::new(RwLock::new(CalibratedRisk::seed())),
+            ledger: Arc::new(Mutex::new(TradeLedger::new())),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  EFEKTIVNI LIMITY — kalibrace oramovana tvrdym stropem
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Efektivni strop agregatni expozice (kalibrace ∧ hard cap).
+    pub fn max_aggregate_exposure(&self) -> f64 {
+        effective_max_aggregate_exposure(self.calibrated.read().max_aggregate_exposure.value)
+    }
+
+    /// Efektivni strop rizika jednoho obchodu (kalibrace ∧ hard cap).
+    pub fn max_single_trade_risk(&self) -> f64 {
+        effective_max_single_trade_risk(self.calibrated.read().max_single_trade_risk.value)
+    }
+
+    /// Efektivni denni drawdown limit (kalibrace ∧ hard cap).
+    pub fn max_daily_drawdown(&self) -> f64 {
+        effective_max_daily_drawdown(self.calibrated.read().max_daily_drawdown.value)
+    }
+
+    /// Efektivni tydenni drawdown limit (kalibrace ∧ hard cap).
+    pub fn max_weekly_drawdown(&self) -> f64 {
+        effective_max_weekly_drawdown(self.calibrated.read().max_weekly_drawdown.value)
+    }
+
+    /// Efektivni prah po sobe jdoucich ztrat (kalibrace ∧ hard cap).
+    pub fn consecutive_loss_threshold(&self) -> u32 {
+        effective_consecutive_loss_threshold(self.calibrated.read().consecutive_loss_threshold.value)
+    }
+
+    /// Efektivni VPIN prah toxicity. Nema tvrdy protejsek v constants.rs,
+    /// kalibrator ho uz clampuje do ⟨0,30 ; 0,95⟩.
+    pub fn vpin_toxicity_threshold(&self) -> f64 {
+        let v = self.calibrated.read().vpin_toxicity_threshold.value;
+        if v.is_finite() {
+            v.clamp(0.30, 0.95)
+        } else {
+            0.65
+        }
+    }
+
+    /// Kopie kalibrovaneho stavu pro dashboard / report.
+    pub fn calibration_snapshot(&self) -> CalibratedRisk {
+        self.calibrated.read().clone()
+    }
+
+    /// Generace kalibrace (0 = dosud jen seed).
+    pub fn calibration_generation(&self) -> u64 {
+        self.calibrated.read().calibration_generation
+    }
+
+    /// Pocet uzavrenych round-tripu v ucetni knize.
+    pub fn ledger_len(&self) -> usize {
+        self.ledger.lock().len()
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SBER DAT A REKALIBRACE
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Zaznam UZAVRENEHO round-tripu do ucetni knihy.
+    ///
+    /// Vola se VYHRADNE po realnem fillu, vedle `record_trade_result`.
+    /// Paper trady se sem nezapocitavaji — kalibrace se nesmi opirat
+    /// o hypoteticke obchody.
+    pub fn record_closed_trade(
+        &self,
+        pnl_usd: f64,
+        fill_price: f64,
+        equity_usd: f64,
+        vpin: f64,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        self.ledger
+            .lock()
+            .record_close(pnl_usd, fill_price, equity_usd, vpin, now);
+    }
+
+    /// Rekalibrace z namerenych dat.
+    ///
+    /// Pri uspechu zapise novy kalibrovany stav a vrati jeho generaci.
+    /// `Err(InsufficientSample)` je NORMALNI provozni stav prvnich
+    /// desitek obchodu, ne chyba — proto se loguje na debug.
+    ///
+    /// Nikdy nepanikari a nikdy neponechava stav v polovicnim zapisu:
+    /// bud se aplikuje cely novy `CalibratedRisk`, nebo zadny.
+    pub fn recalibrate_now(
+        &self,
+        equity_usd: f64,
+        price_usd: f64,
+    ) -> Result<u64, RiskError> {
+        let now = chrono::Utc::now().timestamp();
+        let current = self.calibrated.read().clone();
+
+        let stats: TradingStats = self.ledger.lock().build_stats(
+            equity_usd,
+            price_usd,
+            current.vpin_toxicity_threshold.value,
+            now,
+        )?;
+
+        let equity_sats = TradeLedger::equity_sats(equity_usd, price_usd);
+        if equity_sats <= 0.0 {
+            return Err(RiskError::OutOfRange("equity_sats", equity_sats));
+        }
+
+        let next = SelfCalibration::recalibrate(&current, &stats, equity_sats)?;
+        let generation = next.calibration_generation;
+
+        info!(
+            "Risk Engine [KALIBRACE gen={}]: expozice={:.4} (hard cap {:.4}), \
+             riziko/obchod={:.5}, DD_denni={:.4}, prah_ztrat={}, VPIN={:.3}, P(ruin)={:.6}, n={}",
+            generation,
+            effective_max_aggregate_exposure(next.max_aggregate_exposure.value),
+            crate::limits::MAX_AGGREGATE_EXPOSURE,
+            effective_max_single_trade_risk(next.max_single_trade_risk.value),
+            effective_max_daily_drawdown(next.max_daily_drawdown.value),
+            effective_consecutive_loss_threshold(next.consecutive_loss_threshold.value),
+            next.vpin_toxicity_threshold.value,
+            next.p_ruin_1y.value,
+            stats.sample_size,
+        );
+
+        *self.calibrated.write() = next;
+        Ok(generation)
+    }
+
+    /// Rekalibrace, ktera sama zaloguje vysledek a nic nevyhazuje.
+    /// Urcena pro periodicke volani z rekonciliacniho vlakna.
+    pub fn recalibrate_and_log(&self, equity_usd: f64, price_usd: f64) {
+        match self.recalibrate_now(equity_usd, price_usd) {
+            Ok(_) => {}
+            Err(e @ RiskError::InsufficientSample { .. }) => {
+                // Ocekavany stav pred nasbiranim vzorku — ne varovani.
+                debug!("Risk Engine: {}", e);
+            }
+            Err(e @ RiskError::PRuinIncrease { .. }) => {
+                info!("Risk Engine: {} — drzim predchozi kalibraci", e);
+            }
+            Err(e) => {
+                warn!("Risk Engine: kalibrace neprosla: {}", e);
+            }
         }
     }
 
@@ -72,6 +240,16 @@ impl RiskEngine {
     /// HFT STRATEGY: Buy and sell in milliseconds, profit from spread capture
     /// BTC is the base asset — we trade around it actively, no panic selling
     pub fn evaluate_trade(&self, signal: &Signal, current_price: f64) -> PiranaResult<RiskAssessment> {
+        // Efektivni limity se ctou PRED zamkem stavu — kazda hodnota uz je
+        // oramovana tvrdym stropem z constants.rs (viz limits.rs).
+        // Poradi zamku: calibrated.read() -> state.write(). Rekalibrace bere
+        // calibrated + ledger a nikdy state, takze cyklus nevznikne.
+        let lim_daily_dd = self.max_daily_drawdown();
+        let lim_weekly_dd = self.max_weekly_drawdown();
+        let lim_consecutive = self.consecutive_loss_threshold();
+        let lim_single_risk = self.max_single_trade_risk();
+        let lim_aggregate = self.max_aggregate_exposure();
+
         let mut state = self.state.write();
 
         // HFT: Allow all signal types — we buy AND sell for profit
@@ -92,7 +270,7 @@ impl RiskEngine {
         }
 
         // Check daily drawdown
-        if state.daily_drawdown_pct >= MAX_DAILY_DRAWDOWN {
+        if state.daily_drawdown_pct >= lim_daily_dd {
             state.mode = SystemMode::Defensive;
             warn!("Daily drawdown limit reached! Entering DEFENSIVE MODE");
             return Ok(RiskAssessment {
@@ -100,7 +278,7 @@ impl RiskEngine {
                 rejection_reason: Some(format!(
                     "Daily drawdown {:.2}% exceeds limit {:.2}%",
                     state.daily_drawdown_pct * 100.0,
-                    MAX_DAILY_DRAWDOWN * 100.0
+                    lim_daily_dd * 100.0
                 )),
                 adjusted_position_size: 0.0,
                 current_exposure_pct: state.aggregate_exposure,
@@ -111,7 +289,7 @@ impl RiskEngine {
         }
 
         // Check weekly drawdown
-        if state.weekly_drawdown_pct >= MAX_WEEKLY_DRAWDOWN {
+        if state.weekly_drawdown_pct >= lim_weekly_dd {
             state.mode = SystemMode::Halted;
             error!("Weekly drawdown limit reached! System HALTED");
             return Ok(RiskAssessment {
@@ -119,7 +297,7 @@ impl RiskEngine {
                 rejection_reason: Some(format!(
                     "Weekly drawdown {:.2}% exceeds limit {:.2}%",
                     state.weekly_drawdown_pct * 100.0,
-                    MAX_WEEKLY_DRAWDOWN * 100.0
+                    lim_weekly_dd * 100.0
                 )),
                 adjusted_position_size: 0.0,
                 current_exposure_pct: state.aggregate_exposure,
@@ -130,14 +308,14 @@ impl RiskEngine {
         }
 
         // Check consecutive losses
-        if state.consecutive_losses >= CONSECUTIVE_LOSS_THRESHOLD {
+        if state.consecutive_losses >= lim_consecutive {
             if state.mode == SystemMode::Active {
                 state.mode = SystemMode::Defensive;
                 warn!("Consecutive loss threshold reached! Transitioning to DEFENSIVE MODE");
             }
 
             // Hard limit: If losses continue even in defensive mode and reach double threshold (10), HALT the system
-            if state.consecutive_losses >= CONSECUTIVE_LOSS_THRESHOLD * 2 {
+            if state.consecutive_losses >= lim_consecutive.saturating_mul(2) {
                 state.mode = SystemMode::Halted;
                 error!("Critical consecutive loss threshold reached in defensive mode! System HALTED");
                 return Ok(RiskAssessment {
@@ -145,7 +323,7 @@ impl RiskEngine {
                     rejection_reason: Some(format!(
                         "Critical consecutive losses limit ({} >= {}) reached — System Halted",
                         state.consecutive_losses,
-                        CONSECUTIVE_LOSS_THRESHOLD * 2
+                        lim_consecutive.saturating_mul(2)
                     )),
                     adjusted_position_size: 0.0,
                     current_exposure_pct: state.aggregate_exposure,
@@ -173,8 +351,8 @@ impl RiskEngine {
         let single_trade_risk = position_size * stop_loss_pct;
 
         // If single trade risk exceeds the limit, systematically adjust (reduce) the position size down
-        if single_trade_risk > MAX_SINGLE_TRADE_RISK {
-            let reduction_factor = MAX_SINGLE_TRADE_RISK / single_trade_risk;
+        if single_trade_risk > lim_single_risk {
+            let reduction_factor = lim_single_risk / single_trade_risk;
             position_size *= reduction_factor;
             warn!(
                 "Single trade risk would exceed limit. Systematically adjusted position size down by {:.2}% to fit MAX_SINGLE_TRADE_RISK",
@@ -191,9 +369,9 @@ impl RiskEngine {
             state.aggregate_exposure + position_size
         };
 
-        if !is_sell && proposed_exposure > MAX_AGGREGATE_EXPOSURE {
+        if !is_sell && proposed_exposure > lim_aggregate {
             // Dynamically scale position size down to fit remaining exposure budget
-            let remaining_budget = MAX_AGGREGATE_EXPOSURE - state.aggregate_exposure;
+            let remaining_budget = lim_aggregate - state.aggregate_exposure;
 
             if remaining_budget <= 0.001 {
                 // Exposure budget fully exhausted — genuine reject
@@ -202,7 +380,7 @@ impl RiskEngine {
                     rejection_reason: Some(format!(
                         "Aggregate exposure {:.2}% already at limit {:.2}% — no room for new positions",
                         state.aggregate_exposure * 100.0,
-                        MAX_AGGREGATE_EXPOSURE * 100.0
+                        lim_aggregate * 100.0
                     )),
                     adjusted_position_size: 0.0,
                     current_exposure_pct: state.aggregate_exposure,
@@ -375,6 +553,11 @@ impl RiskEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tvrde stropy pro overeni, ze je kalibrace nikdy neprekroci.
+    use crate::limits::{
+        CONSECUTIVE_LOSS_THRESHOLD, MAX_AGGREGATE_EXPOSURE, MAX_DAILY_DRAWDOWN,
+        MAX_SINGLE_TRADE_RISK, MAX_WEEKLY_DRAWDOWN,
+    };
 
     fn make_signal(position_size_pct: f64, invalidation: f64) -> Signal {
         Signal {
@@ -440,5 +623,161 @@ mod tests {
         assert_eq!(engine.consecutive_losses(), 1);
         engine.record_trade_result(0.5);
         assert_eq!(engine.consecutive_losses(), 0);
+    }
+
+    // ══ T2 — sebekalibrace oramovana tvrdym stropem ══
+
+    #[test]
+    fn fresh_engine_starts_on_seed_not_on_hard_caps() {
+        // Studeny start je ZAMERNE konzervativnejsi nez tvrde stropy.
+        // Seed se nahradi merenim az po MIN_SAMPLES_FOR_CALIBRATION.
+        let engine = RiskEngine::new(400.0);
+        assert_eq!(engine.calibration_generation(), 0);
+        assert_eq!(engine.ledger_len(), 0);
+        assert!(engine.calibration_snapshot().max_aggregate_exposure.is_seed());
+
+        assert!((engine.max_aggregate_exposure() - 0.20).abs() < 1e-12);
+        assert!((engine.max_single_trade_risk() - 0.005).abs() < 1e-12);
+        assert!((engine.max_daily_drawdown() - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn calibration_can_never_exceed_hard_caps() {
+        // JADRO POJISTKY. Kalibrovany stav se rucne prepise na absurdne
+        // vysoke hodnoty; efektivni limity musi presto sednout na strop.
+        use crate::self_calibration::DerivedParam;
+
+        let engine = RiskEngine::new(400.0);
+        {
+            let mut c = engine.calibrated.write();
+            c.max_aggregate_exposure = DerivedParam::new(9.99, "test", "test", 1);
+            c.max_single_trade_risk = DerivedParam::new(9.99, "test", "test", 1);
+            c.max_daily_drawdown = DerivedParam::new(9.99, "test", "test", 1);
+            c.max_weekly_drawdown = DerivedParam::new(9.99, "test", "test", 1);
+            c.consecutive_loss_threshold = DerivedParam::new(999.0, "test", "test", 1);
+        }
+
+        assert!((engine.max_aggregate_exposure() - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12);
+        assert!((engine.max_single_trade_risk() - MAX_SINGLE_TRADE_RISK).abs() < 1e-12);
+        assert!((engine.max_daily_drawdown() - MAX_DAILY_DRAWDOWN).abs() < 1e-12);
+        assert!((engine.max_weekly_drawdown() - MAX_WEEKLY_DRAWDOWN).abs() < 1e-12);
+        assert_eq!(engine.consecutive_loss_threshold(), CONSECUTIVE_LOSS_THRESHOLD);
+    }
+
+    #[test]
+    fn calibration_may_lower_risk_below_hard_cap() {
+        use crate::self_calibration::DerivedParam;
+
+        let engine = RiskEngine::new(400.0);
+        {
+            let mut c = engine.calibrated.write();
+            c.max_aggregate_exposure = DerivedParam::new(0.10, "test", "test", 1);
+            c.max_single_trade_risk = DerivedParam::new(0.001, "test", "test", 1);
+        }
+        assert!((engine.max_aggregate_exposure() - 0.10).abs() < 1e-12);
+        assert!((engine.max_single_trade_risk() - 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nan_calibration_degrades_to_hard_cap_not_to_unlimited() {
+        use crate::self_calibration::DerivedParam;
+
+        let engine = RiskEngine::new(400.0);
+        {
+            let mut c = engine.calibrated.write();
+            c.max_aggregate_exposure = DerivedParam::new(f64::NAN, "test", "test", 1);
+            c.max_single_trade_risk = DerivedParam::new(f64::INFINITY, "test", "test", 1);
+        }
+        assert_eq!(engine.max_aggregate_exposure(), MAX_AGGREGATE_EXPOSURE);
+        assert_eq!(engine.max_single_trade_risk(), MAX_SINGLE_TRADE_RISK);
+    }
+
+    #[test]
+    fn evaluate_trade_respects_calibrated_exposure_limit() {
+        use crate::self_calibration::DerivedParam;
+
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+        {
+            let mut c = engine.calibrated.write();
+            // Kalibrace snizila expozici na 10 %.
+            c.max_aggregate_exposure = DerivedParam::new(0.10, "test", "test", 1);
+            c.max_single_trade_risk = DerivedParam::new(0.05, "test", "test", 1);
+        }
+        engine.update_exposure(0.095);
+
+        let sig = make_signal(0.05, 76000.0);
+        let a = engine.evaluate_trade(&sig, 76200.0).unwrap();
+        // Zbyva jen 0,005 rozpoctu — pozice musi byt seskalovana pod nej.
+        assert!(a.adjusted_position_size < 0.05, "size = {}", a.adjusted_position_size);
+    }
+
+    #[test]
+    fn evaluate_trade_rejects_when_calibrated_budget_exhausted() {
+        use crate::self_calibration::DerivedParam;
+
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+        {
+            let mut c = engine.calibrated.write();
+            c.max_aggregate_exposure = DerivedParam::new(0.10, "test", "test", 1);
+        }
+        engine.update_exposure(0.10);
+
+        let sig = make_signal(0.05, 76000.0);
+        let a = engine.evaluate_trade(&sig, 76200.0).unwrap();
+        assert!(!a.approved, "vycerpany rozpocet musi zamitnout");
+        assert_eq!(a.adjusted_position_size, 0.0);
+    }
+
+    #[test]
+    fn paper_trades_never_enter_the_ledger() {
+        // Kalibrace se nesmi opirat o hypoteticke obchody.
+        let engine = RiskEngine::new(400.0);
+        engine.halt();
+        engine.record_paper_trade_result(5.0);
+        engine.record_paper_trade_result(3.0);
+        assert_eq!(engine.ledger_len(), 0, "paper trady nepatri do ucetni knihy");
+    }
+
+    #[test]
+    fn recalibration_defers_on_small_sample_without_touching_state() {
+        let engine = RiskEngine::new(400.0);
+        for _ in 0..5 {
+            engine.record_closed_trade(2.0, 100_000.0, 10_000.0, 0.0);
+        }
+        let res = engine.recalibrate_now(10_000.0, 100_000.0);
+        assert!(matches!(res, Err(RiskError::InsufficientSample { .. })));
+        assert_eq!(engine.calibration_generation(), 0, "stav se nesmel zmenit");
+        assert!(engine.calibration_snapshot().max_aggregate_exposure.is_seed());
+    }
+
+    #[test]
+    fn recalibrate_and_log_never_panics_on_degenerate_input() {
+        let engine = RiskEngine::new(400.0);
+        // Zadna data, nulova a nesmyslna equity/cena.
+        engine.recalibrate_and_log(0.0, 0.0);
+        engine.recalibrate_and_log(f64::NAN, 100_000.0);
+        engine.recalibrate_and_log(10_000.0, f64::NAN);
+        engine.recalibrate_and_log(-100.0, -100.0);
+        assert_eq!(engine.calibration_generation(), 0);
+    }
+
+    #[test]
+    fn recorded_closed_trades_reach_the_ledger() {
+        let engine = RiskEngine::new(400.0);
+        engine.record_closed_trade(2.0, 100_000.0, 10_000.0, 0.5);
+        engine.record_closed_trade(-1.0, 100_000.0, 10_000.0, 0.5);
+        // Otevirajici fill (PnL == 0) se ignoruje.
+        engine.record_closed_trade(0.0, 100_000.0, 10_000.0, 0.5);
+        assert_eq!(engine.ledger_len(), 2);
+    }
+
+    #[test]
+    fn vpin_threshold_has_a_safe_default() {
+        let engine = RiskEngine::new(400.0);
+        let v = engine.vpin_toxicity_threshold();
+        assert!((0.30..=0.95).contains(&v), "vpin = {v}");
+        assert!((v - 0.65).abs() < 1e-12, "seed hodnota z literatury");
     }
 }

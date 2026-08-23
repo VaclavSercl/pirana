@@ -112,3 +112,42 @@ fn probe_aggregate_exposure_ceiling_with_three_open_orders() {
     );
     assert!(cumulative <= MAX_AGGREGATE_EXPOSURE + 1e-9);
 }
+
+/// ZMENA CHOVANI po zapojeni sebekalibrace (T2) — zamerne zafixovano.
+///
+/// Cerstvy engine uz nestartuje na tvrdych stropech z constants.rs,
+/// ale na SEEDU z `RiskState::seed()`, ktery je zamerne konzervativnejsi:
+///
+/// | parametr              | hard cap | seed  | pomer |
+/// |-----------------------|----------|-------|-------|
+/// | max_aggregate_exposure| 0,90     | 0,20  | 4,5x  |
+/// | max_single_trade_risk | 0,05     | 0,005 | 10x   |
+/// | max_daily_drawdown    | 0,03     | 0,03  | =     |
+/// | max_weekly_drawdown   | 0,07     | 0,07  | =     |
+///
+/// PROVOZNI DOPAD: po restartu sluzby bot obchoduje na 20 % expozice,
+/// dokud nenasbira MIN_SAMPLES_FOR_CALIBRATION (50) uzavrenych round-tripu
+/// a MIN_COMPLETED_DAYS (5) dokoncenych dni. Pak se limit posune podle
+/// mereni, ale nikdy nad tvrdy strop.
+///
+/// Tento test existuje proto, aby se ta zmena nedala prehlednout.
+#[test]
+fn seed_start_is_deliberately_tighter_than_hard_caps() {
+    let engine = RiskEngine::new(398.5);
+    engine.activate();
+
+    assert!(
+        (engine.max_aggregate_exposure() - 0.20).abs() < 1e-12,
+        "cerstvy engine musi startovat na seedu 0,20, ne na hard capu {MAX_AGGREGATE_EXPOSURE}"
+    );
+    assert!(
+        (engine.max_single_trade_risk() - 0.005).abs() < 1e-12,
+        "cerstvy engine musi startovat na seedu 0,005, ne na hard capu {MAX_SINGLE_TRADE_RISK}"
+    );
+    // Drawdowny se seedem rovnaji hard capum — zadna zmena chovani.
+    assert!((engine.max_daily_drawdown() - MAX_DAILY_DRAWDOWN).abs() < 1e-12);
+    assert!((engine.max_weekly_drawdown() - MAX_WEEKLY_DRAWDOWN).abs() < 1e-12);
+
+    // Kalibrace jeste nebezela.
+    assert_eq!(engine.calibration_generation(), 0);
+}
