@@ -165,9 +165,9 @@ def handle_pause(chat_id):
 def handle_resume(chat_id):
     """Handles /resume command."""
     try:
-        subprocess.run(["sudo", "systemctl", "start", "pirana.service"], check=True)
+        subprocess.run(["sudo", "systemctl", "restart", "pirana.service"], check=True)
         time.sleep(2)
-        send_telegram(chat_id, "▶️ <b>Trading obnoven.</b>\nSlužba <code>pirana.service</code> byla spuštěna a aktivována.")
+        send_telegram(chat_id, "▶️ <b>Trading obnoven.</b>\nSlužba <code>pirana.service</code> byla úspěšně restartována a aktivována.")
     except Exception as e:
         send_telegram(chat_id, f"❌ <b>Chyba při spuštění:</b> <code>{e}</code>")
 
