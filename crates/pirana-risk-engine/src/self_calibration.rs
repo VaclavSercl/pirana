@@ -141,10 +141,31 @@ impl TradingStats {
 /// a runtime ji odmítne — přesně tomu má tento typ zabránit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DerivedParam {
+    /// ⚠️ JSON neumí NaN/Inf — `serde_json` je zapíše jako `null`
+    /// a při čtení pak spadne na `invalid type: null, expected f64`.
+    /// Seed `p_ruin_1y` je NaN („dosud neměřeno"), takže bez tohoto
+    /// adaptéru by se seed stav nedal uložit a načíst zpět.
+    /// `null` se čte jako NaN, čímž je round-trip úplný.
+    #[serde(
+        serialize_with = "serialize_maybe_nan",
+        deserialize_with = "deserialize_maybe_nan"
+    )]
     pub value: f64,
     pub formula: String,
     pub inputs: String,
     pub computed_at: i64,
+}
+
+fn serialize_maybe_nan<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    if v.is_finite() {
+        s.serialize_f64(*v)
+    } else {
+        s.serialize_none()
+    }
+}
+
+fn deserialize_maybe_nan<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
 }
 
 impl DerivedParam {
@@ -202,16 +223,45 @@ pub struct RiskState {
 }
 
 impl RiskState {
-    /// Studený start. Seed není cíl — je startovní podmínka, kterou
-    /// první kalibrace po `MIN_SAMPLES_FOR_CALIBRATION` nahradí měřením.
+    /// Studený start — **seeduje se z TVRDÝCH STROPŮ z `constants.rs`.**
+    ///
+    /// ## Proč z hard capů, a ne z konzervativnějšího čísla
+    ///
+    /// Verze v5.0 zde měla 0,20 / 0,005 jako „obecný konzervativní start".
+    /// To číslo nebylo podloženo ničím naměřeným — byla to opatrnost bez
+    /// znalosti konkrétního účtu. Mělo to dva doložené následky:
+    ///
+    /// 1. **Restart tiše zvrátil rozhodnutí operátora.** Operátor vědomě
+    ///    zvýšil expozici na 0,90 / 0,05, protože se bot sám uškrtil na 1 %
+    ///    a 89 % kapitálu leželo ladem. Seed 0,20/0,005 by po restartu
+    ///    dal ještě 10× MENŠÍ pozici, než byla ta původní zaseknutá.
+    /// 2. **Restart měnil chování systému**, přestože žádné měření
+    ///    neproběhlo. Změna limitu bez měření je přesně to, co §8.5 zakazuje.
+    ///
+    /// Hard cap je jediná hodnota podložená rozhodnutím operátora, tedy
+    /// jediná legitimní startovní podmínka. Kalibrace ji pak smí podle
+    /// měření už jen SNIŽOVAT (§8.3: snížení rizika vždy okamžitě a plně) —
+    /// a `limits::clamp_to_hard_cap` dál brání jakémukoli překročení stropu.
+    ///
+    /// Seed se použije **jen když na disku není `risk_state.json`** (§8.4).
+    /// Po prvním úspěšném cyklu je startovní podmínkou naměřený stav, ne toto.
     pub fn seed() -> Self {
+        use pirana_core::constants::{
+            CONSECUTIVE_LOSS_THRESHOLD, MAX_AGGREGATE_EXPOSURE, MAX_DAILY_DRAWDOWN,
+            MAX_SINGLE_TRADE_RISK, MAX_WEEKLY_DRAWDOWN,
+        };
+        const HARD_CAP_NOTE: &str = "hard cap z constants.rs — rozhodnutí operátora, \
+                                     kalibrace ho smí jen snižovat";
         Self {
-            max_aggregate_exposure: DerivedParam::seed(0.20, "konzervativní start"),
-            max_single_trade_risk: DerivedParam::seed(0.005, "konzervativní start"),
-            max_daily_drawdown: DerivedParam::seed(0.03, "konzervativní start"),
-            max_weekly_drawdown: DerivedParam::seed(0.07, "konzervativní start"),
+            max_aggregate_exposure: DerivedParam::seed(MAX_AGGREGATE_EXPOSURE, HARD_CAP_NOTE),
+            max_single_trade_risk: DerivedParam::seed(MAX_SINGLE_TRADE_RISK, HARD_CAP_NOTE),
+            max_daily_drawdown: DerivedParam::seed(MAX_DAILY_DRAWDOWN, HARD_CAP_NOTE),
+            max_weekly_drawdown: DerivedParam::seed(MAX_WEEKLY_DRAWDOWN, HARD_CAP_NOTE),
             daily_loss_limit_sats: DerivedParam::seed(50_000.0, "konzervativní start"),
-            consecutive_loss_threshold: DerivedParam::seed(5.0, "konzervativní start"),
+            consecutive_loss_threshold: DerivedParam::seed(
+                CONSECUTIVE_LOSS_THRESHOLD as f64,
+                HARD_CAP_NOTE,
+            ),
             vpin_toxicity_threshold: DerivedParam::seed(0.65, "literatura, dosud neměřeno"),
             p_ruin_1y: DerivedParam::seed(f64::NAN, "dosud neměřeno"),
             p_ruin_target: 0.005,
@@ -223,6 +273,60 @@ impl RiskState {
             calibrated_at: 0,
             calibration_generation: 0,
         }
+    }
+
+    /// Obranná kontrola stavu načteného z disku (§8.4).
+    ///
+    /// Poškozený nebo ručně upravený soubor nesmí projít jako platný stav.
+    /// `p_ruin_1y` smí být NaN — seed ho takto označuje jako „dosud neměřeno".
+    ///
+    /// Tato kontrola **nenahrazuje** `limits::clamp_to_hard_cap`: ta drží
+    /// strop při každém čtení, tahle jen odmítne zjevně vadný soubor.
+    pub fn validate(&self) -> Result<(), RiskError> {
+        let checked: [(&'static str, f64); 7] = [
+            ("max_aggregate_exposure", self.max_aggregate_exposure.value),
+            ("max_single_trade_risk", self.max_single_trade_risk.value),
+            ("max_daily_drawdown", self.max_daily_drawdown.value),
+            ("max_weekly_drawdown", self.max_weekly_drawdown.value),
+            ("daily_loss_limit_sats", self.daily_loss_limit_sats.value),
+            (
+                "consecutive_loss_threshold",
+                self.consecutive_loss_threshold.value,
+            ),
+            ("vpin_toxicity_threshold", self.vpin_toxicity_threshold.value),
+        ];
+        for (name, v) in checked {
+            if !v.is_finite() {
+                return Err(RiskError::NonFiniteInput);
+            }
+            if v < 0.0 {
+                return Err(RiskError::OutOfRange(name, v));
+            }
+        }
+
+        let scalars: [(&'static str, f64, f64, f64); 6] = [
+            ("p_ruin_target", self.p_ruin_target, 0.0, 1.0),
+            ("kelly_kappa", self.kelly_kappa, 0.10, 0.50),
+            ("sigma_target", self.sigma_target, 0.0, 10.0),
+            ("exposure_floor", self.exposure_floor, 0.0, 1.0),
+            ("exposure_ceiling", self.exposure_ceiling, 0.0, 1.0),
+            ("skim_ratio", self.skim_ratio, 0.0, 1.0),
+        ];
+        for (name, v, lo, hi) in scalars {
+            if !v.is_finite() {
+                return Err(RiskError::NonFiniteInput);
+            }
+            if v < lo || v > hi {
+                return Err(RiskError::OutOfRange(name, v));
+            }
+        }
+        if self.exposure_floor > self.exposure_ceiling {
+            return Err(RiskError::OutOfRange(
+                "exposure_floor > exposure_ceiling",
+                self.exposure_floor,
+            ));
+        }
+        Ok(())
     }
 }
 

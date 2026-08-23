@@ -11,10 +11,12 @@ use crate::limits::{
 // POZOR na kolizi jmen: nize v tomto souboru je privatni `struct RiskState`
 // (bezici stav enginu). `self_calibration::RiskState` je neco jineho —
 // sada kalibrovanych parametru. Alias je nutny.
+use crate::persistence;
 use crate::self_calibration::{
     RiskError, RiskState as CalibratedRisk, SelfCalibration, TradingStats,
 };
 use crate::trade_ledger::TradeLedger;
+use std::path::PathBuf;
 
 /// Central risk engine — enforces ALL risk limits
 /// This is the FINAL gate before any order reaches the exchange.
@@ -25,13 +27,21 @@ use crate::trade_ledger::TradeLedger;
 /// obchodu (`TradeLedger`). Vsechny limity se ctou z kalibrovaneho stavu,
 /// ale VZDY pres fasadu `limits.rs`, ktera je oramuje tvrdym stropem
 /// z `constants.rs`. Kalibrace smi riziko jen snizovat pod strop.
+///
+/// ## Perzistence (§8.4, §12)
+///
+/// Kdyz je engine vytvoren pres [`RiskEngine::new_persistent`], nacte
+/// kalibrovany stav z disku a po kazde uspesne rekalibraci ho zase atomicky
+/// ulozi. Bez toho zil vysledek mereni jen v RAM a kazdy restart ho zahodil.
 #[derive(Debug, Clone)]
 pub struct RiskEngine {
     state: Arc<RwLock<RiskState>>,
-    /// Kalibrovane rizikove parametry (seed dokud neni dost vzorku).
+    /// Kalibrovane rizikove parametry (seed z hard capu dokud neni dost vzorku).
     calibrated: Arc<RwLock<CalibratedRisk>>,
     /// Ucetni kniha realnych uzavrenych round-tripu.
     ledger: Arc<Mutex<TradeLedger>>,
+    /// Cesta k perzistentnimu `risk_state.json`. `None` = jen RAM (testy).
+    state_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -64,7 +74,64 @@ struct RiskState {
 }
 
 impl RiskEngine {
+    /// Engine bez perzistence — kalibrace zije jen v RAM.
+    /// Urceno pro testy a jednorazove nastroje. Produkce pouziva
+    /// [`RiskEngine::new_persistent`].
     pub fn new(initial_balance: f64) -> Self {
+        Self::with_calibration(initial_balance, CalibratedRisk::seed(), None)
+    }
+
+    /// Produkcni konstruktor: kalibrovany stav se nacte z disku (§8.4).
+    ///
+    /// * soubor existuje a je platny -> pouzije se **naměřený** stav,
+    ///   restart tedy nezmeni chovani systemu,
+    /// * soubor NEEXISTUJE -> `CalibratedRisk::seed()`, tj. **tvrde stropy**
+    ///   z `constants.rs`; to je jedina hodnota podlozena rozhodnutim
+    ///   operatora (viz doc u `RiskState::seed`),
+    /// * soubor je poskozeny / nevalidni -> `warn!` + tyz seed. Degradace
+    ///   nikdy nesmi tise rozsirit ani zuzit riziko bez zaznamu.
+    pub fn new_persistent(initial_balance: f64, state_path: PathBuf) -> Self {
+        let calibrated = match persistence::load(&state_path) {
+            Ok(s) => {
+                info!(
+                    "Risk Engine: kalibrace nactena z {} — gen={}, expozice={:.4}, riziko/obchod={:.5}, VPIN={:.3}",
+                    state_path.display(),
+                    s.calibration_generation,
+                    s.max_aggregate_exposure.value,
+                    s.max_single_trade_risk.value,
+                    s.vpin_toxicity_threshold.value,
+                );
+                s
+            }
+            Err(persistence::PersistError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                let seed = CalibratedRisk::seed();
+                info!(
+                    "Risk Engine: {} neexistuje — PRVNI START, seed z tvrdych stropu \
+                     (expozice={:.2}, riziko/obchod={:.3}). Restart tak nemeni chovani.",
+                    state_path.display(),
+                    seed.max_aggregate_exposure.value,
+                    seed.max_single_trade_risk.value,
+                );
+                seed
+            }
+            Err(e) => {
+                warn!(
+                    "Risk Engine: {} nelze pouzit ({}) — degraduji na seed z tvrdych stropu. \
+                     Soubor NEPREPISUJI dokud neprojde rekalibrace.",
+                    state_path.display(),
+                    e
+                );
+                CalibratedRisk::seed()
+            }
+        };
+        Self::with_calibration(initial_balance, calibrated, Some(state_path))
+    }
+
+    fn with_calibration(
+        initial_balance: f64,
+        calibrated: CalibratedRisk,
+        state_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             state: Arc::new(RwLock::new(RiskState {
                 mode: SystemMode::Initializing,
@@ -80,8 +147,45 @@ impl RiskEngine {
                 weekly_drawdown_pct: 0.0,
                 paper_consecutive_wins: 0,
             })),
-            calibrated: Arc::new(RwLock::new(CalibratedRisk::seed())),
+            calibrated: Arc::new(RwLock::new(calibrated)),
             ledger: Arc::new(Mutex::new(TradeLedger::new())),
+            state_path,
+        }
+    }
+
+    /// Cesta k perzistentnimu stavu, pokud engine nejakou ma.
+    pub fn state_path(&self) -> Option<&std::path::Path> {
+        self.state_path.as_deref()
+    }
+
+    /// Atomicky ulozi aktualni kalibrovany stav na disk.
+    ///
+    /// Bez nakonfigurovane cesty je to no-op (`Ok(false)`). Selhani zapisu
+    /// NENI duvod k panice ani k zahozeni kalibrace v pameti — runtime bezi
+    /// dal na spravnych hodnotach, jen je pri pristim startu nenajde.
+    pub fn persist_calibration(&self) -> bool {
+        let Some(path) = self.state_path.as_ref() else {
+            return false;
+        };
+        let snapshot = self.calibrated.read().clone();
+        match persistence::save_atomic(path, &snapshot) {
+            Ok(()) => {
+                debug!(
+                    "Risk Engine: kalibrace gen={} ulozena do {}",
+                    snapshot.calibration_generation,
+                    path.display()
+                );
+                true
+            }
+            Err(e) => {
+                error!(
+                    "Risk Engine: ZAPIS KALIBRACE SELHAL ({}) — {}. Runtime bezi dal, \
+                     ale pri restartu se tento stav ztrati.",
+                    path.display(),
+                    e
+                );
+                false
+            }
         }
     }
 
@@ -208,6 +312,12 @@ impl RiskEngine {
         );
 
         *self.calibrated.write() = next;
+
+        // Perzistence az PO zapisu do pameti (§8.4): runtime musi bezet na
+        // novych hodnotach i kdyz disk selze. Neuspech se loguje jako error,
+        // ale rekalibraci nerusi.
+        self.persist_calibration();
+
         Ok(generation)
     }
 
@@ -628,17 +738,22 @@ mod tests {
     // ══ T2 — sebekalibrace oramovana tvrdym stropem ══
 
     #[test]
-    fn fresh_engine_starts_on_seed_not_on_hard_caps() {
-        // Studeny start je ZAMERNE konzervativnejsi nez tvrde stropy.
-        // Seed se nahradi merenim az po MIN_SAMPLES_FOR_CALIBRATION.
+    fn fresh_engine_starts_on_seed_from_hard_caps() {
+        // Studeny start bez souboru na disku = tvrde stropy z constants.rs.
+        // Duvod je v doc `RiskState::seed`: hard cap je jedina hodnota
+        // podlozena rozhodnutim operatora, takze restart nemeni chovani.
         let engine = RiskEngine::new(400.0);
         assert_eq!(engine.calibration_generation(), 0);
         assert_eq!(engine.ledger_len(), 0);
-        assert!(engine.calibration_snapshot().max_aggregate_exposure.is_seed());
+        assert!(engine
+            .calibration_snapshot()
+            .max_aggregate_exposure
+            .is_seed());
 
-        assert!((engine.max_aggregate_exposure() - 0.20).abs() < 1e-12);
-        assert!((engine.max_single_trade_risk() - 0.005).abs() < 1e-12);
-        assert!((engine.max_daily_drawdown() - 0.03).abs() < 1e-12);
+        assert!((engine.max_aggregate_exposure() - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12);
+        assert!((engine.max_single_trade_risk() - MAX_SINGLE_TRADE_RISK).abs() < 1e-12);
+        assert!((engine.max_daily_drawdown() - MAX_DAILY_DRAWDOWN).abs() < 1e-12);
+        assert_eq!(engine.consecutive_loss_threshold(), CONSECUTIVE_LOSS_THRESHOLD);
     }
 
     #[test]
@@ -779,5 +894,162 @@ mod tests {
         let v = engine.vpin_toxicity_threshold();
         assert!((0.30..=0.95).contains(&v), "vpin = {v}");
         assert!((v - 0.65).abs() < 1e-12, "seed hodnota z literatury");
+    }
+
+    // ══ U1 — perzistence kalibrace ══
+
+    fn tmp_state_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "pirana_engine_persist_{}_{}_{:?}",
+                tag,
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .join("risk_state.json")
+    }
+
+    #[test]
+    fn engine_without_path_does_not_persist() {
+        let engine = RiskEngine::new(400.0);
+        assert!(engine.state_path().is_none());
+        assert!(!engine.persist_calibration(), "bez cesty je zapis no-op");
+    }
+
+    #[test]
+    fn calibration_survives_a_restart() {
+        // JADRO U1. Do teto opravy zil kalibrovany stav jen v RAM a kazdy
+        // restart sluzby ho zahodil zpet na seed.
+        use crate::self_calibration::DerivedParam;
+
+        let path = tmp_state_path("restart");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // 1) prvni "beh" — nic na disku, seed z hard capu
+        let first = RiskEngine::new_persistent(400.0, path.clone());
+        assert!((first.max_aggregate_exposure() - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12);
+        {
+            // kalibrace zmerila nizsi expozici
+            let mut c = first.calibrated.write();
+            c.max_aggregate_exposure = DerivedParam::new(0.31, "sigma_t/sigma_r", "test", 1_750_000_000);
+            c.max_single_trade_risk = DerivedParam::new(0.012, "kelly", "test", 1_750_000_000);
+            c.vpin_toxicity_threshold = DerivedParam::new(0.52, "breakeven", "test", 1_750_000_000);
+            c.calibration_generation = 3;
+        }
+        assert!(first.persist_calibration(), "zapis musi projit");
+
+        // 2) "restart" — novy engine ze stejne cesty
+        let second = RiskEngine::new_persistent(400.0, path.clone());
+        assert!(
+            (second.max_aggregate_exposure() - 0.31).abs() < 1e-12,
+            "po restartu se musi nacist namerena expozice, dostal jsem {}",
+            second.max_aggregate_exposure()
+        );
+        assert!((second.max_single_trade_risk() - 0.012).abs() < 1e-12);
+        assert!((second.vpin_toxicity_threshold() - 0.52).abs() < 1e-12);
+        assert_eq!(second.calibration_generation(), 3);
+        assert!(
+            !second.calibration_snapshot().max_aggregate_exposure.is_seed(),
+            "nactena hodnota uz neni seed"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn persisted_state_can_never_exceed_hard_caps_after_reload() {
+        // Rucne upraveny soubor s expozici 5,0 nesmi po restartu rozsirit
+        // riziko — clamp_to_hard_cap plati i na nactena data.
+        use crate::self_calibration::DerivedParam;
+
+        let path = tmp_state_path("clamp");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        let mut sabotage = CalibratedRisk::seed();
+        sabotage.max_aggregate_exposure = DerivedParam::new(5.0, "sabotaz", "test", 1);
+        sabotage.max_single_trade_risk = DerivedParam::new(0.99, "sabotaz", "test", 1);
+        crate::persistence::save_atomic(&path, &sabotage).unwrap();
+
+        let engine = RiskEngine::new_persistent(400.0, path.clone());
+        assert!((engine.max_aggregate_exposure() - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12);
+        assert!((engine.max_single_trade_risk() - MAX_SINGLE_TRADE_RISK).abs() < 1e-12);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn corrupt_state_file_degrades_to_hard_cap_seed_not_to_chaos() {
+        let path = tmp_state_path("corrupt");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ tohle neni validni json").unwrap();
+
+        let engine = RiskEngine::new_persistent(400.0, path.clone());
+        assert!((engine.max_aggregate_exposure() - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12);
+        assert_eq!(engine.calibration_generation(), 0);
+        assert!(engine
+            .calibration_snapshot()
+            .max_aggregate_exposure
+            .is_seed());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn successful_recalibration_writes_the_file() {
+        let path = tmp_state_path("autosave");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        let engine = RiskEngine::new_persistent(10_000.0, path.clone());
+        // Kalibrace vyzaduje MIN_SAMPLES_FOR_CALIBRATION obchodu I
+        // MIN_COMPLETED_DAYS dokoncenych dni, takze obchody musi byt
+        // rozlozene v case. `record_closed_trade` razitkuje `Utc::now()`,
+        // proto zapisujeme do ucetni knihy primo s explicitnim timestampem.
+        const DAY: i64 = 86_400;
+        {
+            let mut ledger = engine.ledger.lock();
+            for i in 0..200i64 {
+                let pnl = if i % 10 < 6 { 2.0 } else { -1.0 };
+                let ts = (i / 20) * DAY + 3_600; // 10 dni po 20 obchodech
+                ledger.record_close(pnl, 100_000.0, 10_000.0, 0.4, ts);
+            }
+        }
+
+        let generation = engine
+            .recalibrate_now(10_000.0, 100_000.0)
+            .expect("ziskovy vzorek musi projit branou");
+        assert_eq!(generation, 1);
+        assert!(path.is_file(), "rekalibrace musi stav rovnou ulozit");
+
+        let from_disk = crate::persistence::load(&path).expect("soubor musi byt platny");
+        assert_eq!(from_disk.calibration_generation, 1);
+        assert!(!from_disk.max_aggregate_exposure.is_seed());
+        assert!(
+            (from_disk.max_aggregate_exposure.value - engine.calibration_snapshot().max_aggregate_exposure.value)
+                .abs()
+                < 1e-12,
+            "na disku musi byt presne to, co je v pameti"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn seed_state_with_nan_p_ruin_survives_a_disk_roundtrip() {
+        // Regrese: serde_json zapisuje NaN jako `null` a pri cteni spadne.
+        // Seed ma p_ruin_1y = NaN ("dosud nemereno"), takze bez NaN-safe
+        // adapteru by se prvni ulozeny stav uz nikdy neprecetl.
+        let path = tmp_state_path("nan");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        let engine = RiskEngine::new_persistent(400.0, path.clone());
+        assert!(engine.calibration_snapshot().p_ruin_1y.value.is_nan());
+        assert!(engine.persist_calibration());
+
+        let reloaded = crate::persistence::load(&path).expect("seed stav musi jit precist zpet");
+        assert!(reloaded.p_ruin_1y.value.is_nan(), "NaN se musi vratit jako NaN");
+        assert!((reloaded.max_aggregate_exposure.value - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

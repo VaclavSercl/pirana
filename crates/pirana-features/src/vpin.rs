@@ -137,8 +137,40 @@ impl VpinCalculator {
     }
 
     /// Check if market toxicity exceeds warning threshold (Adverse Selection Alert)
+    ///
+    /// Uses the STATIC threshold from `strategy.toml`. In the live hot loop
+    /// prefer [`Self::is_toxic_with_threshold`] fed by
+    /// `RiskEngine::vpin_toxicity_threshold()`, otherwise the calibrated
+    /// value is merely published on the dashboard and never enforced.
     pub fn is_toxic(&self) -> bool {
-        self.config.enabled && self.calculate_vpin() >= self.config.toxicity_threshold
+        self.is_toxic_with_threshold(self.config.toxicity_threshold)
+    }
+
+    /// Toxicity check against an EXTERNALLY supplied threshold.
+    ///
+    /// This is the variant the self-calibrating risk engine drives (§8.1):
+    /// `VPIN_max = breakeven_percentil · (1 − (toxic_ratio − 0,20))`.
+    /// Without it the calibrated threshold had no effect on execution —
+    /// `main.rs` kept comparing against the frozen `strategy.toml` value.
+    ///
+    /// A non-finite or out-of-range threshold falls back to the configured
+    /// static one, so a broken calibration can never disable the guard.
+    pub fn is_toxic_with_threshold(&self, threshold: f64) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        let t = if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
+            threshold
+        } else {
+            self.config.toxicity_threshold
+        };
+        self.calculate_vpin() >= t
+    }
+
+    /// Static threshold currently configured (for logging / dashboards).
+    #[inline]
+    pub fn configured_threshold(&self) -> f64 {
+        self.config.toxicity_threshold
     }
 
     /// Check if market toxicity is extreme (Emergency Flash Crash / Sweep)
@@ -234,5 +266,90 @@ mod tests {
         assert_eq!(calc.completed_buckets.len(), 5);
         let vpin = calc.calculate_vpin();
         assert!(vpin > 0.95);
+    }
+
+    // ══ U3 — kalibrovany prah musi byt ucinny, ne jen publikovany ══
+
+    fn calc_with_vpin(target_vpin_high: bool) -> VpinCalculator {
+        let config = VpinConfig {
+            enabled: true,
+            bucket_size_btc: 0.5,
+            bucket_count: 10,
+            toxicity_threshold: 0.90, // zamerne VYSOKY staticky prah
+            emergency_cancel_on_toxic: true,
+        };
+        let mut calc = VpinCalculator::new(config);
+        if target_vpin_high {
+            // jednostranny sweep -> VPIN ~1.0
+            for _ in 0..12 {
+                calc.process_trade(Side::Sell, 0.5);
+            }
+        } else {
+            for _ in 0..10 {
+                calc.process_trade(Side::Buy, 0.25);
+                calc.process_trade(Side::Sell, 0.25);
+            }
+        }
+        calc
+    }
+
+    #[test]
+    fn calibrated_threshold_can_tighten_the_guard() {
+        // Staticky prah 0,90; kalibrace zmerila, ze edge mizi uz nad 0,45.
+        // Pri VPIN ~0,50 musi guard sepnout s kalibrovanym prahem
+        // a NEsepnout se statickym — presne to main.rs:1401 delal spatne.
+        let config = VpinConfig {
+            enabled: true,
+            bucket_size_btc: 1.0,
+            bucket_count: 10,
+            toxicity_threshold: 0.90,
+            emergency_cancel_on_toxic: true,
+        };
+        let mut calc = VpinCalculator::new(config);
+        // 75 % buy / 25 % sell v kazdem bucketu -> imbalance 0,5
+        for _ in 0..10 {
+            calc.process_trade(Side::Buy, 0.75);
+            calc.process_trade(Side::Sell, 0.25);
+        }
+        let vpin = calc.calculate_vpin();
+        assert!(
+            (0.45..0.60).contains(&vpin),
+            "test potrebuje stredni VPIN, dostal jsem {vpin}"
+        );
+
+        assert!(!calc.is_toxic(), "staticky prah 0,90 nesepne");
+        assert!(
+            calc.is_toxic_with_threshold(0.45),
+            "kalibrovany prah 0,45 sepnout MUSI"
+        );
+    }
+
+    #[test]
+    fn calibrated_threshold_can_loosen_the_guard() {
+        let calc = calc_with_vpin(false); // cisty tok, VPIN ~0
+        assert!(!calc.is_toxic_with_threshold(0.30));
+    }
+
+    #[test]
+    fn broken_calibration_falls_back_to_static_threshold() {
+        // NaN / mimo rozsah nesmi guard vypnout.
+        let calc = calc_with_vpin(true); // VPIN ~1.0, staticky prah 0,90
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 5.0] {
+            assert!(
+                calc.is_toxic_with_threshold(bad),
+                "nevalidni prah {bad} musi degradovat na staticky 0,90, ne guard vypnout"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_guard_is_never_toxic_regardless_of_threshold() {
+        let config = VpinConfig {
+            enabled: false,
+            ..VpinConfig::default()
+        };
+        let calc = VpinCalculator::new(config);
+        assert!(!calc.is_toxic_with_threshold(0.0));
+        assert!(!calc.is_toxic());
     }
 }

@@ -127,7 +127,7 @@ mod tests {
         assert!(atr.current_atr() > 0.0);
         
         let (tp, sl) = atr.calculate_tp_sl_distances(0.5, 3.0, 3.0, 30.0, 20.0, 100.0);
-        assert!(tp >= 3.0 && tp <= 30.0);
-        assert!(sl >= 20.0 && sl <= 100.0);
+        assert!((3.0..=30.0).contains(&tp));
+        assert!((20.0..=100.0).contains(&sl));
     }
 }

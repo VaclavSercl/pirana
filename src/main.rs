@@ -594,7 +594,15 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let usd_bal = *state.usd_balance.read();
     let initial_price = if *state.btc_price.read() > 0.0 { *state.btc_price.read() } else { 73000.0 };
     let initial_balance = btc_bal * initial_price + usd_bal;
-    let risk_engine = RiskEngine::new(if initial_balance > 0.0 { initial_balance } else { 1000.0 });
+    // [CASLAV v5.1 / U1] Kalibrovany stav se nacita z disku (§8.4).
+    // Do teto zmeny zil jen v RAM: kazdy restart sluzby zahodil vsechno
+    // namerene a engine zacal znovu na seedu. Pri osmi restartech za den
+    // kalibrace nemohla konvergovat, protoze nikdy nezacala tam, kde skoncila.
+    let risk_state_path = pirana_risk_engine::persistence::default_state_path();
+    let risk_engine = RiskEngine::new_persistent(
+        if initial_balance > 0.0 { initial_balance } else { 1000.0 },
+        risk_state_path,
+    );
     risk_engine.activate();
 
     let active_positions = Arc::new(parking_lot::RwLock::new(Vec::<ActivePosition>::new()));
@@ -1398,7 +1406,13 @@ async fn process_ws_message(
 
                                 vpin.process_trade(side, qty.abs());
                                 let vpin_score = vpin.calculate_vpin();
-                                let is_vpin_toxic = vpin.is_toxic();
+                                // [CASLAV v5.1 / Ú3] Prah toxicity ctem z KALIBROVANEHO
+                                // stavu risk enginu, ne ze statickeho strategy.toml.
+                                // Do teto opravy kalibrator prah pocital a publikoval
+                                // na dashboardu, ale hot loop porovnaval proti zmrazene
+                                // hodnote z configu — kalibrace byla ucinna jen na papire.
+                                let vpin_threshold = risk_engine.vpin_toxicity_threshold();
+                                let is_vpin_toxic = vpin.is_toxic_with_threshold(vpin_threshold);
                                 let is_vpin_emergency = vpin.is_emergency_toxic();
 
                                 *state.vpin_score.write() = vpin_score;
@@ -1414,7 +1428,7 @@ async fn process_ws_message(
 
                                 if is_vpin_toxic && !is_lead_lag_buy && !is_hawkes_buy && !is_lead_lag_sell && !is_hawkes_sell {
                                     if log_throttler.should_log("vpin_high_toxicity") {
-                                        tracing::warn!("⚠️ [VPIN HIGH TOXICITY] VPIN={:.1}% >= {:.0}% - Adverse selection guard active, skipping standard noise entries", vpin_score * 100.0, conf.vpin_guard.toxicity_threshold * 100.0);
+                                        tracing::warn!("⚠️ [VPIN HIGH TOXICITY] VPIN={:.1}% >= {:.0}% (kalibrovany prah; staticky config {:.0}%) - Adverse selection guard active, skipping standard noise entries", vpin_score * 100.0, vpin_threshold * 100.0, conf.vpin_guard.toxicity_threshold * 100.0);
                                     }
                                     return;
                                 }

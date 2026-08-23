@@ -113,41 +113,67 @@ fn probe_aggregate_exposure_ceiling_with_three_open_orders() {
     assert!(cumulative <= MAX_AGGREGATE_EXPOSURE + 1e-9);
 }
 
-/// ZMENA CHOVANI po zapojeni sebekalibrace (T2) — zamerne zafixovano.
+/// ZMENA CHOVANI po zapojeni perzistence kalibrace (U1/U2) — zamerne zafixovano.
 ///
-/// Cerstvy engine uz nestartuje na tvrdych stropech z constants.rs,
-/// ale na SEEDU z `RiskState::seed()`, ktery je zamerne konzervativnejsi:
+/// Cerstvy engine BEZ souboru na disku startuje na TVRDYCH STROPECH
+/// z `constants.rs`, ne na libovolne konzervativni hodnote:
 ///
-/// | parametr              | hard cap | seed  | pomer |
-/// |-----------------------|----------|-------|-------|
-/// | max_aggregate_exposure| 0,90     | 0,20  | 4,5x  |
-/// | max_single_trade_risk | 0,05     | 0,005 | 10x   |
-/// | max_daily_drawdown    | 0,03     | 0,03  | =     |
-/// | max_weekly_drawdown   | 0,07     | 0,07  | =     |
+/// | parametr              | hard cap | seed  |
+/// |-----------------------|----------|-------|
+/// | max_aggregate_exposure| 0,90     | 0,90  |
+/// | max_single_trade_risk | 0,05     | 0,05  |
+/// | max_daily_drawdown    | 0,03     | 0,03  |
+/// | max_weekly_drawdown   | 0,07     | 0,07  |
 ///
-/// PROVOZNI DOPAD: po restartu sluzby bot obchoduje na 20 % expozice,
-/// dokud nenasbira MIN_SAMPLES_FOR_CALIBRATION (50) uzavrenych round-tripu
-/// a MIN_COMPLETED_DAYS (5) dokoncenych dni. Pak se limit posune podle
-/// mereni, ale nikdy nad tvrdy strop.
+/// PROC: predchozi seed 0,20 / 0,005 nebyl podlozen zadnym merenim. Po
+/// restartu by tise zvratil vedome rozhodnuti operatora (ktery expozici
+/// na 0,90 / 0,05 zvedl prave proto, ze se bot sam uskrtil na 1 %) a dal
+/// 10x mensi pozici. Hard cap je jedina hodnota podlozena rozhodnutim;
+/// kalibrace ji smi podle mereni uz jen SNIZOVAT.
+///
+/// Restart tedy nemeni chovani systemu. Pojistka `clamp_to_hard_cap`
+/// plati dal — viz `calibration_can_never_exceed_hard_caps`.
 ///
 /// Tento test existuje proto, aby se ta zmena nedala prehlednout.
 #[test]
-fn seed_start_is_deliberately_tighter_than_hard_caps() {
+fn cold_start_seeds_from_hard_caps_not_from_an_arbitrary_floor() {
     let engine = RiskEngine::new(398.5);
     engine.activate();
 
     assert!(
-        (engine.max_aggregate_exposure() - 0.20).abs() < 1e-12,
-        "cerstvy engine musi startovat na seedu 0,20, ne na hard capu {MAX_AGGREGATE_EXPOSURE}"
+        (engine.max_aggregate_exposure() - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12,
+        "studeny start musi sednout na hard cap {MAX_AGGREGATE_EXPOSURE}, dostal jsem {}",
+        engine.max_aggregate_exposure()
     );
     assert!(
-        (engine.max_single_trade_risk() - 0.005).abs() < 1e-12,
-        "cerstvy engine musi startovat na seedu 0,005, ne na hard capu {MAX_SINGLE_TRADE_RISK}"
+        (engine.max_single_trade_risk() - MAX_SINGLE_TRADE_RISK).abs() < 1e-12,
+        "studeny start musi sednout na hard cap {MAX_SINGLE_TRADE_RISK}, dostal jsem {}",
+        engine.max_single_trade_risk()
     );
-    // Drawdowny se seedem rovnaji hard capum — zadna zmena chovani.
     assert!((engine.max_daily_drawdown() - MAX_DAILY_DRAWDOWN).abs() < 1e-12);
     assert!((engine.max_weekly_drawdown() - MAX_WEEKLY_DRAWDOWN).abs() < 1e-12);
 
-    // Kalibrace jeste nebezela.
+    // Kalibrace jeste nebezela — porad je to seed, jen z jineho cisla.
     assert_eq!(engine.calibration_generation(), 0);
+}
+
+/// Presne cislo z operatorova vypoctu: restart nesmi zmensit velikost obchodu.
+///
+/// Pri equity 398,50 USD a rizikovem rozpoctu:
+///   expozice 0,90 x riziko 0,05 -> 0,045 x equity = 17,93 USD notional rizika
+///   expozice 0,20 x riziko 0,005 -> 0,001 x equity = 0,3985 USD
+/// Pomer je 45x. Tento test hlida, ze se po restartu vracime na prvni radek.
+#[test]
+fn restart_does_not_shrink_the_risk_budget() {
+    let equity = 398.5;
+    let engine = RiskEngine::new(equity);
+    engine.activate();
+
+    let budget_now = engine.max_aggregate_exposure() * engine.max_single_trade_risk() * equity;
+    let budget_old_seed = 0.20 * 0.005 * equity;
+
+    assert!(
+        budget_now > budget_old_seed * 40.0,
+        "rozpocet po restartu {budget_now:.4} USD musi byt radove vyssi nez u stareho seedu {budget_old_seed:.4} USD"
+    );
 }
