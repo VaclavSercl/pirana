@@ -1,4 +1,14 @@
 # PIRANA
+
+> ⚠️ **HISTORICKÝ DOKUMENT — SUPERSEDED**
+>
+> Tento dokument popisuje původní architektonický záměr (květen 2026).
+> Závazným zdrojem je `ai-orchestration/prompts/CASLAV_MASTER_v5_1.md`.
+> **Číselné risk limity uvedené níže NEPLATÍ** — jediným zdrojem pravdy je
+> `/opt/caslav/risk/risk_state.toml` (viz §8.4 master promptu).
+> Limity se odvozují ze vzorců, nejsou zapsané.
+
+
 ## Institutional Hybrid AI-Orchestrated Quantitative Trading System
 ### Hermes Agent + Deterministic Ultra-Low-Latency Execution Architecture
 
