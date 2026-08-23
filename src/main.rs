@@ -1021,11 +1021,18 @@ async fn process_ws_message(
 
                                             // Update win rate from REAL PnL (running average over closed trades only)
                                             {
-                                                let mut wins = state_clone.win_rate.write();
                                                 let trades_today = *state_clone.trades_today.read();
-                                                if trades_today > 0 {
-                                                    let current_wins = if pnl > 0.0 { 1.0 } else { 0.0 };
-                                                    *wins = (*wins * ((trades_today - 1) as f64) + current_wins) / (trades_today as f64);
+                                                // [CASLAV v5] win rate VYHRADNE z uzavrenych round-tripu.
+                                                // Otevirajici fill ma PnL == 0.0; driv se zapocital jako prohra
+                                                // a jmenovatel rostl 2x rychleji nez pocet uzavrenych obchodu.
+                                                if pnl.abs() > f64::EPSILON {
+                                                    let mut closed = state_clone.closed_trades.write();
+                                                    *closed += 1;
+                                                    if pnl > 0.0 {
+                                                        *state_clone.winning_trades.write() += 1;
+                                                    }
+                                                    let won = *state_clone.winning_trades.read() as f64;
+                                                    *state_clone.win_rate.write() = won / (*closed).max(1) as f64;
                                                 }
                                                 let mut best = state_clone.best_trade.write();
                                                 if pnl > *best { *best = pnl; }
@@ -1953,10 +1960,17 @@ async fn process_ws_message(
                                                                 // Win rate / best / worst / avg size (closed trades only)
                                                                 {
                                                                     let trades_today = *state_clone.trades_today.read();
-                                                                    let mut wins = state_clone.win_rate.write();
-                                                                    if trades_today > 0 {
-                                                                        let current_wins = if realized_pnl > 0.0 { 1.0 } else { 0.0 };
-                                                                        *wins = (*wins * ((trades_today - 1) as f64) + current_wins) / (trades_today as f64);
+                                                                    // [CASLAV v5] win rate VYHRADNE z uzavrenych round-tripu.
+                                                                    // Otevirajici fill ma PnL == 0.0; driv se zapocital jako prohra
+                                                                    // a jmenovatel rostl 2x rychleji nez pocet uzavrenych obchodu.
+                                                                    if realized_pnl.abs() > f64::EPSILON {
+                                                                        let mut closed = state_clone.closed_trades.write();
+                                                                        *closed += 1;
+                                                                        if realized_pnl > 0.0 {
+                                                                            *state_clone.winning_trades.write() += 1;
+                                                                        }
+                                                                        let won = *state_clone.winning_trades.read() as f64;
+                                                                        *state_clone.win_rate.write() = won / (*closed).max(1) as f64;
                                                                     }
                                                                     let mut best = state_clone.best_trade.write();
                                                                     if realized_pnl > *best { *best = realized_pnl; }

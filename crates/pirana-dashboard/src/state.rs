@@ -49,6 +49,10 @@ pub struct DashboardState {
     pub paper_consecutive_wins: Arc<parking_lot::RwLock<u32>>,
     /// Total trades today
     pub trades_today: Arc<parking_lot::RwLock<u32>>,
+    /// Uzavrene round-tripy (jen fill s nenulovym realizovanym PnL)
+    pub closed_trades: Arc<parking_lot::RwLock<u32>>,
+    /// Ziskove uzavrene round-tripy
+    pub winning_trades: Arc<parking_lot::RwLock<u32>>,
     /// Win rate
     pub win_rate: Arc<parking_lot::RwLock<f64>>,
     /// Best trade today
@@ -191,6 +195,8 @@ pub struct DashboardSnapshot {
     pub order_book: OrderBookView,
     pub consecutive_losses: u32,
     pub trades_today: u32,
+    pub closed_trades: u32,
+    pub winning_trades: u32,
     pub win_rate: f64,
     pub best_trade: f64,
     pub worst_trade: f64,
@@ -252,6 +258,8 @@ impl DashboardState {
             consecutive_losses: Arc::new(parking_lot::RwLock::new(0)),
             paper_consecutive_wins: Arc::new(parking_lot::RwLock::new(0)),
             trades_today: Arc::new(parking_lot::RwLock::new(0)),
+            closed_trades: Arc::new(parking_lot::RwLock::new(0)),
+            winning_trades: Arc::new(parking_lot::RwLock::new(0)),
             win_rate: Arc::new(parking_lot::RwLock::new(0.0)),
             best_trade: Arc::new(parking_lot::RwLock::new(0.0)),
             worst_trade: Arc::new(parking_lot::RwLock::new(0.0)),
@@ -304,6 +312,8 @@ impl DashboardState {
             order_book: self.order_book.read().clone(),
             consecutive_losses: *self.consecutive_losses.read(),
             trades_today: *self.trades_today.read(),
+            closed_trades: *self.closed_trades.read(),
+            winning_trades: *self.winning_trades.read(),
             win_rate: *self.win_rate.read(),
             best_trade: *self.best_trade.read(),
             worst_trade: *self.worst_trade.read(),
