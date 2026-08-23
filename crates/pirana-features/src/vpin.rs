@@ -150,6 +150,16 @@ impl VpinCalculator {
         }
     }
 
+    /// Minimalni pocet dokoncenych kosu, nez ma VPIN smysl vyhodnocovat.
+    /// Pod touto hranici je odhad cisty sum — v pomeru k velikosti kose.
+    pub const MIN_COMPLETED_BUCKETS: usize = 10;
+
+    /// Vraci true, pokud je kalkulace ve fazi warm-upu (prilis malo dat).
+    /// Guard by v teto fazi nemel blokovat — nemerime toxicitu, ale granularitu.
+    pub fn is_warming_up(&self) -> bool {
+        self.completed_buckets.len() < Self::MIN_COMPLETED_BUCKETS
+    }
+
     /// Check if market toxicity exceeds warning threshold (Adverse Selection Alert)
     ///
     /// Uses the STATIC threshold from `strategy.toml`. In the live hot loop
@@ -173,6 +183,10 @@ impl VpinCalculator {
         if !self.config.enabled {
             return false;
         }
+        // Warm-up: prilis malo kosu = sum, ne toxicita. Guard mlci.
+        if self.is_warming_up() {
+            return false;
+        }
         let t = if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
             threshold
         } else {
@@ -191,6 +205,7 @@ impl VpinCalculator {
     pub fn is_emergency_toxic(&self) -> bool {
         self.config.enabled
             && self.config.emergency_cancel_on_toxic
+            && !self.is_warming_up()
             && self.calculate_vpin() >= self.emergency_threshold()
     }
 
@@ -203,6 +218,15 @@ impl VpinCalculator {
         let vpin = self.calculate_vpin();
         let buckets = self.completed_buckets.len();
         let target_buckets = self.config.bucket_count;
+
+        if self.is_warming_up() {
+            return format!(
+                "Warming Up: VPIN={:.1}% (only {}/{} buckets — metric not reliable yet)",
+                vpin * 100.0,
+                buckets,
+                Self::MIN_COMPLETED_BUCKETS
+            );
+        }
 
         if vpin >= self.emergency_threshold() {
             format!("🚨 [EMERGENCY TOXICITY] VPIN={:.1}% >= 75% | Flash Crash Risk ({}/{} buckets)", vpin * 100.0, buckets, target_buckets)
@@ -367,5 +391,46 @@ mod tests {
         let calc = VpinCalculator::new(config);
         assert!(!calc.is_toxic_with_threshold(0.0));
         assert!(!calc.is_toxic());
+    }
+
+    #[test]
+    fn warming_up_guard_never_blocks() {
+        // Po restartu je VPIN nedostatecny — malo kosu. Guard musi mlcet,
+        // jinak by falesne blokoval vstupy (dnes zpusobil 3,5h vypadek).
+        let config = VpinConfig {
+            enabled: true,
+            bucket_size_btc: 0.5,
+            bucket_count: 50,
+            toxicity_threshold: 0.65,
+            emergency_cancel_on_toxic: true,
+        };
+        let mut calc = VpinCalculator::new(config);
+
+        // Naplnime jen 4 obchody po 0.1 BTC → 4 x 0.1 = 0.4 BTC = 1 koš (pod prahem 10)
+        for _ in 0..4 {
+            calc.process_trade(Side::Sell, 0.1);
+        }
+
+        assert!(calc.is_warming_up());
+        assert!(
+            !calc.is_toxic(),
+            "warm-up guard must not block (VPIN unreliable)"
+        );
+        assert!(
+            !calc.is_emergency_toxic(),
+            "warm-up emergency must not trigger"
+        );
+        assert!(
+            calc.status().contains("Warming Up"),
+            "status must report warm-up: {}",
+            calc.status()
+        );
+
+        // Po naplneni dostatecneho poctu kosu uz guard funguje
+        for _ in 0..60 {
+            calc.process_trade(Side::Sell, 0.1); // dalsich 60 x 0.1 = 6 BTC = 12 košů
+        }
+        assert!(!calc.is_warming_up());
+        assert!(calc.is_toxic(), "with enough buckets, toxic flow must block");
     }
 }

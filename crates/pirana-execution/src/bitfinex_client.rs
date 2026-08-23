@@ -294,10 +294,31 @@ impl BitfinexClient {
                 message: format!("Cancel failed: {}", e),
             })?;
 
+        let status = response.status();
         let text = response.text().await.map_err(|e| PiranaError::ExchangeApi {
             code: -1,
             message: format!("Failed to read cancel response: {}", e),
         })?;
+
+        // HTTP 429 = prekrocili jsme tempo. Aktivovat exponencialni backoff.
+        if status.as_u16() == 429 {
+            self.rate_limiter.record_rate_limited();
+            error!("Bitfinex rate limit (429) on cancel: {}", text);
+            return Err(PiranaError::ExchangeApi {
+                code: 429,
+                message: format!("rate limited: {text}"),
+            });
+        }
+
+        if !status.is_success() {
+            error!("Cancel rejected: {} - {}", status, text);
+            return Err(PiranaError::ExchangeApi {
+                code: status.as_u16() as i32,
+                message: text,
+            });
+        }
+
+        self.rate_limiter.record_success();
 
         info!("Order {} cancelled: {}", order_id, text);
         Ok(text)
