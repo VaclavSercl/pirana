@@ -122,7 +122,29 @@ enabled = true
 # emergency alertů za den a 3,5 h zastaveného obchodování 23. 8. od 13:06.
 # 5,0 BTC = 217 obchodů na koš, naplní se za ~91 s — dost na vyhlazení šumu,
 # stále dost citlivé na reálný jednosměrný tok.
-bucket_size_btc = 5.0
+#
+# REVIZE 17:50 — VOLBA 5,0 BTC BYLA CHYBNA, OPRAVENO NA 2,0
+#
+# Puvodne jsem vybral kos podle nejnizsi sumove podlahy. To je spatne
+# kriterium: s sumem se vytrati i signal. Zmereno na 450 000 realnych
+# obchodech z Bitfinexu, AUC = jak dobre VPIN predpovi pohyb ceny
+# v nasledujicich 300 s (0,50 = nahoda):
+#
+#     kos   AUC    korelace  plni se   okno 50 kosu
+#     0,5   0,610    0,190       9 s       7,6 min
+#     2,0   0,626    0,205      36 s      30,2 min   <- ZVOLENO
+#     5,0   0,559    0,112      91 s      75,5 min   <- NEJHORSI ze vsech
+#      10   0,588    0,106     181 s     151,1 min
+#      25   0,652    0,186     453 s     377,6 min
+#
+# Kos 5,0 BTC ma nejnizsi predikcni silu (AUC 0,559, sotva nad nahodou)
+# i nejnizsi korelaci. Kos 25 BTC ma sice nejlepsi AUC 0,652, ale okno
+# 50 kosu = 6,3 hodiny; pri cooldownu 2 s je to jako ridit podle vcerejsi
+# predpovedi pocasi — nez metrika zareaguje, epizoda toxicity skoncila.
+#
+# 2,0 BTC: AUC 0,626 (druha nejlepsi), okno 30 min, median VPIN 0,473
+# bezpecne pod prahem 0,65. Nejlepsi pomer informace k reakcni dobe.
+bucket_size_btc = 2.0
 # Počet košů v klouzavém okně
 bucket_count = 50
 # Práh toxicity pro blokování protisměrných obchodů (Adverse Selection Guard)
