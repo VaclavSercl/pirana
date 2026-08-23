@@ -95,10 +95,15 @@ The threshold is **configurable** via `strategy.toml` and is properly passed to 
 
 ### Risk Management
 
-- Maximum Aggregate Exposure: **20%**
-- Maximum Single Trade Risk: **0.50%**
-- Maximum Daily Drawdown: **3%**
-- Maximum Weekly Drawdown: **7%**
+> ⚠️ Konkrétní čísla NEUVÁDĚT zde — jediným zdrojem pravdy je
+> `crates/pirana-core/src/constants.rs` (hard stropy) a po zapojení
+> samokalibrace `/opt/caslav/risk/risk_state.toml` (odvozené hodnoty).
+> Duplikace limitů v dokumentaci = TRUTH_DIVERGENCE (viz master prompt §8.4).
+
+- Maximum Aggregate Exposure: viz `MAX_AGGREGATE_EXPOSURE` v constants.rs
+- Maximum Single Trade Risk: viz `MAX_SINGLE_TRADE_RISK`
+- Maximum Daily Drawdown: viz `MAX_DAILY_DRAWDOWN`
+- Maximum Weekly Drawdown: viz `MAX_WEEKLY_DRAWDOWN`
 - Position size is dynamically scaled to fit within exposure budget
 - 5 consecutive losses → **Defensive Mode** (50% position size)
 - 10 consecutive losses → **Halted** (paper trading until 5 consecutive paper wins)
@@ -265,7 +270,7 @@ pirana/
 - **OFI threshold fix**: `ofi_trigger_threshold` from `strategy.toml` is now properly passed to `OfiCalculator` instead of using hardcoded `OFI_THRESHOLD = 0.6` constant
 - **Position tracking fix**: BUY positions, balance updates, and exposure updates now happen **synchronously before** `tokio::spawn` to eliminate race conditions where SELL arrived before BUY was registered
 - **Naked short prevention**: SELL orders are **skipped** if no open BUY position exists, instead of executing and logging a warning
-- **LIMIT orders**: Switched from `EXCHANGE MARKET` (taker fee 0.20%) to `EXCHANGE LIMIT` (maker fee 0.10%) — saves 50% on fees
+- **Order type**: aktuálně `EXCHANGE MARKET` (ověřeno v journalctl: 21/21 exekucí). Přepnutí na `EXCHANGE LIMIT` je PLÁN, ne stav. Účet má potvrzený zero-fee status (100/100 exekucí fee=0).
 - **Win rate calculation**: Now properly updated on every SELL trade (was hardcoded 0.0)
 - **Order book processing**: Bitfinex book channel data is now parsed and stored in `DashboardState.order_book` (was empty)
 - **TP/SL realism**: Adjusted from $350/$150 to $15/$25 — achievable within the 10s trade interval

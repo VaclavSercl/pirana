@@ -96,8 +96,7 @@ impl L2DepthCalculator {
         let baseline_density = 0.001;
         let ratio = (density / baseline_density).clamp(0.2, 5.0);
         
-        let estimated_kappa = (base_kappa * ratio.sqrt()).clamp(0.20, 10.0);
-        estimated_kappa
+        (base_kappa * ratio.sqrt()).clamp(0.20, 10.0)
     }
 }
 

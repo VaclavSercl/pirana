@@ -140,7 +140,7 @@ impl BitfinexClient {
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_array())
             {
-                if let Some(id) = order_arr.get(0).and_then(|v| v.as_i64()) {
+                if let Some(id) = order_arr.first().and_then(|v| v.as_i64()) {
                     exchange_order_id = id;
                 }
                 if let Some(p) = order_arr.get(16).and_then(|v| v.as_f64()) {
