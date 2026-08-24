@@ -14,3 +14,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 metrics = { workspace = true }
+
+[dev-dependencies]
+# Integracni test tests/mode_cycle.rs overuje cely cyklus rezimu
+# pres governance + risk engine dohromady — deadlock 24. 8. vznikl
+# teprve jejich slozenim, zadny unit test ho nemohl chytit.
+pirana-signal-validator = { path = "../pirana-signal-validator" }

@@ -393,6 +393,39 @@ impl RiskEngine {
         true
     }
 
+    /// Posune casovac Defensive o `secs` do minulosti — POUZE PRO TESTY.
+    ///
+    /// Integracni testy potrebuji simulovat uplynuti cooldownu bez cekani
+    /// 15 realnych minut. Privatni `state` neni z jineho cratu dostupny,
+    /// takze je nutna verejna metoda.
+    ///
+    /// Neni oznacena `#[cfg(test)]`, protoze `cfg(test)` plati jen pro unit
+    /// testy uvnitr tohoto cratu — integracni testy v `tests/` kompiluji
+    /// crate jako bezou zavislost a takovou metodu by nevidely.
+    #[doc(hidden)]
+    pub fn debug_rewind_defensive_since(&self, secs: i64) {
+        let mut state = self.state.write();
+        state.defensive_since = chrono::Utc::now().timestamp() - secs;
+    }
+
+    /// Hodnota defensive_since — POUZE PRO TESTY.
+    #[doc(hidden)]
+    pub fn debug_since(&self) -> i64 {
+        self.state.read().defensive_since
+    }
+
+    /// Aktualni pocet po sobe jdoucich ztrat — POUZE PRO TESTY.
+    #[doc(hidden)]
+    pub fn debug_losses(&self) -> u32 {
+        self.state.read().consecutive_losses
+    }
+
+    /// Vynuluje citac po sobe jdoucich ztrat — POUZE PRO TESTY.
+    #[doc(hidden)]
+    pub fn debug_reset_losses(&self) {
+        self.state.write().consecutive_losses = 0;
+    }
+
     /// Kolik sekund uz system stravil v Defensive rezimu (0 = neni v nem).
     /// Pro dashboard a diagnostiku — bez teto viditelnosti se deadlock
     /// 24. 8. projevil az po dvou hodinach.
