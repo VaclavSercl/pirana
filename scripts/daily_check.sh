@@ -75,7 +75,21 @@ EOF
 
 echo "[$(date -Iseconds)] Spouštím ranní audit agenta Čáslav..." >> "$LOG_FILE"
 
-REPORT_OUTPUT=$(/home/wwwenda/.local/bin/agy --dangerously-skip-permissions --print "$PROMPT_CONTENT" 2>&1)
+# Timeout 5 minut — agy dnes ráno běžel 34 minut a skončil chybou.
+# Bez timeoutu čeká skript donekonečna a žádný report neodešle.
+# -k 30s: pokud agy ignoruje SIGTERM, pošleme SIGKILL po 30s.
+AGY_TIMEOUT=300
+REPORT_OUTPUT=$(timeout -k 30s "$AGY_TIMEOUT" /home/wwwenda/.local/bin/agy --dangerously-skip-permissions --print "$PROMPT_CONTENT" 2>&1)
+AGY_EXIT=$?
+
+# Timeout nebo chyba → fallback report, ne ticho
+if [ $AGY_EXIT -ne 0 ]; then
+    if [ $AGY_EXIT -eq 124 ]; then
+        REPORT_OUTPUT="⚠️ <b>ČÁSLAV :: RANNÍ AUDIT — TIMEOUT</b>\n\nAgent agy nestihl odpovědět do 5 minut (timeout -k 30s). Zkontroluj logy: journalctl -u pirana-daily-check.service"
+    else
+        REPORT_OUTPUT="⚠️ <b>ČÁSLAV :: RANNÍ AUDIT — CHYBA AGENTA</b>\n\nAgent agy skončil s exit kódem $AGY_EXIT. Zkontroluj logy: journalctl -u pirana-daily-check.service"
+    fi
+fi
 
 # Uložení výstupu do logu
 echo "$REPORT_OUTPUT" >> "$LOG_FILE"
