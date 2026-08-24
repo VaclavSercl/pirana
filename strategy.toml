@@ -33,7 +33,7 @@ max_slippage_bps = 5
 position_size_pct = 20.0
 max_aggregate_exposure_pct = 90.0
 max_single_trade_risk_pct = 5.0
-daily_loss_limit_usd = 50.0
+# daily_loss_limit_usd odstraněno 24.8. — risk engine používá daily_loss_limit_sats (kalibrované).
 use_dynamic_winrate_sizing = true
 min_position_size_pct = 5.0
 max_position_size_pct = 25.0

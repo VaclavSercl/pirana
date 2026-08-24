@@ -135,7 +135,7 @@ Pojistky formálně existují, ale jsou to statické konstanty, ne kalibrované 
 # ── ČÁST 5 ────────────────────────────────────────────────────────────
 """<b>6. DALŠÍ ZJIŠTĚNÍ</b>
 
-🟠 <b>P1</b> — V <code>ai-orchestration/prompts/</code> leží <b>dva</b> master prompty: nový <code>CASLAV_MASTER_v5_1.md</code> (29 KB) i starý <code>master_system_prompt.md</code> (3,7 KB, z 20. 8.). Není zřejmé, který se načítá — riziko, že běží starý.
+# P1 vyreseno 24.8. — stary master_system_prompt.md byl odstranen z disku.
 
 🟡 <b>P2</b> — <code>Cargo.toml.example</code> deklaruje verzi <code>5.0.0</code>, zatímco vše ostatní je v5.1.
 
