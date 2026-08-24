@@ -620,7 +620,7 @@ async fn process_ws_message(
                         let q_active = AvellanedaStoikovModel::calculate_active_inventory(
                             total_btc,
                             locked_btc,
-                            conf.inventory.min_inventory_btc,
+                            conf.inventory.target_inventory_btc,
                         );
                         let sigma = atr.current_atr();
                         let as_quote = as_model.compute_quotes(price, q_active, sigma);
@@ -1016,7 +1016,7 @@ async fn process_ws_message(
                                 let q_active = AvellanedaStoikovModel::calculate_active_inventory(
                                     total_btc,
                                     locked_btc,
-                                    conf.inventory.min_inventory_btc,
+                                    conf.inventory.target_inventory_btc,
                                 );
                                 let sigma = atr.current_atr();
                                 let as_quote = as_model.compute_quotes(mid, q_active, sigma);
@@ -1097,7 +1097,7 @@ async fn process_ws_message(
                                 let q_active = AvellanedaStoikovModel::calculate_active_inventory(
                                     total_btc,
                                     locked_btc,
-                                    conf.inventory.min_inventory_btc,
+                                    conf.inventory.target_inventory_btc,
                                 );
                                 let sigma = atr.current_atr();
                                 let as_quote = as_model.compute_quotes(price, q_active, sigma);

@@ -56,12 +56,15 @@ pub struct InventoryConfig {
     pub min_inventory_btc: f64,
     #[serde(default = "default_max_inventory_btc")]
     pub max_inventory_btc: f64,
+    #[serde(default = "default_target_inventory_btc")]
+    pub target_inventory_btc: f64,
     #[serde(default = "default_true")]
     pub use_dynamic_inventory: bool,
 }
 
 fn default_min_inventory_btc() -> f64 { 0.0001 }
 fn default_max_inventory_btc() -> f64 { 0.05 }
+fn default_target_inventory_btc() -> f64 { 0.01 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RiskConfig {
@@ -265,6 +268,7 @@ impl StrategyConfig {
                 inventory: InventoryConfig {
                     min_inventory_btc: 0.0001,
                     max_inventory_btc: 0.05,
+                    target_inventory_btc: 0.01,
                     use_dynamic_inventory: true,
                 },
                 risk_management: RiskConfig {

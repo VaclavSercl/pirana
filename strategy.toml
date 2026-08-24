@@ -26,6 +26,7 @@ min_confidence_score = 0.95
 [inventory]
 min_inventory_btc = 0.0001
 max_inventory_btc = 0.05
+target_inventory_btc = 0.01
 use_dynamic_inventory = true
 
 [risk_management]
