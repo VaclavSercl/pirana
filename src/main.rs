@@ -1354,22 +1354,39 @@ async fn process_ws_message(
                                     // pozorovany 24. 8.: 11 350 zamitnuti, 2 h 15 min bez obchodu).
                                     risk_engine.tick_mode();
 
-                                    match governance.apply_governance(&sig, risk_engine.mode()) {
-                                        Ok(GovernanceResult::Approved) => {}
-                                        Ok(GovernanceResult::Denied { reason }) => {
-                                            tracing::warn!("Signal denied by Governance: {}", reason);
-                                            state.add_signal(signal_view);
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Governance error: {}", e);
-                                            state.add_signal(signal_view);
-                                            return;
+                                    // Paper trading v Halted rezimu OBCHAZI governance.
+                                    //
+                                    // Governance je brana pro REALNE ordery. Paper obchod
+                                    // zadny order na burzu neposila, takze nema co porusit.
+                                    //
+                                    // Bez tohoto obchvatu vznika tentyz deadlock jako
+                                    // 24. 8. v Defensive, ale HORSI: governance zamitne
+                                    // v Halted vsechny signaly (governance.rs:34-38) jeste
+                                    // pred paper vetvi, takze paper recovery (5 vyher ->
+                                    // Active, engine.rs:700) se nikdy nespusti. A Halted
+                                    // nema zadny cooldown jako Defensive — jedine ostatni
+                                    // cesty ven jsou resume(), ktery z produkce nikdo
+                                    // nevola, a restart procesu. System by tedy uvazl
+                                    // NATRVALO. Nalezeno oponenturou agy 24. 8.
+                                    let is_halted = risk_engine.mode() == SystemMode::Halted;
+
+                                    if !is_halted {
+                                        match governance.apply_governance(&sig, risk_engine.mode()) {
+                                            Ok(GovernanceResult::Approved) => {}
+                                            Ok(GovernanceResult::Denied { reason }) => {
+                                                tracing::warn!("Signal denied by Governance: {}", reason);
+                                                state.add_signal(signal_view);
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Governance error: {}", e);
+                                                state.add_signal(signal_view);
+                                                return;
+                                            }
                                         }
                                     }
 
                                     // 2. Evaluate in Risk Engine
-                                    let is_halted = risk_engine.mode() == SystemMode::Halted;
 
                                     if is_halted {
                                         // Paper trading in Halted mode!
@@ -1671,22 +1688,39 @@ async fn process_ws_message(
                                     // pozorovany 24. 8.: 11 350 zamitnuti, 2 h 15 min bez obchodu).
                                     risk_engine.tick_mode();
 
-                                    match governance.apply_governance(&sig, risk_engine.mode()) {
-                                        Ok(GovernanceResult::Approved) => {}
-                                        Ok(GovernanceResult::Denied { reason }) => {
-                                            tracing::warn!("Signal denied by Governance: {}", reason);
-                                            state.add_signal(signal_view);
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Governance error: {}", e);
-                                            state.add_signal(signal_view);
-                                            return;
+                                    // Paper trading v Halted rezimu OBCHAZI governance.
+                                    //
+                                    // Governance je brana pro REALNE ordery. Paper obchod
+                                    // zadny order na burzu neposila, takze nema co porusit.
+                                    //
+                                    // Bez tohoto obchvatu vznika tentyz deadlock jako
+                                    // 24. 8. v Defensive, ale HORSI: governance zamitne
+                                    // v Halted vsechny signaly (governance.rs:34-38) jeste
+                                    // pred paper vetvi, takze paper recovery (5 vyher ->
+                                    // Active, engine.rs:700) se nikdy nespusti. A Halted
+                                    // nema zadny cooldown jako Defensive — jedine ostatni
+                                    // cesty ven jsou resume(), ktery z produkce nikdo
+                                    // nevola, a restart procesu. System by tedy uvazl
+                                    // NATRVALO. Nalezeno oponenturou agy 24. 8.
+                                    let is_halted = risk_engine.mode() == SystemMode::Halted;
+
+                                    if !is_halted {
+                                        match governance.apply_governance(&sig, risk_engine.mode()) {
+                                            Ok(GovernanceResult::Approved) => {}
+                                            Ok(GovernanceResult::Denied { reason }) => {
+                                                tracing::warn!("Signal denied by Governance: {}", reason);
+                                                state.add_signal(signal_view);
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Governance error: {}", e);
+                                                state.add_signal(signal_view);
+                                                return;
+                                            }
                                         }
                                     }
 
                                     // 2. Evaluate in Risk Engine
-                                    let is_halted = risk_engine.mode() == SystemMode::Halted;
 
                                     if is_halted {
                                         // Paper trading in Halted mode!

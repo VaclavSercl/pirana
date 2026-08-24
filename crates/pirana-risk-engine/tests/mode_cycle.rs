@@ -281,3 +281,122 @@ fn tick_mode_does_not_release_before_cooldown() {
     }
     assert_eq!(engine.mode(), SystemMode::Defensive);
 }
+
+/// Hot loop PO oprave deadlocku v Halted: governance se pri Halted preskoci,
+/// protoze paper obchod neposila zadny order na burzu.
+/// Vraci `true`, pokud se rizeni dostalo za governance k risk enginu.
+fn hot_loop_step_v2(engine: &RiskEngine, gov: &GovernanceEngine, sig: &Signal) -> bool {
+    engine.tick_mode();
+
+    let is_halted = engine.mode() == SystemMode::Halted;
+    if !is_halted {
+        match gov.apply_governance(sig, engine.mode()) {
+            Ok(GovernanceResult::Approved) => {}
+            _ => return false,
+        }
+    }
+    true // v Halted pokracuje paper vetev, jinak realna
+}
+
+/// Dostane engine do Halted pres 10 ztrat (2x prah).
+fn drive_into_halted(engine: &RiskEngine, sig: &Signal) {
+    for _ in 0..10 {
+        engine.record_trade_result(-1.0);
+    }
+    let _ = engine.evaluate_trade(sig, PRICE);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  REGRESE: tentyz deadlock v HALTED rezimu (nalez oponentury agy)
+//
+//  Governance zamitne v Halted VSECHNY signaly (governance.rs:34-38) jeste
+//  pred paper vetvi. Paper recovery (5 vyher -> Active, engine.rs:700) se
+//  tedy nikdy nespusti. A na rozdil od Defensive nema Halted zadny cooldown:
+//    - resume()        z produkcniho kodu nikdo nevola (mrtvy kod)
+//    - API endpoint    neexistuje
+//    - cooldown        neni
+//  System by uvazl NATRVALO, jedine vychodisko byl restart procesu.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn halted_blocks_paper_recovery_before_fix() {
+    // Dukaz vady: puvodni smycka nepusti v Halted nic, ani paper obchod.
+    let engine = RiskEngine::new(400.0);
+    engine.activate();
+    let gov = GovernanceEngine::new();
+    let sig = make_signal(SignalType::DistributionExit);
+
+    drive_into_halted(&engine, &sig);
+    assert_eq!(engine.mode(), SystemMode::Halted, "10 ztrat musi vest do Halted");
+
+    for i in 0..50 {
+        assert!(
+            !hot_loop_step_broken(&engine, &gov, &sig),
+            "pruchod {i}: puvodni smycka v Halted nepusti nic — paper recovery je mrtva"
+        );
+    }
+    assert_eq!(engine.mode(), SystemMode::Halted, "system uvazl natrvalo");
+}
+
+#[test]
+fn halted_allows_paper_after_fix() {
+    // Po oprave se rizeni dostane az k paper vetvi.
+    let engine = RiskEngine::new(400.0);
+    engine.activate();
+    let gov = GovernanceEngine::new();
+    let sig = make_signal(SignalType::DistributionExit);
+
+    drive_into_halted(&engine, &sig);
+    assert_eq!(engine.mode(), SystemMode::Halted);
+
+    assert!(
+        hot_loop_step_v2(&engine, &gov, &sig),
+        "opravena smycka musi v Halted pustit rizeni k paper vetvi"
+    );
+}
+
+#[test]
+fn paper_wins_recover_from_halted() {
+    // Cela cesta ven: Halted -> 5 ziskovych paper obchodu -> Active.
+    let engine = RiskEngine::new(400.0);
+    engine.activate();
+    let gov = GovernanceEngine::new();
+    let sig = make_signal(SignalType::DistributionExit);
+
+    drive_into_halted(&engine, &sig);
+    assert_eq!(engine.mode(), SystemMode::Halted);
+
+    for i in 1..=5 {
+        assert!(
+            hot_loop_step_v2(&engine, &gov, &sig),
+            "paper obchod {i} se musi dostat k enginu"
+        );
+        engine.record_paper_trade_result(1.0);
+    }
+
+    assert_eq!(
+        engine.mode(),
+        SystemMode::Active,
+        "5 ziskovych paper obchodu musi system obnovit (mode={:?} losses={})",
+        engine.mode(),
+        engine.debug_losses()
+    );
+}
+
+#[test]
+fn fix_does_not_weaken_defensive_gate() {
+    // Pojistka: obchvat governance plati JEN pro Halted.
+    // V Defensive musi realny obchodni signal dal narazit.
+    let engine = RiskEngine::new(400.0);
+    engine.activate();
+    let gov = GovernanceEngine::new();
+    let sig = make_signal(SignalType::DistributionExit);
+
+    drive_into_defensive(&engine, &sig);
+    assert_eq!(engine.mode(), SystemMode::Defensive);
+
+    assert!(
+        !hot_loop_step_v2(&engine, &gov, &sig),
+        "v Defensive musi governance obchodni signal zamitnout i po oprave"
+    );
+}
