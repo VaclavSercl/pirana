@@ -58,6 +58,14 @@ pub struct InventoryConfig {
     pub max_inventory_btc: f64,
     #[serde(default = "default_target_inventory_btc")]
     pub target_inventory_btc: f64,
+    /// Cilovy podil obchodovatelne equity drzeny v BTC (v procentech).
+    ///
+    /// Nahrazuje pevnou konstantu `target_inventory_btc`, ktera pri malem
+    /// uctu prekracovala 100 % kapitalu a nutila bota skoupit celou penezenku.
+    /// Je-li 0 nebo zaporne, pouzije se zpetne kompatibilni
+    /// `target_inventory_btc`.
+    #[serde(default = "default_target_inventory_pct")]
+    pub target_inventory_pct: f64,
     #[serde(default = "default_true")]
     pub use_dynamic_inventory: bool,
 }
@@ -65,6 +73,7 @@ pub struct InventoryConfig {
 fn default_min_inventory_btc() -> f64 { 0.0001 }
 fn default_max_inventory_btc() -> f64 { 0.05 }
 fn default_target_inventory_btc() -> f64 { 0.01 }
+fn default_target_inventory_pct() -> f64 { 30.0 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RiskConfig {
@@ -269,6 +278,7 @@ impl StrategyConfig {
                     min_inventory_btc: 0.0001,
                     max_inventory_btc: 0.05,
                     target_inventory_btc: 0.01,
+                    target_inventory_pct: 30.0,
                     use_dynamic_inventory: true,
                 },
                 risk_management: RiskConfig {

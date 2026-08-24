@@ -26,6 +26,33 @@ min_confidence_score = 0.95
 [inventory]
 min_inventory_btc = 0.0001
 max_inventory_btc = 0.05
+# Cilovy inventar: PODIL obchodovatelne equity drzeny v BTC (v procentech).
+#
+# ZMENA 24. 8. 2026 — pevna konstanta vysala celou penezenku
+# ------------------------------------------------------------------
+# Drive platilo target_inventory_btc = 0.01 (pevne cislo v BTC).
+# Pri cene 77 978 USD to bylo 779,78 USD = 196 % cele equity (396,96 USD).
+#
+# Avellaneda-Stoikov pocita q = (btc - trezor) - target. Kdyz je cil vetsi
+# nez cely kapital, zustava q trvale zaporne, coz naklani kotace k nakupu.
+# Bot proto nakupoval, dokud nevycerpal fiat na 0,29 USD a burza nezacala
+# odmitat objednavky: error 10001 "not enough exchange balance".
+#
+# Alokace se posunula z rannich 8,7 % BTC na 99,9 % za jedno dopoledne.
+# To NENI akumulace ze zisku — tu obstarava [profit_skimmer] (10 % z PnL).
+# Tohle byla konverze celeho kapitalu, ktera bota pripravila o schopnost
+# nakupovat. Market making potrebuje obe strany.
+#
+# Nove je cil PODIL equity, takze se sam prizpusobi velikosti uctu i cene.
+# Trezor se do equity nepocita, takze nastradane satoshi cil nezvysuji
+# a akumulace ze zisku bezi nezavisle na tomto nastaveni.
+#
+#   30 % pri equity 397 USD -> target 0,001527 BTC (119 USD)
+#                              fiat zbyva 278 USD na nakupy
+#
+# target_inventory_btc nize zustava jen jako zaloha pro pripad,
+# ze by target_inventory_pct bylo 0 nebo zaporne.
+target_inventory_pct = 30.0
 target_inventory_btc = 0.01
 use_dynamic_inventory = true
 

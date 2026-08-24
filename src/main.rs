@@ -657,10 +657,25 @@ async fn process_ws_message(
                         } else {
                             0.0
                         };
+                        // Cilovy inventar jako PODIL equity, ne pevna konstanta.
+                        // Pevnych 0,01 BTC bylo pri cene 78k = 196 % kapitalu, takze
+                        // q zustavalo trvale zaporne a bot nakupoval, dokud 24. 8.
+                        // nevycerpal fiat na 0,29 USD (error 10001 od burzy).
+                        let target_btc = if conf.inventory.target_inventory_pct > 0.0 {
+                            AvellanedaStoikovModel::target_inventory_from_equity(
+                                total_btc,
+                                locked_btc,
+                                *state.usd_balance.read(),
+                                price,
+                                conf.inventory.target_inventory_pct,
+                            )
+                        } else {
+                            conf.inventory.target_inventory_btc
+                        };
                         let q_active = AvellanedaStoikovModel::calculate_active_inventory(
                             total_btc,
                             locked_btc,
-                            conf.inventory.target_inventory_btc,
+                            target_btc,
                         );
                         let sigma = atr.current_atr();
                         let as_quote = as_model.compute_quotes(price, q_active, sigma);
@@ -1070,10 +1085,25 @@ async fn process_ws_message(
                                 } else {
                                     0.0
                                 };
+                                // Cilovy inventar jako PODIL equity, ne pevna konstanta.
+                                // Pevnych 0,01 BTC bylo pri cene 78k = 196 % kapitalu, takze
+                                // q zustavalo trvale zaporne a bot nakupoval, dokud 24. 8.
+                                // nevycerpal fiat na 0,29 USD (error 10001 od burzy).
+                                let target_btc = if conf.inventory.target_inventory_pct > 0.0 {
+                                    AvellanedaStoikovModel::target_inventory_from_equity(
+                                        total_btc,
+                                        locked_btc,
+                                        *state.usd_balance.read(),
+                                        mid,
+                                        conf.inventory.target_inventory_pct,
+                                    )
+                                } else {
+                                    conf.inventory.target_inventory_btc
+                                };
                                 let q_active = AvellanedaStoikovModel::calculate_active_inventory(
                                     total_btc,
                                     locked_btc,
-                                    conf.inventory.target_inventory_btc,
+                                    target_btc,
                                 );
                                 let sigma = atr.current_atr();
                                 let as_quote = as_model.compute_quotes(mid, q_active, sigma);
@@ -1151,10 +1181,25 @@ async fn process_ws_message(
                                     0.0
                                 };
                                 let current_btc = pirana_core::reconciliation::BalanceReconciliation::calculate_tradable_margin(total_btc, locked_btc);
+                                // Cilovy inventar jako PODIL equity, ne pevna konstanta.
+                                // Pevnych 0,01 BTC bylo pri cene 78k = 196 % kapitalu, takze
+                                // q zustavalo trvale zaporne a bot nakupoval, dokud 24. 8.
+                                // nevycerpal fiat na 0,29 USD (error 10001 od burzy).
+                                let target_btc = if conf.inventory.target_inventory_pct > 0.0 {
+                                    AvellanedaStoikovModel::target_inventory_from_equity(
+                                        total_btc,
+                                        locked_btc,
+                                        *state.usd_balance.read(),
+                                        price,
+                                        conf.inventory.target_inventory_pct,
+                                    )
+                                } else {
+                                    conf.inventory.target_inventory_btc
+                                };
                                 let q_active = AvellanedaStoikovModel::calculate_active_inventory(
                                     total_btc,
                                     locked_btc,
-                                    conf.inventory.target_inventory_btc,
+                                    target_btc,
                                 );
                                 let sigma = atr.current_atr();
                                 let as_quote = as_model.compute_quotes(price, q_active, sigma);

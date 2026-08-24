@@ -88,6 +88,66 @@ impl AvellanedaStoikovModel {
         )
     }
 
+    /// Cilovy inventar odvozeny z EQUITY, nikoli pevna konstanta v BTC.
+    ///
+    /// ## Proc
+    ///
+    /// `target_inventory_btc = 0.01` je pevne cislo. Pri cene 77 978 USD to
+    /// bylo 779,78 USD, tedy **196 % cele equity** (396,96 USD). Model tim
+    /// dostal nesplnitelny cil: `q = btc - target` zustavalo trvale zaporne,
+    /// coz naklani kotace k nakupu — a bot nakupoval, dokud 24. 8. nevycerpal
+    /// fiat na 0,29 USD a burza nezacala odmitat objednavky
+    /// (`error 10001: not enough exchange balance`).
+    ///
+    /// Alokace se timto zpusobem posunula z rannich 8,7 % BTC na 99,9 %.
+    /// To nebyla akumulace ze zisku (od te je profit_skimmer, 10 % z PnL),
+    /// ale konverze celeho kapitalu.
+    ///
+    /// ## Jak
+    ///
+    /// Cil je PODIL obchodovatelne equity, takze se sam prizpusobi velikosti
+    /// uctu i cene BTC. Trezor (`locked_btc_reserve`) se do equity nepocita —
+    /// nastradane satoshi tedy cil nezvysuji a akumulace bezi nezavisle.
+    ///
+    /// ```text
+    ///   tradable_equity = (total_btc - locked) * price + usd
+    ///   target_btc      = tradable_equity * pct / 100 / price
+    /// ```
+    ///
+    /// Pri `pct = 30` a equity 397 USD vyjde target 0,001527 BTC (119 USD)
+    /// a botovi zbyva 278 USD na nakupy — market making funguje obema smery.
+    #[inline]
+    pub fn target_inventory_from_equity(
+        total_btc: f64,
+        locked_btc_reserve: f64,
+        usd_balance: f64,
+        price: f64,
+        target_pct: f64,
+    ) -> f64 {
+        if !price.is_finite() || price <= 0.0 {
+            return 0.0;
+        }
+        let pct = if target_pct.is_finite() {
+            target_pct.clamp(0.0, 100.0)
+        } else {
+            return 0.0;
+        };
+        let btc = if total_btc.is_finite() { total_btc.max(0.0) } else { 0.0 };
+        let locked = if locked_btc_reserve.is_finite() {
+            locked_btc_reserve.max(0.0)
+        } else {
+            0.0
+        };
+        let usd = if usd_balance.is_finite() { usd_balance.max(0.0) } else { 0.0 };
+
+        let tradable_equity = (btc - locked).max(0.0) * price + usd;
+        if !tradable_equity.is_finite() || tradable_equity <= 0.0 {
+            return 0.0;
+        }
+        let target = tradable_equity * (pct / 100.0) / price;
+        if target.is_finite() { target.max(0.0) } else { 0.0 }
+    }
+
     /// STRIKTNÍ INVARIANT: Inventář 'q' MUSÍ být počítán výhradně z obchodovatelného zůstatku:
     /// let q_active = (total_btc - locked_btc_reserve).max(0.0) - target_inventory_btc;
     ///
@@ -359,5 +419,111 @@ mod tests {
         let buy_mult2 = model.calculate_inventory_skew_multiplier(r_deficit, mid, Side::Buy);
         assert!(buy_mult2 > 1.0, "BTC deficit should boost BUY size");
         assert!(sell_mult2 < 1.0, "BTC deficit should reduce SELL size");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  REGRESE 24. 8. 2026: pevny target vysal celou penezenku
+    //
+    //  target_inventory_btc = 0.01 bylo pri cene 77 978 USD rovno 779,78 USD,
+    //  tedy 196 % equity (396,96 USD). q zustavalo trvale zaporne, model
+    //  tlacil na nakup a bot skoncil s 99,9 % v BTC a 0,29 USD fiatu.
+    //  Burza pak odmitala objednavky: error 10001 not enough exchange balance.
+    // ═══════════════════════════════════════════════════════════════════
+
+    const PX: f64 = 77_978.0;
+
+    #[test]
+    fn regression_fixed_target_exceeded_whole_equity() {
+        // Realny stav z 24. 8. 12:32.
+        let btc = 0.005087;
+        let usd = 0.29;
+        let equity = btc * PX + usd;
+
+        // PUVODNI chovani: pevny cil 0,01 BTC
+        let old_target = 0.01;
+        assert!(
+            old_target * PX > equity,
+            "pevny cil {:.2} USD prekracoval celou equity {:.2} USD",
+            old_target * PX,
+            equity
+        );
+        let q_old = AvellanedaStoikovModel::calculate_active_inventory(btc, 0.0, old_target);
+        assert!(q_old < 0.0, "q bylo zaporne ({q_old:.6}) -> trvaly tlak na nakup");
+
+        // NOVE chovani: 30 % equity
+        let new_target =
+            AvellanedaStoikovModel::target_inventory_from_equity(btc, 0.0, usd, PX, 30.0);
+        assert!(
+            new_target * PX < equity,
+            "novy cil {:.2} USD musi byt pod equity {:.2} USD",
+            new_target * PX,
+            equity
+        );
+        // Bot uz ma BTC vic nez cil -> q kladne -> bude PRODAVAT, ne kupovat.
+        let q_new = AvellanedaStoikovModel::calculate_active_inventory(btc, 0.0, new_target);
+        assert!(
+            q_new > 0.0,
+            "pri 99,9 % v BTC musi byt q kladne (je {q_new:.6}) -> tlak na prodej"
+        );
+    }
+
+    #[test]
+    fn target_is_share_of_equity() {
+        // 50 % z equity 1000 USD pri cene 100 000 = 500 USD = 0,005 BTC
+        let btc = 0.005; // 500 USD
+        let usd = 500.0;
+        let t = AvellanedaStoikovModel::target_inventory_from_equity(btc, 0.0, usd, 100_000.0, 50.0);
+        assert!((t - 0.005).abs() < 1e-9, "ocekavano 0.005, dostal jsem {t}");
+    }
+
+    #[test]
+    fn vault_is_excluded_from_target() {
+        // Trezor nesmi cil zvysovat — jinak by nastradane sats nutily
+        // bota kupovat jeste vic.
+        let locked = 0.002;
+        let with_vault =
+            AvellanedaStoikovModel::target_inventory_from_equity(0.005, locked, 100.0, PX, 30.0);
+        let without =
+            AvellanedaStoikovModel::target_inventory_from_equity(0.003, 0.0, 100.0, PX, 30.0);
+        assert!(
+            (with_vault - without).abs() < 1e-12,
+            "trezor musi byt z equity vylouceny: {with_vault} vs {without}"
+        );
+    }
+
+    #[test]
+    fn target_scales_with_price() {
+        // Pri dvojnasobne cene je stejny podil equity polovicni mnozstvi BTC.
+        let a = AvellanedaStoikovModel::target_inventory_from_equity(0.0, 0.0, 1000.0, 50_000.0, 40.0);
+        let b = AvellanedaStoikovModel::target_inventory_from_equity(0.0, 0.0, 1000.0, 100_000.0, 40.0);
+        assert!((a - 2.0 * b).abs() < 1e-9, "a={a} b={b}");
+    }
+
+    #[test]
+    fn target_rejects_garbage() {
+        for (btc, locked, usd, px, pct) in [
+            (f64::NAN, 0.0, 100.0, PX, 30.0),
+            (0.005, f64::NAN, 100.0, PX, 30.0),
+            (0.005, 0.0, f64::NAN, PX, 30.0),
+            (0.005, 0.0, 100.0, 0.0, 30.0),
+            (0.005, 0.0, 100.0, -1.0, 30.0),
+            (0.005, 0.0, 100.0, PX, f64::NAN),
+        ] {
+            let t = AvellanedaStoikovModel::target_inventory_from_equity(btc, locked, usd, px, pct);
+            assert!(t.is_finite() && t >= 0.0, "nesmyslny vstup dal {t}");
+        }
+    }
+
+    #[test]
+    fn target_pct_is_clamped() {
+        // Nad 100 % by cil prekrocil kapital — presne ta puvodni vada.
+        let t = AvellanedaStoikovModel::target_inventory_from_equity(0.0, 0.0, 1000.0, 100_000.0, 500.0);
+        assert!((t - 0.01).abs() < 1e-9, "500 % se musi oriznout na 100 %, dostal jsem {t}");
+    }
+
+    #[test]
+    fn zero_equity_yields_zero_target() {
+        let t = AvellanedaStoikovModel::target_inventory_from_equity(0.0, 0.0, 0.0, PX, 30.0);
+        assert_eq!(t, 0.0);
     }
 }
