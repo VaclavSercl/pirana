@@ -345,6 +345,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let state_for_reconciliation = state.clone();
     let positions_for_reconciliation = active_positions.clone();
     let risk_engine_for_reconciliation = risk_engine.clone();
+    // Pro srovnani expozice se skutecnymi pozicemi v rekonciliacni smycce.
+    let active_positions_for_recon = active_positions.clone();
     tokio::spawn(async move {
         // [CASLAV v5.1] Citac ticku pro kadenci rekalibrace.
         // Rekonciliace bezi kazdych 15 s; rekalibrace 1x za 60 ticku = 15 min.
@@ -419,6 +421,32 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     // pri malem vzorku jen debug hlaska a puvodni stav zustava.
                     if tick % RECALIBRATION_EVERY_N_TICKS == 0 && btc_price > 0.0 {
                         let equity_usd = new_btc * btc_price + new_usd;
+
+                        // Srovnat agregatni expozici se SKUTECNYMI pozicemi.
+                        // update_exposure je pouhy akumulator (+x / -x); kazdy
+                        // neuplny rollback nebo pad procesu mezi obema volanimi
+                        // nechá citac nafouknuty. 24. 8. pozorovano
+                        // exposure_pct = 26,42 pri NULA otevrenych pozicich.
+                        if equity_usd > 0.0 {
+                            let notional: f64 = active_positions_for_recon
+                                .read()
+                                .iter()
+                                .map(|p| p.quantity.abs() * btc_price)
+                                .sum();
+                            let actual = (notional / equity_usd).clamp(0.0, 10.0);
+                            if let Some(drift) = risk_engine_for_reconciliation
+                                .sync_exposure_from_positions(actual)
+                            {
+                                warn!(
+                                    "Expozice srovnana: drift {:+.4} -> skutecnych {:.4} \
+                                     ({} otevrenych pozic)",
+                                    drift,
+                                    actual,
+                                    active_positions_for_recon.read().len()
+                                );
+                            }
+                        }
+
                         risk_engine_for_reconciliation.recalibrate_and_log(equity_usd, btc_price);
 
                         // Publikace kalibrovaneho stavu do dashboardu (/api/risk_state).
@@ -1319,6 +1347,13 @@ async fn process_ws_message(
 
                                     // 1b. Governance gate — system-mode-aware policy enforcement
                                     // (Halted → no signals; Defensive → only Hold/DefensiveHalt pass)
+                                    // Vyhodnotit casove prechody stavu PRED governance.
+                                    // Governance pri Defensive zamitne signal returnem a
+                                    // evaluate_trade se pak nezavola — kdyby cooldown zustal
+                                    // jen tam, system by z Defensive nikdy nevysel (deadlock
+                                    // pozorovany 24. 8.: 11 350 zamitnuti, 2 h 15 min bez obchodu).
+                                    risk_engine.tick_mode();
+
                                     match governance.apply_governance(&sig, risk_engine.mode()) {
                                         Ok(GovernanceResult::Approved) => {}
                                         Ok(GovernanceResult::Denied { reason }) => {
@@ -1629,6 +1664,13 @@ async fn process_ws_message(
 
                                     // 1b. Governance gate — system-mode-aware policy enforcement
                                     // (Halted → no signals; Defensive → only Hold/DefensiveHalt pass)
+                                    // Vyhodnotit casove prechody stavu PRED governance.
+                                    // Governance pri Defensive zamitne signal returnem a
+                                    // evaluate_trade se pak nezavola — kdyby cooldown zustal
+                                    // jen tam, system by z Defensive nikdy nevysel (deadlock
+                                    // pozorovany 24. 8.: 11 350 zamitnuti, 2 h 15 min bez obchodu).
+                                    risk_engine.tick_mode();
+
                                     match governance.apply_governance(&sig, risk_engine.mode()) {
                                         Ok(GovernanceResult::Approved) => {}
                                         Ok(GovernanceResult::Denied { reason }) => {

@@ -352,6 +352,58 @@ impl RiskEngine {
     }
 
     /// Activate the risk engine (transition from Initializing to Active)
+    /// Vyhodnoti casove prechody stavu NEZAVISLE na `evaluate_trade`.
+    ///
+    /// ## Proc existuje
+    ///
+    /// Governance (`main.rs`) cte `mode()` a pri `Defensive` zamitne signal
+    /// jeste PRED tim, nez se `evaluate_trade` zavola. Jenze jedina cesta
+    /// zpet do `Active` byla uvnitr `evaluate_trade`. Vznikl deadlock:
+    ///
+    /// ```text
+    ///   Defensive -> governance zamitne -> evaluate_trade se nezavola
+    ///             -> cooldown se nevyhodnoti -> zustava Defensive
+    /// ```
+    ///
+    /// Realne pozorovano 24. 8.: 11 350 zamitnutych signalu, bot nestrilel
+    /// 2 h 15 min pri win rate 66,7 % a kladnem dennim PnL.
+    ///
+    /// Tato metoda se vola z hot loopu pred governance, takze cooldown
+    /// probehne i kdyz zadny obchod neprojde.
+    ///
+    /// Vraci `true`, pokud doslo ke zmene rezimu.
+    pub fn tick_mode(&self) -> bool {
+        let mut state = self.state.write();
+        if state.mode != SystemMode::Defensive || state.defensive_since <= 0 {
+            return false;
+        }
+        let elapsed = chrono::Utc::now().timestamp() - state.defensive_since;
+        if elapsed < DEFENSIVE_COOLDOWN_SECS {
+            return false;
+        }
+        info!(
+            "Risk Engine: DEFENSIVE -> ACTIVE (cooldown {} min uplynul, \
+             consecutive_losses {} -> 0)",
+            DEFENSIVE_COOLDOWN_SECS / 60,
+            state.consecutive_losses
+        );
+        state.mode = SystemMode::Active;
+        state.consecutive_losses = 0;
+        state.defensive_since = 0;
+        true
+    }
+
+    /// Kolik sekund uz system stravil v Defensive rezimu (0 = neni v nem).
+    /// Pro dashboard a diagnostiku — bez teto viditelnosti se deadlock
+    /// 24. 8. projevil az po dvou hodinach.
+    pub fn defensive_elapsed_secs(&self) -> i64 {
+        let state = self.state.read();
+        if state.mode != SystemMode::Defensive || state.defensive_since <= 0 {
+            return 0;
+        }
+        (chrono::Utc::now().timestamp() - state.defensive_since).max(0)
+    }
+
     pub fn activate(&self) {
         let mut state = self.state.write();
         state.mode = SystemMode::Active;
@@ -569,6 +621,11 @@ impl RiskEngine {
 
         if pnl < 0.0 {
             state.consecutive_losses += 1;
+            // Kazda dalsi ztrata v Defensive posouva casovac — cooldown meri
+            // dobu KLIDU, ne dobu od vstupu do rezimu. Deadlock 24. 8. nebyl
+            // timto zpusoben: system uvazl proto, ze governance zamitla signal
+            // driv, nez se evaluate_trade (a s nim cooldown) vubec zavolalo.
+            // Reseni je tick_mode() volany z hot loopu, ne vypnuti teto logiky.
             state.defensive_since = chrono::Utc::now().timestamp();
         } else {
             state.consecutive_losses = 0;
@@ -615,6 +672,38 @@ impl RiskEngine {
         } else {
             state.paper_consecutive_wins = 0;
             info!("Risk Engine [Paper]: Unprofitable paper trade recorded. Consecutive wins reset to 0.");
+        }
+    }
+
+    /// Synchronizuje agregatni expozici se SKUTECNYM stavem pozic.
+    ///
+    /// ## Proc existuje
+    ///
+    /// `update_exposure` je pouhy akumulator: `+x` pri otevreni, `-x` pri
+    /// uzavreni. Kazdy neuplny rollback, pad procesu mezi obema volanimi
+    /// nebo uzavreni jinou cestou nechá citac trvale nafouknuty. Nic ho
+    /// nikdy nesrovnalo s realitou.
+    ///
+    /// Pozorovano 24. 8.: `exposure_pct = 26,42` pri NULA otevrenych
+    /// pozicich. Falesna expozice zabira misto v limitu a dusi sizing.
+    ///
+    /// Vola se z rekonciliacni smycky (kazdych 15 s), kde uz jsou k dispozici
+    /// cerstve zustatky z burzy. `actual` je soucet notionalu otevrenych
+    /// pozic deleny equity — tedy skutecny podil kapitalu v trhu.
+    ///
+    /// Vraci `Some(drift)`, pokud byla odchylka vetsi nez 0,5 procentniho
+    /// bodu — volajici to ma zalogovat, aby drift nezustal neviditelny.
+    pub fn sync_exposure_from_positions(&self, actual: f64) -> Option<f64> {
+        if !actual.is_finite() || actual < 0.0 {
+            return None;
+        }
+        let mut state = self.state.write();
+        let drift = state.aggregate_exposure - actual;
+        state.aggregate_exposure = actual;
+        if drift.abs() > 0.005 {
+            Some(drift)
+        } else {
+            None
         }
     }
 
@@ -1185,5 +1274,130 @@ mod tests {
         assert!((reloaded.max_aggregate_exposure.value - MAX_AGGREGATE_EXPOSURE).abs() < 1e-12);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  REGRESE: deadlock Defensive (24. 8. 2026)
+    //
+    //  Governance cetla mode() a pri Defensive zamitla signal returnem,
+    //  takze evaluate_trade se nezavolalo. Jedina cesta zpet do Active
+    //  byla ale uvnitr evaluate_trade => system uvazl natrvalo.
+    //  Realny dopad: 11 350 zamitnutych signalu, 2 h 15 min bez obchodu
+    //  pri win rate 66,7 % a kladnem dennim PnL.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Pomocnik: dostane engine do Defensive s casovacem N sekund v minulosti.
+    fn engine_in_defensive(elapsed_secs: i64) -> RiskEngine {
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+        {
+            let mut st = engine.state.write();
+            st.mode = SystemMode::Defensive;
+            st.consecutive_losses = 5;
+            st.defensive_since = chrono::Utc::now().timestamp() - elapsed_secs;
+        }
+        engine
+    }
+
+    #[test]
+    fn tick_mode_releases_after_cooldown() {
+        // Cooldown uplynul -> musi se vratit do Active a vynulovat citac.
+        let engine = engine_in_defensive(DEFENSIVE_COOLDOWN_SECS + 1);
+        assert_eq!(engine.mode(), SystemMode::Defensive);
+
+        let changed = engine.tick_mode();
+
+        assert!(changed, "tick_mode mel ohlasit zmenu");
+        assert_eq!(engine.mode(), SystemMode::Active, "musi byt zpet v Active");
+        assert_eq!(
+            engine.state.read().consecutive_losses,
+            0,
+            "citac ztrat se musi vynulovat, jinak hned spadne zpet"
+        );
+    }
+
+    #[test]
+    fn tick_mode_holds_before_cooldown() {
+        // Cooldown jeste nevyprsel -> zadna zmena.
+        let engine = engine_in_defensive(DEFENSIVE_COOLDOWN_SECS - 60);
+        assert!(!engine.tick_mode(), "pred vyprsenim se nesmi nic zmenit");
+        assert_eq!(engine.mode(), SystemMode::Defensive);
+    }
+
+    #[test]
+    fn tick_mode_is_noop_when_active() {
+        let engine = RiskEngine::new(400.0);
+        engine.activate();
+        assert!(!engine.tick_mode());
+        assert_eq!(engine.mode(), SystemMode::Active);
+    }
+
+    #[test]
+    fn deadlock_is_broken_without_calling_evaluate_trade() {
+        // JADRO REGRESE: system se musi uvolnit i kdyz evaluate_trade
+        // NIKDY nedostane sanci se spustit (presne to delala governance).
+        let engine = engine_in_defensive(DEFENSIVE_COOLDOWN_SECS + 1);
+        assert_eq!(engine.mode(), SystemMode::Defensive);
+
+        engine.tick_mode(); // jedine volani, zadny evaluate_trade
+
+        assert_eq!(
+            engine.mode(),
+            SystemMode::Active,
+            "bez tick_mode by tu system uvazl navzdy"
+        );
+    }
+
+
+    #[test]
+    fn defensive_elapsed_reports_time() {
+        let engine = engine_in_defensive(300);
+        let e = engine.defensive_elapsed_secs();
+        assert!((295..=305).contains(&e), "ocekavano ~300 s, dostal jsem {e}");
+
+        let active = RiskEngine::new(400.0);
+        active.activate();
+        assert_eq!(active.defensive_elapsed_secs(), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  REGRESE: drift expozice (24. 8. 2026)
+    //  exposure_pct = 26,42 pri NULA otevrenych pozicich.
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn sync_exposure_corrects_drift() {
+        let engine = RiskEngine::new(400.0);
+        engine.update_exposure(0.2642); // nafouknuty citac
+
+        let drift = engine.sync_exposure_from_positions(0.0);
+
+        assert!(drift.is_some(), "drift 26 % musel byt ohlasen");
+        assert!((drift.unwrap() - 0.2642).abs() < 1e-9);
+        assert!(
+            engine.state.read().aggregate_exposure.abs() < 1e-9,
+            "expozice musi byt srovnana na nulu"
+        );
+    }
+
+    #[test]
+    fn sync_exposure_silent_when_matching() {
+        let engine = RiskEngine::new(400.0);
+        engine.update_exposure(0.10);
+        // Odchylka 0,1 p.b. je pod prahem hlaseni.
+        assert!(engine.sync_exposure_from_positions(0.101).is_none());
+    }
+
+    #[test]
+    fn sync_exposure_rejects_garbage() {
+        let engine = RiskEngine::new(400.0);
+        engine.update_exposure(0.5);
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(engine.sync_exposure_from_positions(bad).is_none());
+        }
+        assert!(
+            (engine.state.read().aggregate_exposure - 0.5).abs() < 1e-9,
+            "nesmyslny vstup nesmi expozici prepsat"
+        );
     }
 }

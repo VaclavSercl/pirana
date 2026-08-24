@@ -20,7 +20,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::trade_ledger::{ClosedTrade, OpenLot, TradeLedger};
 

@@ -264,6 +264,7 @@ impl TradeLedger {
     /// * `now_ts`      — unix timestamp.
     ///
     /// Vraci Some(ClosedTrade) pokud doslo k uzavreni round-tripu, jinak None.
+    #[allow(clippy::too_many_arguments)]
     pub fn process_fill(
         &mut self,
         side: pirana_core::types::Side,
