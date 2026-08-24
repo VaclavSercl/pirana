@@ -45,6 +45,7 @@
 //! o expozici jsou horsi nez jedna; mel nula volani zvenci.
 
 pub mod engine;
+pub mod ledger_persistence;
 pub mod limits;
 pub mod persistence;
 pub mod self_calibration;

@@ -25,6 +25,8 @@ use pirana_dashboard::state::DashboardState;
 use pirana_signal_validator::validator::{SignalValidator, ValidationResult};
 use pirana_signal_validator::governance::{GovernanceEngine, GovernanceResult};
 use pirana_risk_engine::engine::RiskEngine;
+use pirana_risk_engine::trade_ledger::TradeLedger;
+use pirana_risk_engine::ledger_persistence;
 use std::sync::Arc;
 use tracing::{info, error, warn};
 
@@ -320,6 +322,16 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         risk_state_path,
     );
     risk_engine.activate();
+
+    // [CASLAV v5.1 / PERSISTENCE] TradeLedger persistence + reconstruction
+    // TradeLedger se nacita ze snapshotu a doplnuje se gapem z burzy.
+    let mut ledger = TradeLedger::new();
+    if let Ok(Some(snapshot)) = ledger_persistence::load_snapshot() {
+        snapshot.apply_to_ledger(&mut ledger);
+        info!("TradeLedger nacten ze snapshotu: {} round-tripu", ledger.len());
+    } else {
+        info!("TradeLedger: zadny snapshot, start od nuly");
+    }
 
     let active_positions = Arc::new(parking_lot::RwLock::new(Vec::<ActivePosition>::new()));
 
@@ -829,6 +841,23 @@ async fn process_ws_message(
                                                     equity_usd,
                                                     vpin_now,
                                                 );
+                                            }
+
+                                            // [CASLAV v5.1 / PERSISTENCE] Append do JSONL logu.
+                                            {
+                                                let closed_trade = pirana_risk_engine::trade_ledger::ClosedTrade {
+                                                    pnl_sats: (pnl / fill_price) * 100_000_000.0,
+                                                    ts: chrono::Utc::now().timestamp(),
+                                                    vpin_at_close: *state_clone.vpin_score.read(),
+                                                    side: if pnl > 0.0 { Side::Buy } else { Side::Sell },
+                                                    fill_price,
+                                                    qty: filled_qty,
+                                                    fee_sats: 0.0,
+                                                    cid: format!("pirana_{}", chrono::Utc::now().timestamp()),
+                                                    order_id: 0,
+                                                    trade_id: 0,
+                                                };
+                                                let _ = ledger_persistence::append_trade(&closed_trade);
                                             }
 
                                             // Asymmetric BTC Profit Skimmer: Lock profit portion in BTC reserve

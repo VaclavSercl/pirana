@@ -47,6 +47,54 @@ pub struct OrderExecutionResult {
     pub raw: String,
 }
 
+/// Zaznam jednoho obchodu z Bitfinex API (pro gap reconstruction).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TradeRecord {
+    /// Execution timestamp (milisekundy).
+    pub mts: i64,
+    /// Executed amount (kladne = buy, zaporne = sell).
+    pub exec_amount: f64,
+    /// Execution price.
+    pub exec_price: f64,
+    /// Order ID.
+    pub order_id: i64,
+    /// Client Order ID (muze byt null).
+    pub cid: Option<String>,
+    /// Poplatek.
+    pub fee: f64,
+    /// Mena poplatku.
+    pub fee_currency: String,
+}
+
+impl TradeRecord {
+    /// Je to nas obchod? Filtruje podle cid prefixu.
+    pub fn is_ours(&self) -> bool {
+        self.cid
+            .as_deref()
+            .map(|c| c.starts_with("pirana_"))
+            .unwrap_or(false)
+    }
+
+    /// Strana obchodu (Buy = kladne, Sell = zaporne).
+    pub fn side(&self) -> pirana_core::types::Side {
+        if self.exec_amount > 0.0 {
+            pirana_core::types::Side::Buy
+        } else {
+            pirana_core::types::Side::Sell
+        }
+    }
+
+    /// Mnozstvi BTC (absolutni hodnota).
+    pub fn qty(&self) -> f64 {
+        self.exec_amount.abs()
+    }
+
+    /// Unix timestamp v sekundach.
+    pub fn ts(&self) -> i64 {
+        self.mts / 1000
+    }
+}
+
 impl BitfinexClient {
     /// Novy klient s VLASTNIM rozpoctem rate limitu.
     ///
@@ -378,6 +426,93 @@ impl BitfinexClient {
         }
 
         Ok(balances)
+    }
+
+    /// Stahne historii obchodu z Bitfinex pro gap reconstruction.
+    ///
+    /// * `symbol`  — napr. "tBTCUSD"
+    /// * `start`   — timestamp v milisekundach (MTS). Stahuje zaznamy s MTS >= start.
+    /// * `limit`   — pocet zaznamu (max 2500).
+    ///
+    /// Vraci vektor TradeRecord.
+    pub async fn get_trades_hist(
+        &self,
+        symbol: &str,
+        start: i64,
+        limit: i32,
+    ) -> PiranaResult<Vec<TradeRecord>> {
+        let nonce = self.next_nonce();
+        let endpoint = format!("/api/v2/auth/r/trades/{}/hist", symbol);
+        let body = format!(r#"{{"start":{},"limit":{}}}"#, start, limit);
+        let payload = format!("{}{}{}", endpoint, nonce, body);
+        let signature = self.sign(&payload);
+
+        let url = format!("{}/v2/auth/r/trades/{}/hist", self.base_url, symbol);
+
+        self.rate_limiter.acquire().await;
+        let response = self.client
+            .post(&url)
+            .header("bfx-apikey", &self.api_key)
+            .header("bfx-nonce", &nonce)
+            .header("bfx-signature", &signature)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| PiranaError::ExchangeApi {
+                code: -1,
+                message: format!("Trades history request failed: {}", e),
+            })?;
+
+        let status = response.status();
+        let text = response.text().await.map_err(|e| PiranaError::ExchangeApi {
+            code: -1,
+            message: format!("Trades history read failed: {}", e),
+        })?;
+
+        if status.as_u16() == 429 {
+            self.rate_limiter.record_rate_limited();
+            return Err(PiranaError::ExchangeApi {
+                code: 429,
+                message: "Rate limit hit on trades history".into(),
+            });
+        }
+        if !status.is_success() {
+            return Err(PiranaError::ExchangeApi {
+                code: status.as_u16() as i32,
+                message: format!("Trades history failed: {}", text),
+            });
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            PiranaError::ExchangeApi {
+                code: -1,
+                message: format!("Trades history parse failed: {}", e),
+            }
+        })?;
+
+        let mut records = Vec::new();
+        if let Some(arr) = json.as_array() {
+            for item in arr {
+                if let Some(t) = item.as_array() {
+                    if t.len() >= 12 {
+                        let record = TradeRecord {
+                            mts: t[2].as_i64().unwrap_or(0),
+                            exec_amount: t[4].as_f64().unwrap_or(0.0),
+                            exec_price: t[5].as_f64().unwrap_or(0.0),
+                            order_id: t[3].as_i64().unwrap_or(0),
+                            cid: t[11].as_i64().map(|c| c.to_string()),
+                            fee: t[9].as_f64().unwrap_or(0.0),
+                            fee_currency: t[10].as_str().unwrap_or("").to_string(),
+                        };
+                        records.push(record);
+                    }
+                }
+            }
+        }
+
+        self.rate_limiter.record_success();
+        Ok(records)
     }
 
     /// Get active open order IDs for a symbol (for orphan reconciliation)

@@ -39,7 +39,7 @@ pub const MIN_REALIZED_VOL_DAILY: f64 = 1e-4;
 pub const NEUTRAL_TOXIC_RATIO: f64 = 0.20;
 
 /// Jeden uzavreny round-trip.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClosedTrade {
     /// Realizovany PnL v satoshi (zaporny = ztrata).
     pub pnl_sats: f64,
@@ -47,6 +47,20 @@ pub struct ClosedTrade {
     pub ts: i64,
     /// VPIN namereny v okamziku uzavreni. 0.0 = nemereno.
     pub vpin_at_close: f64,
+    /// Strana, ktera uzavrela pozici (Buy = long close, Sell = short close).
+    pub side: pirana_core::types::Side,
+    /// Cena realneho fillu.
+    pub fill_price: f64,
+    /// Mnozstvi BTC.
+    pub qty: f64,
+    /// Poplatek v satoshi.
+    pub fee_sats: f64,
+    /// Client Order ID (pro deduplikaci a filtraci).
+    pub cid: String,
+    /// Bitfinex order ID.
+    pub order_id: i64,
+    /// Bitfinex trade ID.
+    pub trade_id: i64,
 }
 
 impl ClosedTrade {
@@ -55,10 +69,29 @@ impl ClosedTrade {
     }
 }
 
+/// Otevrena pozice (lot) pro FIFO matching.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpenLot {
+    /// Strana pozice (Buy = long, Sell = short).
+    pub side: pirana_core::types::Side,
+    /// Zbyvajici mnozstvi BTC k uzavreni.
+    pub remaining_btc: f64,
+    /// Cena otevreni.
+    pub price: f64,
+    /// Unix timestamp otevreni.
+    pub ts: i64,
+    /// Client Order ID.
+    pub cid: String,
+    /// Bitfinex order ID.
+    pub order_id: i64,
+}
+
 /// Ucetni kniha uzavrenych obchodu.
 #[derive(Debug)]
 pub struct TradeLedger {
     trades: VecDeque<ClosedTrade>,
+    /// Otevrene pozice pro FIFO matching.
+    open_lots: VecDeque<OpenLot>,
     /// Dokoncene denni vynosy jako podil kapitalu.
     daily_returns: VecDeque<f64>,
     /// EWMA denni volatility (RiskMetrics, lambda z self_calibration).
@@ -69,6 +102,8 @@ pub struct TradeLedger {
     day_start_equity_usd: f64,
     /// Kumulovany PnL rozpracovaneho dne (USD).
     day_pnl_usd: f64,
+    /// Posledni znamy timestamp pro gap reconstruction.
+    last_persisted_ts: i64,
 }
 
 impl Default for TradeLedger {
@@ -81,11 +116,13 @@ impl TradeLedger {
     pub fn new() -> Self {
         Self {
             trades: VecDeque::with_capacity(LEDGER_CAPACITY),
+            open_lots: VecDeque::with_capacity(LEDGER_CAPACITY / 10),
             daily_returns: VecDeque::with_capacity(MIN_COMPLETED_DAYS * 2),
             vol_ewma: 0.0,
             current_day: -1,
             day_start_equity_usd: 0.0,
             day_pnl_usd: 0.0,
+            last_persisted_ts: 0,
         }
     }
 
@@ -103,6 +140,66 @@ impl TradeLedger {
 
     pub fn vol_ewma(&self) -> f64 {
         self.vol_ewma
+    }
+
+    pub fn open_lots_count(&self) -> usize {
+        self.open_lots.len()
+    }
+
+    pub fn last_persisted_ts(&self) -> i64 {
+        self.last_persisted_ts
+    }
+
+    /// Nastavi timestamp posledniho persistovaneho stavu (pro gap reconstruction).
+    pub fn set_last_persisted_ts(&mut self, ts: i64) {
+        self.last_persisted_ts = ts;
+    }
+
+    /// Nastavi EWMA volatility (pro snapshot recovery).
+    pub fn set_vol_ewma(&mut self, vol: f64) {
+        self.vol_ewma = vol;
+    }
+
+    /// Nastavi denni vynosy (pro snapshot recovery).
+    pub fn set_daily_returns(&mut self, returns: Vec<f64>) {
+        self.daily_returns = returns.into();
+    }
+
+    /// Nastavi otevrene pozice (pro snapshot recovery).
+    pub fn set_open_lots(&mut self, lots: Vec<OpenLot>) {
+        self.open_lots = lots.into();
+    }
+
+    /// Nastavi denni stav (pro snapshot recovery).
+    pub fn set_day_state(&mut self, day: i64, start_equity: f64, pnl: f64) {
+        self.current_day = day;
+        self.day_start_equity_usd = start_equity;
+        self.day_pnl_usd = pnl;
+    }
+
+    /// Vrati denni vynosy (pro snapshot).
+    pub fn daily_returns(&self) -> &VecDeque<f64> {
+        &self.daily_returns
+    }
+
+    /// Vrati otevrene pozice (pro snapshot).
+    pub fn open_lots(&self) -> &VecDeque<OpenLot> {
+        &self.open_lots
+    }
+
+    /// Vrati equity na zacatku dne.
+    pub fn day_start_equity_usd(&self) -> f64 {
+        self.day_start_equity_usd
+    }
+
+    /// Vrati PnL dne.
+    pub fn day_pnl_usd(&self) -> f64 {
+        self.day_pnl_usd
+    }
+
+    /// Vrati aktualni den.
+    pub fn current_day(&self) -> i64 {
+        self.current_day
     }
 
     /// Zaznam UZAVRENEHO round-tripu po realnem fillu.
@@ -145,7 +242,110 @@ impl TradeLedger {
             pnl_sats,
             ts: now_ts,
             vpin_at_close: if vpin.is_finite() && vpin > 0.0 { vpin } else { 0.0 },
+            side: if pnl_usd > 0.0 { pirana_core::types::Side::Buy } else { pirana_core::types::Side::Sell },
+            fill_price,
+            qty: 0.0, // nezname, doplnime pozdeji
+            fee_sats: 0.0,
+            cid: String::new(),
+            order_id: 0,
+            trade_id: 0,
         });
+    }
+
+    /// Zaznam fillu pro FIFO matching (otevreni nebo uzavreni pozice).
+    ///
+    /// * `side`        — Buy = nakup (otevrena long nebo uzavrena short), Sell = prodej.
+    /// * `qty`         — mnozstvi BTC (kladne).
+    /// * `price`       — fill price.
+    /// * `fee_sats`    — poplatek v satoshi.
+    /// * `cid`         — Client Order ID.
+    /// * `order_id`    — Bitfinex order ID.
+    /// * `trade_id`    — Bitfinex trade ID.
+    /// * `now_ts`      — unix timestamp.
+    ///
+    /// Vraci Some(ClosedTrade) pokud doslo k uzavreni round-tripu, jinak None.
+    pub fn process_fill(
+        &mut self,
+        side: pirana_core::types::Side,
+        qty: f64,
+        price: f64,
+        fee_sats: f64,
+        cid: String,
+        order_id: i64,
+        trade_id: i64,
+        now_ts: i64,
+    ) -> Option<ClosedTrade> {
+        if !qty.is_finite() || qty <= 0.0 || !price.is_finite() || price <= 0.0 {
+            return None;
+        }
+
+        let mut remaining = qty;
+
+        // Zkusime uzavrit proti opacnym lotum (FIFO).
+        while remaining > 0.0 && !self.open_lots.is_empty() {
+            let front = self.open_lots.front_mut().unwrap();
+            if front.side == side {
+                // Stejna strana — neni co uzavirat.
+                break;
+            }
+
+            let match_qty = remaining.min(front.remaining_btc);
+            let pnl_usd = match side {
+                pirana_core::types::Side::Sell => {
+                    // Prodavame long pozici.
+                    (price - front.price) * match_qty
+                }
+                pirana_core::types::Side::Buy => {
+                    // Kupujeme zpet short pozici.
+                    (front.price - price) * match_qty
+                }
+            };
+
+            let pnl_sats = (pnl_usd / price) * SATS_PER_BTC;
+            remaining -= match_qty;
+            front.remaining_btc -= match_qty;
+
+            if front.remaining_btc <= 0.0 {
+                let closed_lot = self.open_lots.pop_front().unwrap();
+                // Round-trip uzavren.
+                let closed = ClosedTrade {
+                    pnl_sats,
+                    ts: now_ts,
+                    vpin_at_close: 0.0, // doplnime z dashboardu
+                    side,
+                    fill_price: price,
+                    qty: match_qty,
+                    fee_sats: (fee_sats / qty) * match_qty,
+                    cid: format!("{}->{}", closed_lot.cid, cid),
+                    order_id,
+                    trade_id,
+                };
+                self.record_closed_trade(closed.clone());
+                return Some(closed);
+            }
+        }
+
+        // Zbyly objem otevira novy lot.
+        if remaining > 0.0 {
+            self.open_lots.push_back(OpenLot {
+                side,
+                remaining_btc: remaining,
+                price,
+                ts: now_ts,
+                cid,
+                order_id,
+            });
+        }
+
+        None
+    }
+
+    /// Interni zapis uzavreneho round-tripu (bez duplikace logiky).
+    fn record_closed_trade(&mut self, trade: ClosedTrade) {
+        if self.trades.len() >= LEDGER_CAPACITY {
+            self.trades.pop_front();
+        }
+        self.trades.push_back(trade);
     }
 
     /// Uzavre predchozi den a otevre novy, pokud doslo k prelomu dne.
