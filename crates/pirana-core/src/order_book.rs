@@ -90,11 +90,20 @@ impl OrderBook {
         }
     }
 
-    /// Get the volume-weighted average price for a given quantity on one side
-    pub fn vwap(&self, side: Side, quantity: f64) -> Option<f64> {
-        let levels: Vec<PriceLevel> = match side {
-            Side::Buy => self.bids.values().rev().copied().collect(),
-            Side::Sell => self.asks.values().copied().collect(),
+    /// Get the volume-weighted average price that a TAKER order of the given
+    /// side would pay for `quantity`:
+    /// - taker BUY konzumuje ASK stranu knihy (od nejlevnějšího ask výš),
+    /// - taker SELL konzumuje BID stranu knihy (od nejvyššího bid dolů).
+    ///
+    /// [CASLAV v5.1 / OPONENTURA FIX] Původní implementace měla strany
+    /// prohozené (BUY bral bids) — slippage guard tím byl zcela nefunkční:
+    /// vždy vyhlásil price improvement a nikdy neskipnul.
+    pub fn vwap(&self, taker_side: Side, quantity: f64) -> Option<f64> {
+        let levels: Vec<PriceLevel> = match taker_side {
+            // Taker BUY platí asky: seřazené vzestupně (nejlevní první).
+            Side::Buy => self.asks.values().copied().collect(),
+            // Taker SELL dostává od bidů: sestupně (nejvyšší první).
+            Side::Sell => self.bids.values().rev().copied().collect(),
         };
 
         let mut remaining = quantity;
@@ -206,6 +215,39 @@ mod tests {
 
         let imbalance = book.book_imbalance(5);
         assert!(imbalance > 0.0); // More bid volume = positive imbalance
+    }
+
+    /// [CASLAV v5.1 / OPONENTURA REGRESNÍ TEST] vwap() měl dříve strany
+    /// prohozené: taker BUY počítal z bidů. Tento test zajišťuje, že
+    /// taker BUY vždy platí ask cenu a taker SELL dostává bid cenu.
+    #[test]
+    fn test_vwap_taker_semantics() {
+        let mut book = OrderBook::new(Symbol::new("tBTCUSD"), 0.01);
+
+        book.update_level(Side::Buy, 60000.0, 5.0, 10);
+        book.update_level(Side::Sell, 60010.0, 5.0, 10);
+
+        // Taker BUY 1 BTC konzumuje asky → VWAP musí být 60010 (ask), ne 60000 (bid).
+        let buy_vwap = book.vwap(Side::Buy, 1.0).unwrap();
+        assert!((buy_vwap - 60_010.0).abs() < 1e-9, "taker BUY VWAP = {buy_vwap}, očekávám ask");
+
+        // Taker SELL 1 BTC konzumuje bidy → VWAP musí být 60000 (bid), ne 60010 (ask).
+        let sell_vwap = book.vwap(Side::Sell, 1.0).unwrap();
+        assert!((sell_vwap - 60_000.0).abs() < 1e-9, "taker SELL VWAP = {sell_vwap}, očekávám bid");
+    }
+
+    /// VWAP musí správně procházet hloubku: taker BUY 3 BTC při asku
+    /// 1 BTC @ 60010 a 2 BTC @ 60020 → (1*60010 + 2*60020)/3.
+    #[test]
+    fn test_vwap_walks_book_depth() {
+        let mut book = OrderBook::new(Symbol::new("tBTCUSD"), 0.01);
+
+        book.update_level(Side::Sell, 60010.0, 1.0, 5);
+        book.update_level(Side::Sell, 60020.0, 2.0, 5);
+
+        let vwap = book.vwap(Side::Buy, 3.0).unwrap();
+        let expected = (1.0 * 60_010.0 + 2.0 * 60_020.0) / 3.0;
+        assert!((vwap - expected).abs() < 1e-9, "vwap = {vwap}, očekávám {expected}");
     }
 
     #[test]

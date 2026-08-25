@@ -104,6 +104,12 @@ pub struct DashboardState {
     pub markout_5s: Arc<parking_lot::RwLock<f64>>,
     /// Real-time post-trade markout drift at +30s
     pub markout_30s: Arc<parking_lot::RwLock<f64>>,
+    /// Realizovaný slippage posledního fillu (bps; kladný = zhoršení).
+    pub slippage_last_bps: Arc<parking_lot::RwLock<f64>>,
+    /// EWMA realizovaného slippage (bps) — vstup pro kalibraci prahu.
+    pub slippage_ewma_bps: Arc<parking_lot::RwLock<f64>>,
+    /// P90 realizovaného slippage (bps) z rolling okna 500 fillů.
+    pub slippage_p90_bps: Arc<parking_lot::RwLock<f64>>,
     /// System start time
     pub start_time: DateTime<Utc>,
 }
@@ -278,6 +284,9 @@ pub struct DashboardSnapshot {
     pub markout_1s: f64,
     pub markout_5s: f64,
     pub markout_30s: f64,
+    pub slippage_last_bps: f64,
+    pub slippage_ewma_bps: f64,
+    pub slippage_p90_bps: f64,
     pub uptime_seconds: u64,
 }
 
@@ -343,6 +352,9 @@ impl DashboardState {
             markout_1s: Arc::new(parking_lot::RwLock::new(0.0)),
             markout_5s: Arc::new(parking_lot::RwLock::new(0.0)),
             markout_30s: Arc::new(parking_lot::RwLock::new(0.0)),
+            slippage_last_bps: Arc::new(parking_lot::RwLock::new(0.0)),
+            slippage_ewma_bps: Arc::new(parking_lot::RwLock::new(0.0)),
+            slippage_p90_bps: Arc::new(parking_lot::RwLock::new(0.0)),
             start_time: Utc::now(),
         }
     }
@@ -398,6 +410,9 @@ impl DashboardState {
             markout_1s: *self.markout_1s.read(),
             markout_5s: *self.markout_5s.read(),
             markout_30s: *self.markout_30s.read(),
+            slippage_last_bps: *self.slippage_last_bps.read(),
+            slippage_ewma_bps: *self.slippage_ewma_bps.read(),
+            slippage_p90_bps: *self.slippage_p90_bps.read(),
             uptime_seconds: uptime,
         }
     }

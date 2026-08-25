@@ -269,9 +269,17 @@ impl BitfinexClient {
     /// [ MTS, "on-req", null, null, [ [ ORDER_ARRAY ] ], null, "SUCCESS", "..." ]
     /// ORDER_ARRAY layout (relevant indices):
     ///   [0]  = exchange order id (u64)
-    ///   [6]  = amount (signed)
-    ///   [7]  = amount_orig (signed)
+    ///   [6]  = amount (signed, ZBÝVAJÍCÍ po fillu)
+    ///   [7]  = amount_orig (signed, původní požadavek)
+    ///   [13] = status ("ACTIVE", "CANCELED", "EXECUTED", ...)
     ///   [16] = price_avg (f64, 0.0 if not filled yet)
+    ///
+    /// [CASLAV v5.1 / OPONENTURA FIX — IOC 0-fill]
+    /// Dříve: zrušený IOC order (CANCELED, price_avg = 0, amount = amount_orig)
+    /// byl hlášen jako 100% fill za požadovanou cenu — optimistic state
+    /// se rozešel s peněženkou. Nyní: reálný fill = amount_orig − amount;
+    /// pokud je fill 0, vrátíme filled_qty = 0 a avg_fill_price = 0
+    /// (volající ví, že order neproběhl).
     fn parse_order_execution(text: &str, requested_price: f64, requested_qty: f64) -> OrderExecutionResult {
         let mut exchange_order_id: i64 = 0;
         let mut avg_fill_price: f64 = 0.0;
@@ -291,7 +299,26 @@ impl BitfinexClient {
                 if let Some(p) = order_arr.get(16).and_then(|v| v.as_f64()) {
                     avg_fill_price = p;
                 }
-                if let Some(a) = order_arr.get(6).and_then(|v| v.as_f64()) {
+                // Reálný fill: rozlišit tři případy ACK:
+                // 1. price_avg > 0 → fill proběhl okamžitě (market/IOC naplněný);
+                //    amount v ACK často zůstává == amount_orig, ale cena je reálná.
+                // 2. status CANCELED (IOC bez fillu) → filled_qty = 0.
+                // 3. amount < amount_orig → částečný fill, spočítat reálně.
+                let amount_now = order_arr.get(6).and_then(|v| v.as_f64());
+                let amount_orig = order_arr.get(7).and_then(|v| v.as_f64());
+                let status = order_arr.get(13).and_then(|v| v.as_str()).unwrap_or("");
+                if let (Some(now), Some(orig)) = (amount_now, amount_orig) {
+                    let executed = (orig.abs() - now.abs()).max(0.0);
+                    if executed > 0.0 {
+                        // Částečný nebo úplný fill — reálné vyplněné množství.
+                        filled_qty = executed.min(requested_qty.abs());
+                    } else if avg_fill_price <= 0.0 && (status == "CANCELED" || status.starts_with("EXECUTED @ 0")) {
+                        // IOC zrušen bez fillu: žádná cena, žádné množství.
+                        filled_qty = 0.0;
+                    }
+                    // Jinak: ACK před registrací fillu (market order) —
+                    // držíme optimistic odhad, fill dorazí vzápětí.
+                } else if let Some(a) = amount_now {
                     if a.abs() > 0.0 {
                         filled_qty = a.abs();
                     }
@@ -299,12 +326,12 @@ impl BitfinexClient {
             }
         }
 
-        // Fallback: market order ACK may arrive before fill registration.
-        // Never report 0.0 as a fill price — fall back to the requested price
-        // so downstream PnL math stays finite.
-        if !avg_fill_price.is_finite() || avg_fill_price <= 0.0 {
+        // Fallback pro market order ACK, který dorazí před registrací fillu:
+        // nikdy nevracet fill za cenu 0 — ale jen když něco reálně vyplněno bylo.
+        if filled_qty > 0.0 && (!avg_fill_price.is_finite() || avg_fill_price <= 0.0) {
             avg_fill_price = requested_price;
         }
+        // 0-fill: avg_fill_price zůstává 0.0 — volající pozná neúspěch.
 
         OrderExecutionResult {
             exchange_order_id,
@@ -600,6 +627,27 @@ mod tests {
         let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,-0.000052,-0.000052,"EXCHANGE MARKET",null,null,null,0,"ACTIVE",null,null,0,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
         let r = BitfinexClient::parse_order_execution(sample, 76288.0, -0.000052);
         assert_eq!(r.avg_fill_price, 76288.0);
+    }
+
+    /// [CASLAV v5.1 / OPONENTURA REGRESNÍ TEST] IOC zrušen bez fillu:
+    /// status CANCELED, price_avg 0, amount == amount_orig → NEHLÁSIT
+    /// falešný 100% fill (dřívější chyba: optimistic state se rozešel s peněženkou).
+    #[test]
+    fn test_parse_order_execution_ioc_zero_fill() {
+        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,0.000052,0.000052,"EXCHANGE IOC",null,null,null,0,"CANCELED",null,null,0,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
+        let r = BitfinexClient::parse_order_execution(sample, 76288.0, 0.000052);
+        assert_eq!(r.filled_qty, 0.0, "IOC bez fillu musí hlásit 0, ne falešný fill");
+        assert_eq!(r.avg_fill_price, 0.0, "bez fillu není ani cena — volající pozná neúspěch");
+    }
+
+    /// Částečný IOC fill: amount < amount_orig → reálně vyplněné množství.
+    #[test]
+    fn test_parse_order_execution_partial_fill() {
+        // amount = 0.000020 (zbývá), amount_orig = 0.000052 → vyplněno 0.000032.
+        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,0.000020,0.000052,"EXCHANGE IOC",null,null,null,0,"CANCELED",null,null,76280,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
+        let r = BitfinexClient::parse_order_execution(sample, 76288.0, 0.000052);
+        assert!((r.filled_qty - 0.000032).abs() < 1e-12, "filled = {}", r.filled_qty);
+        assert!((r.avg_fill_price - 76_280.0).abs() < 1e-9);
     }
 
     #[test]

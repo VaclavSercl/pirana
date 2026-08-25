@@ -301,6 +301,12 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let initial_as_conf = strategy_config.read().avellaneda_stoikov.clone();
     let mut as_model = AvellanedaStoikovModel::from_config(&initial_as_conf);
     let markout_tracker = Arc::new(parking_lot::Mutex::new(MarkoutTracker::new(100)));
+    // [CASLAV v5.1 / SLIPPAGE P2] Telemetrie realizovaného slippage —
+    // EWMA + P90 z rolling okna 500 fillů. Publikuje se do dashboardu,
+    // později vstup pro kalibraci max_slippage_bps (§8.1).
+    let slippage_telemetry = Arc::new(parking_lot::Mutex::new(
+        pirana_core::slippage::SlippageTelemetry::new(),
+    ));
     let mut order_book;
     let mut log_throttler = LogThrottler::new(std::time::Duration::from_secs(60));
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
@@ -699,7 +705,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &markout_tracker, &mut order_book, &mut log_throttler, &router, &mut validator, &governance, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &markout_tracker, &slippage_telemetry, &mut order_book, &mut log_throttler, &router, &mut validator, &governance, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -745,6 +751,7 @@ async fn process_ws_message(
     vpin: &mut VpinCalculator,
     as_model: &mut AvellanedaStoikovModel,
     markout_tracker: &Arc<parking_lot::Mutex<MarkoutTracker>>,
+    slippage_telemetry: &Arc<parking_lot::Mutex<pirana_core::slippage::SlippageTelemetry>>,
     order_book: &mut pirana_core::order_book::OrderBook,
     log_throttler: &mut LogThrottler,
     router: &Arc<parking_lot::Mutex<OrderRouter>>,
@@ -1651,6 +1658,34 @@ async fn process_ws_message(
                                                      return;
                                                  }
 
+                                                 // [CASLAV v5.1 / SLIPPAGE P0] Pre-trade guard:
+                                                 // očekávaná fill cena (VWAP z ask strany knihy)
+                                                 // vs signální cena. Překročení max_slippage_bps
+                                                 // = alpha pryč = skip. Měřením 25.8.: 3 obchody
+                                                 // s 12–17 bps žraly ~40 % edge dne.
+                                                 let slippage_guard = pirana_core::slippage::SlippageGuard::new(
+                                                     conf.risk_management.max_slippage_bps as f64,
+                                                 );
+                                                 let expected_buy_vwap = order_book.vwap(Side::Buy, final_trade_size);
+                                                 match slippage_guard.check(Side::Buy, price, expected_buy_vwap) {
+                                                     pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
+                                                         if log_throttler.should_log("slippage_guard_buy") {
+                                                             tracing::warn!(
+                                                                 "🛡️ [SLIPPAGE GUARD] BUY skip: očekávaný fill {:.0} = +{:.1} bps > práh {} bps (signál {:.0}). Alpha pryč.",
+                                                                 expected_fill_price, slippage_bps, conf.risk_management.max_slippage_bps, price
+                                                             );
+                                                         }
+                                                         state.add_signal(signal_view);
+                                                         return;
+                                                     }
+                                                     pirana_core::slippage::SlippageDecision::Execute { .. } => {}
+                                                 }
+                                                 // [CASLAV v5.1 / SLIPPAGE P1] IOC limit místo
+                                                 // market: limit = signál + max_slippage →
+                                                 // zachytí price improvement (71 % orderů),
+                                                 // nikdy nezaplatí víc než práh.
+                                                 let ioc_limit_price = slippage_guard.ioc_limit_price(Side::Buy, price);
+
                                                  if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                                      tracing::info!("Buying Pressure (Composite: {:.2}) -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, SL: -{:.1})", composite_signal, final_trade_size, tp_dist, sl_dist);
                                                      
@@ -1714,21 +1749,59 @@ async fn process_ws_message(
                                                     let router_clone = router.clone();
                                                     let active_positions_clone = active_positions.clone();
                                                     let risk_engine_clone = risk_engine.clone();
+                                                    let slippage_telemetry_clone = slippage_telemetry.clone();
                                                     let exp_size = assessment.adjusted_position_size;
 
                                                     tokio::spawn(async move {
-                                                         // Use MARKET order for execution since fees are zero
-                                                         match client_clone.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::Market, final_trade_size, price).await {
+                                                         // [CASLAV v5.1 / SLIPPAGE P1] IOC LIMIT místo MARKET:
+                                                         // limit = signál + max_slippage → fill nikdy horší než práh,
+                                                         // price improvement (71 % měřených orderů) se zachytí.
+                                                         // IOC = neplněná část se okamžitě ruší, nic nevisí v knize.
+                                                         match client_clone.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::IOC, final_trade_size, ioc_limit_price).await {
                                                             Ok(exec) => {
                                                                 let fill_price = exec.avg_fill_price;
                                                                 let filled_qty = exec.filled_qty;
                                                                 let exchange_id = exec.exchange_order_id.to_string();
+
+                                                                // [CASLAV v5.1 / SLIPPAGE P2] Telemetrie realizovaného
+                                                                // slippage (fill vs signál) — EWMA + P90 pro kalibraci.
+                                                                {
+                                                                    let realized_bps = if price > 0.0 {
+                                                                        ((fill_price - price) / price) / (1.0 / 10_000.0)
+                                                                    } else {
+                                                                        0.0
+                                                                    };
+                                                                    let mut tel = slippage_telemetry_clone.lock();
+                                                                    tel.record(realized_bps);
+                                                                    *state_clone.slippage_last_bps.write() = realized_bps;
+                                                                    *state_clone.slippage_ewma_bps.write() = tel.ewma_bps();
+                                                                    if let Some(p90) = tel.p90_bps() {
+                                                                        *state_clone.slippage_p90_bps.write() = p90;
+                                                                    }
+                                                                }
 
                                                                 // Reconcile optimistic state to the REAL fill (price + qty)
                                                                 let qty_delta = filled_qty - final_trade_size;
                                                                 if qty_delta.abs() > 1e-12 {
                                                                     *state_clone.btc_balance.write() += qty_delta;
                                                                     *state_clone.usd_balance.write() -= qty_delta * fill_price;
+                                                                }
+
+                                                                // [CASLAV v5.1 / SLIPPAGE P1 — IOC 0-FILL]
+                                                                // IOC limit se může zrušit bez fillu (limit pod
+                                                                // best ask). Toto NENÍ chyba — jen signál vyprchal.
+                                                                // Rollback optimistic state jako u Err větve.
+                                                                if filled_qty <= 0.0 {
+                                                                    tracing::info!("IOC BUY order vypršel bez fillu (limit {:.0} nedosažen) — rollback optimistic state", ioc_limit_price);
+                                                                    let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, 0.0, 0.0, None);
+                                                                    let mut positions = active_positions_clone.write();
+                                                                    if let Some(idx) = positions.iter().position(|p| p.entry_price == price && p.quantity == final_trade_size && !p.is_paper) {
+                                                                        positions.remove(idx);
+                                                                    }
+                                                                    *state_clone.btc_balance.write() -= final_trade_size;
+                                                                    *state_clone.usd_balance.write() += required_usd;
+                                                                    risk_engine_clone.update_exposure(-exp_size);
+                                                                    return;
                                                                 }
 
                                                                 // Fix position entry price and quantity to real fill so TP/SL and PnL are exact
@@ -2062,6 +2135,29 @@ async fn process_ws_message(
                                                 // using the REAL exchange fill price (fixes duplicate ticker-price record).
                                                 tracing::info!("OFI Selling Pressure closing BUY position (entry price: {}, qty: {:.6}) — submitting SELL", closed_pos.entry_price, closed_pos.quantity);
 
+                                                // [CASLAV v5.1 / SLIPPAGE P0+P1] Guard + IOC i pro SELL:
+                                                // VWAP z bid strany knihy vs signální cena; limit IOC
+                                                // = signál − max_slippage → nikdy neprodáme pod práh.
+                                                let slippage_guard_sell = pirana_core::slippage::SlippageGuard::new(
+                                                    conf.risk_management.max_slippage_bps as f64,
+                                                );
+                                                let expected_sell_vwap = order_book.vwap(Side::Sell, final_trade_size);
+                                                let sell_ioc_limit = match slippage_guard_sell.check(Side::Sell, price, expected_sell_vwap) {
+                                                    pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
+                                                        if log_throttler.should_log("slippage_guard_sell") {
+                                                            tracing::warn!(
+                                                                "🛡️ [SLIPPAGE GUARD] SELL skip: očekávaný fill {:.0} = +{:.1} bps > práh {} bps (signál {:.0}). Alpha pryč.",
+                                                                expected_fill_price, slippage_bps, conf.risk_management.max_slippage_bps, price
+                                                            );
+                                                        }
+                                                        state.add_signal(signal_view);
+                                                        return;
+                                                    }
+                                                    pirana_core::slippage::SlippageDecision::Execute { .. } => {
+                                                        slippage_guard_sell.ioc_limit_price(Side::Sell, price)
+                                                    }
+                                                };
+
                                                 if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                                     tracing::info!("OFI Selling Pressure -> Submitting SELL order asynchronously for {:.6} BTC", final_trade_size);
 
@@ -2089,6 +2185,7 @@ async fn process_ws_message(
                                                     let active_positions_clone = active_positions.clone();
                                                     let risk_engine_clone = risk_engine.clone();
                                                     let markout_clone = markout_tracker.clone();
+                                                    let slippage_telemetry_sell = slippage_telemetry.clone();
                                                     let strategy_config_sell = strategy_config.clone();
                                                     let exp_size = assessment.adjusted_position_size;
                                                     let pos_to_restore = closed_pos.clone();
@@ -2096,12 +2193,41 @@ async fn process_ws_message(
 
                                                     tokio::spawn(async move {
                                                         // Bitfinex sells require negative quantity
-                                                        // Use MARKET order for execution since fees are zero
-                                                        match client_clone.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::Market, -final_trade_size, price).await {
+                                                        // [CASLAV v5.1 / SLIPPAGE P1] IOC LIMIT místo MARKET:
+                                                        // limit = signál − max_slippage → nikdy neprodáme pod práh,
+                                                        // price improvement se zachytí, neplněná část se ruší.
+                                                        match client_clone.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::IOC, -final_trade_size, sell_ioc_limit).await {
                                                             Ok(exec) => {
                                                                 let fill_price = exec.avg_fill_price;
                                                                 let filled_qty = exec.filled_qty;
                                                                 let exchange_id = exec.exchange_order_id.to_string();
+
+                                                                // [CASLAV v5.1 / SLIPPAGE P2] Telemetrie realizovaného slippage.
+                                                                {
+                                                                    let realized_bps = if price > 0.0 {
+                                                                        ((price - fill_price) / price) / (1.0 / 10_000.0)
+                                                                    } else {
+                                                                        0.0
+                                                                    };
+                                                                    let mut tel = slippage_telemetry_sell.lock();
+                                                                    tel.record(realized_bps);
+                                                                    *state_clone.slippage_last_bps.write() = realized_bps;
+                                                                    *state_clone.slippage_ewma_bps.write() = tel.ewma_bps();
+                                                                    if let Some(p90) = tel.p90_bps() {
+                                                                        *state_clone.slippage_p90_bps.write() = p90;
+                                                                    }
+                                                                }
+
+                                                                // [CASLAV v5.1 / SLIPPAGE P1 — IOC 0-FILL]
+                                                                // IOC SELL bez fillu: pozice se vrací zpět
+                                                                // (pos_to_restore), balanc se nijak nemění.
+                                                                if filled_qty <= 0.0 {
+                                                                    tracing::info!("IOC SELL order vypršel bez fillu (limit {:.0} nedosažen) — pozice se vrací", sell_ioc_limit);
+                                                                    let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, 0.0, 0.0, None);
+                                                                    active_positions_clone.write().push(pos_to_restore.clone());
+                                                                    risk_engine_clone.update_exposure(exp_size);
+                                                                    return;
+                                                                }
 
                                                                 // Realized PnL from the REAL fill price (includes slippage)
                                                                 let realized_pnl = (fill_price - entry_price_closed) * filled_qty;
