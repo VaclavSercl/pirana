@@ -335,6 +335,45 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
     let active_positions = Arc::new(parking_lot::RwLock::new(Vec::<ActivePosition>::new()));
 
+    // [CASLAV v5.1 / P0-1 START RECONCILIATION — revize po oponentuře agy]
+    // PRVNI VERZE (zamitnuta oponentem): registrovat cely btc_total jako synteticke
+    // pozice s entry_price = aktualni cena. Vad je pet:
+    //  (a) fake entry cena skorumpuje PnL a kalibraci,
+    //  (b) hromadny TP/SL trigger na prvnim ticku = dump celeho portfolia,
+    //  (c) w.total zahrnuje locked_btc_reserve — prodali bychom trezor (§1b),
+    //  (d) 50 paralelnich market orderu = rate limit kolize.
+    // TRADNI POZICE SE NEJSOU REKONSTRUOVAT BEZ SKUTECNYCH VSTUPNICH CEN —
+    // k tomu slouzi TradeLedger / trades_hist. Zde pouze LOGUJEME stav,
+    // aby operator vedel, ze po restartu existuje BTC bez registrovanych pozic.
+    // Deadlock resi P0-2 (REBALANCE SELL), ktery nyni funguje i s prazdnym
+    // active_positions a respektuje trezor.
+    {
+        if let Ok(wallets) = client.get_wallets().await {
+            let mut btc_total = 0.0;
+            for w in &wallets {
+                if w.asset == "BTC" {
+                    btc_total = w.total;
+                }
+            }
+            let locked_reserve = *state.locked_btc_reserve.read();
+            let tradable = (btc_total - locked_reserve).max(0.0);
+            let open_positions = active_positions.read().len();
+            if open_positions == 0 && tradable > MIN_ORDER_SIZE_BTC {
+                warn!(
+                    "🔄 [START RECONCILIATION] {} BTC na burze (trezor {:.8}) ale ZADNE registrovane pozice po restartu. Deadlock resi REBALANCE SELL pri pristim SELL signalu.",
+                    tradable, locked_reserve
+                );
+            } else {
+                info!(
+                    "🔄 [START RECONCILIATION] BTC {:.8} (trezor {:.8}), pozic: {}",
+                    btc_total, locked_reserve, open_positions
+                );
+            }
+        } else {
+            warn!("🔄 [START RECONCILIATION] Wallety nedostupné při startu");
+        }
+    }
+
     // Spawn a permanent, background balance reconciliation task (every 15 seconds)
     // to prevent virtual wallet balance drift, auto-clamp vault reserves, and protect PnL metrics
     // Sdili rozpocet rate limitu i citac nonce s hlavnim klientem.
@@ -347,6 +386,74 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let risk_engine_for_reconciliation = risk_engine.clone();
     // Pro srovnani expozice se skutecnymi pozicemi v rekonciliacni smycce.
     let active_positions_for_recon = active_positions.clone();
+
+    // [CASLAV v5.1 / P1-3 INACTIVITY WATCHDOG — revize po oponentuře]
+    // PUVODNI CHYBA (dle oponenta): watchdog testoval trades_today == 0 — po
+    // jedinem obchodu se trvale deaktivoval a 20 h deadlock by prosel bez alertu.
+    // OPRAVA: hlidame last_trade_ts.elapsed() > 1 h v Active rezimu.
+    {
+        let state_for_watchdog = state.clone();
+        tokio::spawn(async move {
+            const CHECK_INTERVAL_SECS: i64 = 600; // 10 min
+            const INACTIVITY_THRESHOLD_SECS: i64 = 3600; // 1 h
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
+            let mut alert_sent = false;
+            let start = chrono::Utc::now().timestamp();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS as u64)).await;
+                let now = chrono::Utc::now().timestamp();
+                // Grace period 1 h od startu — systém se rozehání.
+                if now - start < INACTIVITY_THRESHOLD_SECS {
+                    continue;
+                }
+                let mode = *state_for_watchdog.system_mode.read();
+                let last_trade = *state_for_watchdog.last_trade_ts.read();
+                let last = if last_trade > 0 { last_trade } else { start };
+                let idle_secs = now - last;
+
+                if mode == SystemMode::Active && idle_secs >= INACTIVITY_THRESHOLD_SECS {
+                    if !alert_sent {
+                        alert_sent = true;
+                        let btc = *state_for_watchdog.btc_balance.read();
+                        let usd = *state_for_watchdog.usd_balance.read();
+                        let msg = format!(
+                            "🚨 <b>ČÁSLAV :: INACTIVITY ALERT</b>\n\n\
+                             Systém je v Active režimu {} h bez obchodu (poslední: {}).\n\
+                             Pravděpodobný deadlock (inventory / pozice).\n\n\
+                             • BTC: <code>{:.8}</code>\n• USD: <code>{:.2}</code>\n\
+                             Zkontroluj: journalctl -u pirana.service | grep -E \"skipping|REBALANCE\"",
+                            idle_secs / 3600,
+                            if last_trade > 0 { "dnes" } else { "nikdy od startu" },
+                            btc, usd
+                        );
+                        let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+                        let chat = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_else(|_| "1076582576".into());
+                        if !token.is_empty() {
+                            let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+                            let payload = serde_json::json!({
+                                "chat_id": chat,
+                                "text": msg,
+                                "parse_mode": "HTML",
+                            });
+                            if let Err(e) = http.post(&url).json(&payload).send().await {
+                                tracing::error!("[INACTIVITY WATCHDOG] Telegram alert selhal: {}", e);
+                            }
+                        } else {
+                            tracing::error!("[INACTIVITY WATCHDOG] TELEGRAM_BOT_TOKEN neni nastaven — alert jen do logu");
+                        }
+                        tracing::warn!("[INACTIVITY WATCHDOG] Alert odeslán — Active bez obchodu {} h", idle_secs / 3600);
+                    }
+                } else if idle_secs < INACTIVITY_THRESHOLD_SECS {
+                    // System zase obchoduje — reset flagu.
+                    alert_sent = false;
+                }
+            }
+        });
+    }
+
     tokio::spawn(async move {
         // [CASLAV v5.1] Citac ticku pro kadenci rekalibrace.
         // Rekonciliace bezi kazdych 15 s; rekalibrace 1x za 60 ticku = 15 min.
@@ -403,9 +510,35 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     }
 
                     // 3. Inventory synchronization on out-of-band manual sell
+                    // [CASLAV v5.1 / ROOT-CAUSE FIX — nález oponentury agy]
+                    // PUVODNI CHYBA: retain() smazal VSECHNY BUY pozice i kdyz byl
+                    // prodan jen zlomek — vznikl stav "inventar > 0, pozice = 0"
+                    // = deadlock z 24.8. Nyni se pozice snizuji proporcionalne.
                     if delta_btc < -0.00004 && delta_usd > (delta_btc.abs() * btc_price * 0.85) {
-                        tracing::info!("⚡ [AUTO-RECONCILE] Manual out-of-band sell detected (ΔBTC={:.8}, ΔUSD=+${:.2}). Cleaning active positions...", delta_btc.abs(), delta_usd);
-                        positions_for_reconciliation.write().retain(|p| p.side != Side::Buy);
+                        tracing::info!(
+                            "⚡ [AUTO-RECONCILE] Manual out-of-band sell detected (ΔBTC={:.8}, ΔUSD=+${:.2}). Proporcionálně snižuji BUY pozice...",
+                            delta_btc.abs(), delta_usd
+                        );
+                        let sold_btc = delta_btc.abs();
+                        let mut positions = positions_for_reconciliation.write();
+                        let total_buy: f64 = positions
+                            .iter()
+                            .filter(|p| p.side == Side::Buy && !p.is_paper)
+                            .map(|p| p.quantity)
+                            .sum();
+                        if total_buy > 0.0 && sold_btc < total_buy {
+                            // Proporcionalni snizeni vsech BUY pozic o prodany podil.
+                            let ratio = 1.0 - (sold_btc / total_buy);
+                            for p in positions.iter_mut() {
+                                if p.side == Side::Buy && !p.is_paper {
+                                    p.quantity *= ratio;
+                                    p.exposure_size *= ratio;
+                                }
+                            }
+                        } else if sold_btc >= total_buy {
+                            // Prodano vsechno nebo vic — BUY pozice plne zavreny.
+                            positions.retain(|p| !(p.side == Side::Buy && !p.is_paper));
+                        }
                     }
 
                     // Update real-time wallet balances in state
@@ -918,6 +1051,7 @@ async fn process_ws_message(
                                             }
 
                                             *state_clone.trades_today.write() += 1;
+                                            *state_clone.last_trade_ts.write() = chrono::Utc::now().timestamp();
 
                                             // Update win rate from REAL PnL (running average over closed trades only)
                                             {
@@ -1874,11 +2008,53 @@ async fn process_ws_message(
                                                 let closed_pos = match closed_pos_opt {
                                                     Some(pos) => pos,
                                                     None => {
-                                                        if log_throttler.should_log("no_buy_positions") {
-                                                            tracing::warn!("OFI Selling Pressure: no open BUY positions to close — skipping SELL to avoid naked short! (throttled)");
+                                                        // [CASLAV v5.1 / P0-2 DEADLOCK FIX — revize po oponentuře]
+                                                        // Deadlock z 24.8.: active_positions prazdne, ale bot drzi
+                                                        // BTC nad maximem inventare. SELL nema co zavirat, BUY neni
+                                                        // inventar — system visi neaktivni (20 h).
+                                                        //
+                                                        // POVINNE OCHRANY (dle oponentury):
+                                                        // 1. Trezor: current_btc je TOTAL balance; odecte se
+                                                        //    locked_btc_reserve, aby se nikdy neprodaly sats trezoru (§1b).
+                                                        // 2. Sizing: proda se POUZE excess_btc (rozdil nad max inventar),
+                                                        //    nikdy sizerova velikost — jinak system podstrelil cil.
+                                                        let locked_reserve = *state.locked_btc_reserve.read();
+                                                        let tradable_btc = (current_btc - locked_reserve).max(0.0);
+                                                        let max_allowed_btc = if conf.inventory.use_dynamic_inventory {
+                                                            dynamic_sizer.calculate_dynamic_max_inventory_btc(total_portfolio_usd, price)
+                                                        } else {
+                                                            conf.inventory.max_inventory_btc
+                                                        };
+                                                        let excess_btc = (tradable_btc - max_allowed_btc).max(0.0);
+                                                        if excess_btc > MIN_ORDER_SIZE_BTC {
+                                                            if log_throttler.should_log("rebalance_sell") {
+                                                                tracing::warn!(
+                                                                    "🔄 [REBALANCE SELL] Deadlock: žádné pozice, ale obchodovatelný inventář {:.6} > max {:.6} (trezor {:.8} odečten). Prodávám přesně {:.6} BTC.",
+                                                                    tradable_btc, max_allowed_btc, locked_reserve, excess_btc
+                                                                );
+                                                            }
+                                                            // Svazat velikost orderu STRIKTNE s prebytkem.
+                                                            final_trade_size = excess_btc.min(final_trade_size.max(excess_btc)).max(MIN_ORDER_SIZE_BTC);
+                                                            ActivePosition {
+                                                                entry_price: price,
+                                                                quantity: excess_btc,
+                                                                side: Side::Buy,
+                                                                tp_price: price + tp_dist,
+                                                                sl_price: price - sl_dist,
+                                                                exposure_size: assessment.adjusted_position_size,
+                                                                is_paper: false,
+                                                                highest_price_seen: price,
+                                                                lowest_price_seen: price,
+                                                                is_breakeven: false,
+                                                                trailing_active: false,
+                                                            }
+                                                        } else {
+                                                            if log_throttler.should_log("no_buy_positions") {
+                                                                tracing::warn!("OFI Selling Pressure: no open BUY positions to close — skipping SELL to avoid naked short! (throttled)");
+                                                            }
+                                                            state.add_signal(signal_view);
+                                                            return;
                                                         }
-                                                        state.add_signal(signal_view);
-                                                        return;
                                                     }
                                                 };
 
@@ -1943,6 +2119,7 @@ async fn process_ws_message(
                                                                 // Risk engine result + closed-trade counter
                                                                 risk_engine_clone.record_trade_result(realized_pnl);
                                                                 *state_clone.trades_today.write() += 1;
+                                                                *state_clone.last_trade_ts.write() = chrono::Utc::now().timestamp();
 
                                                                 // Balances at real fill
                                                                 *state_clone.btc_balance.write() -= filled_qty;

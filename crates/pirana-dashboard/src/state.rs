@@ -49,6 +49,9 @@ pub struct DashboardState {
     pub paper_consecutive_wins: Arc<parking_lot::RwLock<u32>>,
     /// Total trades today
     pub trades_today: Arc<parking_lot::RwLock<u32>>,
+    /// Timestamp posledniho exekuovaneho obchodu (unix sekundy; 0 = nic dnes).
+    /// Pro INACTIVITY WATCHDOG: rozliseni deadlocku od "uzil svuj daily budget".
+    pub last_trade_ts: Arc<parking_lot::RwLock<i64>>,
     /// Uzavrene round-tripy (jen fill s nenulovym realizovanym PnL)
     pub closed_trades: Arc<parking_lot::RwLock<u32>>,
     /// Ziskove uzavrene round-tripy
@@ -313,6 +316,7 @@ impl DashboardState {
             consecutive_losses: Arc::new(parking_lot::RwLock::new(0)),
             paper_consecutive_wins: Arc::new(parking_lot::RwLock::new(0)),
             trades_today: Arc::new(parking_lot::RwLock::new(0)),
+            last_trade_ts: Arc::new(parking_lot::RwLock::new(0)),
             closed_trades: Arc::new(parking_lot::RwLock::new(0)),
             winning_trades: Arc::new(parking_lot::RwLock::new(0)),
             win_rate: Arc::new(parking_lot::RwLock::new(0.0)),
