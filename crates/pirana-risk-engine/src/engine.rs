@@ -330,14 +330,23 @@ impl RiskEngine {
             return Err(RiskError::OutOfRange("equity_sats", equity_sats));
         }
 
-        // [ADAPTIVE BASELINE — nález oponentury P0] Update baseline probíhá
+        // [ADAPTIVE BASELINE — nález testování] Update baseline probíhá
         // NEZÁVISLE na klasické kalibraci. Okamžité snížení při negativním
         // Kelly musí proběhnout i když klasická kalibrace selže
         // (InsufficientSample / P(ruin) brána) — dřívější `?` na řádku
         // výše baseline blokoval a LKG rollback nikdy nenastal.
         self.update_adaptive_baseline(&stats, equity_usd, price_usd);
 
-        let next = SelfCalibration::recalibrate(&current, &stats, equity_sats)?;
+        let next = match SelfCalibration::recalibrate(&current, &stats, equity_sats) {
+            Ok(next) => next,
+            Err(e) => {
+                // Klasická kalibrace zamítnuta. Baseline už je ošetřena výše —
+                // ale pokud se změnila, její stav musí přežít restart.
+                // Persistujeme celý calibrated (baseline + staré limity).
+                let _ = self.persist_calibration();
+                return Err(e);
+            }
+        };
         let generation = next.calibration_generation;
 
         info!(
