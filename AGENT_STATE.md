@@ -33,6 +33,10 @@
 
 ### 26.8.2026
 
+- **15:53 (Telegram bot)**: Ověřen TTS Piper — provider `piper`, hlas `cs_CZ-kasandra-medium`
+  (soubory `/home/wwwenda/.local/share/piper/voices/cs_CZ-kasandra-medium.onnx` + `.json`).
+  Test syntézy: exit 0, WAV 136 KB. Config `~/.hermes/config.yaml` již obsahuje `tts.provider: piper`
+  a `tts.piper.voice: cs_CZ-kasandra-medium`. Vše funkční, žádná změna nebyla nutná.
 - **11:57 (ranní audit — Hermes WebUI)**: Audit bez zásahu do TOML. Stav: Defensive,
   consec_losses 6/5(seed práh), WR 22,7 % (15/66), denní PnL -0,063 USD (-0,016 %),
   equity 402,07 USD (start 402,76), OFI=0.0, VPIN 41,0 %, markout_1s -7,8 bps (záporný

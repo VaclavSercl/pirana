@@ -32,6 +32,13 @@ pub struct BitfinexClient {
     /// `fetch_max` zaruci, ze vraceny nonce je vzdy vetsi nez predchozi,
     /// i kdyz systemovy cas skoci zpet (NTP).
     nonce_counter: Arc<AtomicI64>,
+    /// [FIX 26. 8. — nonce race v jednom procesu] Serializace odeslání
+    /// autentizovaných požadavků. Paralelní tokio::spawny (TP/SL close
+    /// více pozic + resolve_fill + rekonciliace) alokovaly nonce z CAS
+    /// v pořadí A,B — ale na burzu dorazily B dřív. Server si drží MAX
+    /// nonce → A odmítnuto jako „nonce: small" (naměřeno 40 % ztracených
+    /// close orderů). Mutex drží alokaci nonce i odeslání pohromadě.
+    submit_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Result of a successfully submitted order, parsed from the exchange response
@@ -115,6 +122,7 @@ impl BitfinexClient {
             nonce_counter: Arc::new(AtomicI64::new(
                 chrono::Utc::now().timestamp_micros(),
             )),
+            submit_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -164,6 +172,7 @@ impl BitfinexClient {
             api_secret,
             rate_limiter: other.rate_limiter.clone(),
             nonce_counter: Arc::clone(&other.nonce_counter),
+            submit_mutex: Arc::clone(&other.submit_mutex),
         }
     }
 
@@ -194,6 +203,10 @@ impl BitfinexClient {
             });
         }
 
+        // [FIX nonce race] Nonce + odeslání pod jedním zámkem — viz
+        // submit_mutex dokumentace. Bez toho paralelní tasky alokovaly
+        // nonce A,B ale doručily B dřív → A odmítnuto (10114).
+        let _submit_guard = self.submit_mutex.lock().await;
         let nonce = self.next_nonce();
         let endpoint = "/api/v2/auth/w/order/submit";
 
@@ -350,6 +363,7 @@ impl BitfinexClient {
 
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: i64) -> PiranaResult<String> {
+        let _submit_guard = self.submit_mutex.lock().await;
         let nonce = self.next_nonce();
         let endpoint = "/api/v2/auth/w/order/cancel";
 
@@ -408,6 +422,7 @@ impl BitfinexClient {
 
     /// Get wallet balances
     pub async fn get_wallets(&self) -> PiranaResult<Vec<Balance>> {
+        let _submit_guard = self.submit_mutex.lock().await;
         let nonce = self.next_nonce();
         let endpoint = "/api/v2/auth/r/wallets";
         let body = "{}";
@@ -475,6 +490,7 @@ impl BitfinexClient {
         start: i64,
         limit: i32,
     ) -> PiranaResult<Vec<TradeRecord>> {
+        let _submit_guard = self.submit_mutex.lock().await;
         let nonce = self.next_nonce();
         let endpoint = format!("/api/v2/auth/r/trades/{}/hist", symbol);
         let body = format!(r#"{{"start":{},"limit":{}}}"#, start, limit);
@@ -622,6 +638,7 @@ impl BitfinexClient {
 
     /// Get active open order IDs for a symbol (for orphan reconciliation)
     pub async fn get_active_orders(&self, symbol: &str) -> PiranaResult<Vec<i64>> {
+        let _submit_guard = self.submit_mutex.lock().await;
         let nonce = self.next_nonce();
         let endpoint = format!("/api/v2/auth/r/orders/{}", symbol);
         let body = "{}";
