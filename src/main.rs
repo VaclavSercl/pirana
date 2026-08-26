@@ -1758,13 +1758,42 @@ async fn process_ws_message(
                                                          // price improvement (71 % měřených orderů) se zachytí.
                                                          // IOC = neplněná část se okamžitě ruší, nic nevisí v knize.
                                                          match client_clone.submit_order("tBTCUSD", Side::Buy, pirana_core::types::OrderType::IOC, final_trade_size, ioc_limit_price).await {
-                                                            Ok(exec) => {
-                                                                let fill_price = exec.avg_fill_price;
-                                                                let filled_qty = exec.filled_qty;
-                                                                let exchange_id = exec.exchange_order_id.to_string();
+                                                            Ok(ack) => {
+                                                                // [CASLAV v5.1 / FILL TRUTH] ACK `on-req` pro IOC vrací
+                                                                // v price_avg LIMIT cenu, ne reálný fill (naměřeno 26.8.:
+                                                                // 100 % orderů „+39 USD slippage" = přesně 5 bps práh).
+                                                                // Autoritativní fill: /trades/hist přes order_id.
+                                                                let (fill_price, filled_qty, exchange_id, fill_is_authoritative) = match client_clone.resolve_fill("tBTCUSD", ack.exchange_order_id).await {
+                                                                    Ok(Some((vwap, qty))) => (vwap, qty, ack.exchange_order_id.to_string(), true),
+                                                                    Ok(None) => (ack.avg_fill_price, ack.filled_qty, ack.exchange_order_id.to_string(), false),
+                                                                    Err(e) => {
+                                                                        tracing::warn!("⚠️ [FILL TRUTH] resolve_fill nedostupné ({}), používám ACK odhad — PnL může být nepřesný", e);
+                                                                        (ack.avg_fill_price, ack.filled_qty, ack.exchange_order_id.to_string(), false)
+                                                                    }
+                                                                };
+
+                                                                // [CASLAV v5.1 / SLIPPAGE P1 — IOC 0-FILL]
+                                                                // IOC limit se může zrušit bez fillu (limit pod
+                                                                // best ask). Toto NENÍ chyba — jen signál vyprchal.
+                                                                // Rollback optimistic state jako u Err větve.
+                                                                // POZOR: musí být PŘED jakýmkoliv dalším měněním balanců.
+                                                                if filled_qty <= 0.0 {
+                                                                    tracing::info!("IOC BUY order vypršel bez fillu (limit {:.0} nedosažen) — rollback optimistic state", ioc_limit_price);
+                                                                    let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, 0.0, 0.0, None);
+                                                                    let mut positions = active_positions_clone.write();
+                                                                    if let Some(idx) = positions.iter().position(|p| p.entry_price == price && p.quantity == final_trade_size && !p.is_paper) {
+                                                                        positions.remove(idx);
+                                                                    }
+                                                                    *state_clone.btc_balance.write() -= final_trade_size;
+                                                                    *state_clone.usd_balance.write() += required_usd;
+                                                                    risk_engine_clone.update_exposure(-exp_size);
+                                                                    return;
+                                                                }
 
                                                                 // [CASLAV v5.1 / SLIPPAGE P2] Telemetrie realizovaného
                                                                 // slippage (fill vs signál) — EWMA + P90 pro kalibraci.
+                                                                // Teprve NYNÍ, po autoritativním fillu — dřívější
+                                                                // verze měřila limit cenu, ne fill.
                                                                 {
                                                                     let realized_bps = if price > 0.0 {
                                                                         ((fill_price - price) / price) / (1.0 / 10_000.0)
@@ -1780,28 +1809,21 @@ async fn process_ws_message(
                                                                     }
                                                                 }
 
-                                                                // Reconcile optimistic state to the REAL fill (price + qty)
-                                                                let qty_delta = filled_qty - final_trade_size;
-                                                                if qty_delta.abs() > 1e-12 {
-                                                                    *state_clone.btc_balance.write() += qty_delta;
-                                                                    *state_clone.usd_balance.write() -= qty_delta * fill_price;
-                                                                }
-
-                                                                // [CASLAV v5.1 / SLIPPAGE P1 — IOC 0-FILL]
-                                                                // IOC limit se může zrušit bez fillu (limit pod
-                                                                // best ask). Toto NENÍ chyba — jen signál vyprchal.
-                                                                // Rollback optimistic state jako u Err větve.
-                                                                if filled_qty <= 0.0 {
-                                                                    tracing::info!("IOC BUY order vypršel bez fillu (limit {:.0} nedosažen) — rollback optimistic state", ioc_limit_price);
-                                                                    let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, 0.0, 0.0, None);
-                                                                    let mut positions = active_positions_clone.write();
-                                                                    if let Some(idx) = positions.iter().position(|p| p.entry_price == price && p.quantity == final_trade_size && !p.is_paper) {
-                                                                        positions.remove(idx);
+                                                                // Reconcile optimistic state to the REAL fill (price + qty).
+                                                                // Před odesláním bylo odečteno required_usd = size * SIGNÁLNÍ
+                                                                // cena; reálná útrata je filled_qty * FILL cena. Rozdíl
+                                                                // (price improvement i slippage) se musí v USD promítnout
+                                                                // vždy — i při 100% fillu (nález oponentury: dříve se
+                                                                // qty_delta == 0 blok přeskočil a USD driftěl).
+                                                                {
+                                                                    let qty_delta = filled_qty - final_trade_size;
+                                                                    if qty_delta.abs() > 1e-12 {
+                                                                        *state_clone.btc_balance.write() += qty_delta;
                                                                     }
-                                                                    *state_clone.btc_balance.write() -= final_trade_size;
-                                                                    *state_clone.usd_balance.write() += required_usd;
-                                                                    risk_engine_clone.update_exposure(-exp_size);
-                                                                    return;
+                                                                    let usd_correction = required_usd - filled_qty * fill_price;
+                                                                    if usd_correction.abs() > 1e-9 {
+                                                                        *state_clone.usd_balance.write() += usd_correction;
+                                                                    }
                                                                 }
 
                                                                 // Fix position entry price and quantity to real fill so TP/SL and PnL are exact
@@ -1814,7 +1836,11 @@ async fn process_ws_message(
                                                                 }
 
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Filled, filled_qty, fill_price, Some(exchange_id));
-                                                                tracing::info!("Asynchronous BUY order executed successfully! Real fill: {:.2} USD ({} slippage vs. signal {:.2})", fill_price, fill_price - price, price);
+                                                                if fill_is_authoritative {
+                                                                    tracing::info!("Asynchronous BUY order executed! Authoritative fill: {:.2} USD ({} slippage vs. signal {:.2})", fill_price, fill_price - price, price);
+                                                                } else {
+                                                                    tracing::warn!("Asynchronous BUY order executed! Fallback fill (ACK odhad): {:.2} USD ({} slippage vs. signal {:.2})", fill_price, fill_price - price, price);
+                                                                }
                                                             }
                                                             Err(e) => {
                                                                 tracing::error!("Bitfinex asynchronous BUY order execution failed: {}", e);
@@ -2197,12 +2223,31 @@ async fn process_ws_message(
                                                         // limit = signál − max_slippage → nikdy neprodáme pod práh,
                                                         // price improvement se zachytí, neplněná část se ruší.
                                                         match client_clone.submit_order("tBTCUSD", Side::Sell, pirana_core::types::OrderType::IOC, -final_trade_size, sell_ioc_limit).await {
-                                                            Ok(exec) => {
-                                                                let fill_price = exec.avg_fill_price;
-                                                                let filled_qty = exec.filled_qty;
-                                                                let exchange_id = exec.exchange_order_id.to_string();
+                                                            Ok(ack) => {
+                                                                // [CASLAV v5.1 / FILL TRUTH] Autoritativní fill z /trades/hist
+                                                                // (ACK price_avg = limit cena, ne reálný fill — viz resolve_fill).
+                                                                let (fill_price, filled_qty, exchange_id, fill_is_authoritative) = match client_clone.resolve_fill("tBTCUSD", ack.exchange_order_id).await {
+                                                                    Ok(Some((vwap, qty))) => (vwap, qty, ack.exchange_order_id.to_string(), true),
+                                                                    Ok(None) => (ack.avg_fill_price, ack.filled_qty, ack.exchange_order_id.to_string(), false),
+                                                                    Err(e) => {
+                                                                        tracing::warn!("⚠️ [FILL TRUTH] resolve_fill nedostupné ({}), používám ACK odhad — PnL může být nepřesný", e);
+                                                                        (ack.avg_fill_price, ack.filled_qty, ack.exchange_order_id.to_string(), false)
+                                                                    }
+                                                                };
+
+                                                                // [CASLAV v5.1 / SLIPPAGE P1 — IOC 0-FILL]
+                                                                // IOC SELL bez fillu: pozice se vrací zpět
+                                                                // (pos_to_restore), balanc se nijak nemění.
+                                                                if filled_qty <= 0.0 {
+                                                                    tracing::info!("IOC SELL order vypršel bez fillu (limit {:.0} nedosažen) — pozice se vrací", sell_ioc_limit);
+                                                                    let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, 0.0, 0.0, None);
+                                                                    active_positions_clone.write().push(pos_to_restore.clone());
+                                                                    risk_engine_clone.update_exposure(exp_size);
+                                                                    return;
+                                                                }
 
                                                                 // [CASLAV v5.1 / SLIPPAGE P2] Telemetrie realizovaného slippage.
+                                                                // Teprve po autoritativním fillu.
                                                                 {
                                                                     let realized_bps = if price > 0.0 {
                                                                         ((price - fill_price) / price) / (1.0 / 10_000.0)
@@ -2216,17 +2261,6 @@ async fn process_ws_message(
                                                                     if let Some(p90) = tel.p90_bps() {
                                                                         *state_clone.slippage_p90_bps.write() = p90;
                                                                     }
-                                                                }
-
-                                                                // [CASLAV v5.1 / SLIPPAGE P1 — IOC 0-FILL]
-                                                                // IOC SELL bez fillu: pozice se vrací zpět
-                                                                // (pos_to_restore), balanc se nijak nemění.
-                                                                if filled_qty <= 0.0 {
-                                                                    tracing::info!("IOC SELL order vypršel bez fillu (limit {:.0} nedosažen) — pozice se vrací", sell_ioc_limit);
-                                                                    let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, 0.0, 0.0, None);
-                                                                    active_positions_clone.write().push(pos_to_restore.clone());
-                                                                    risk_engine_clone.update_exposure(exp_size);
-                                                                    return;
                                                                 }
 
                                                                 // Realized PnL from the REAL fill price (includes slippage)
@@ -2246,6 +2280,11 @@ async fn process_ws_message(
                                                                 risk_engine_clone.record_trade_result(realized_pnl);
                                                                 *state_clone.trades_today.write() += 1;
                                                                 *state_clone.last_trade_ts.write() = chrono::Utc::now().timestamp();
+                                                                if fill_is_authoritative {
+                                                                    tracing::info!("Asynchronous SELL order executed! Authoritative fill: {:.2} USD, PnL: {} USD", fill_price, realized_pnl);
+                                                                } else {
+                                                                    tracing::warn!("Asynchronous SELL order executed! Fallback fill (ACK odhad): {:.2} USD, PnL: {} USD", fill_price, realized_pnl);
+                                                                }
 
                                                                 // Balances at real fill
                                                                 *state_clone.btc_balance.write() -= filled_qty;

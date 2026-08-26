@@ -309,12 +309,19 @@ impl BitfinexClient {
                 let status = order_arr.get(13).and_then(|v| v.as_str()).unwrap_or("");
                 if let (Some(now), Some(orig)) = (amount_now, amount_orig) {
                     let executed = (orig.abs() - now.abs()).max(0.0);
-                    if executed > 0.0 {
+                    if status == "CANCELED" || status.starts_with("EXECUTED @ 0") {
+                        // Zrušený IOC: NEPROVÁDĚNÉ množství je nula bez ohledu
+                        // na price_avg — Bitfinex tam vrací limit cenu orderu,
+                        // což dřívější podmínka `avg_fill_price <= 0.0` nechytila
+                        // (nález oponentury: ghost pozice z 0-fill orderů).
+                        filled_qty = if executed > 0.0 { executed.min(requested_qty.abs()) } else { 0.0 };
+                        if executed <= 0.0 {
+                            // 0-fill: ani cena není reálná — limit, ne fill.
+                            avg_fill_price = 0.0;
+                        }
+                    } else if executed > 0.0 {
                         // Částečný nebo úplný fill — reálné vyplněné množství.
                         filled_qty = executed.min(requested_qty.abs());
-                    } else if avg_fill_price <= 0.0 && (status == "CANCELED" || status.starts_with("EXECUTED @ 0")) {
-                        // IOC zrušen bez fillu: žádná cena, žádné množství.
-                        filled_qty = 0.0;
                     }
                     // Jinak: ACK před registrací fillu (market order) —
                     // držíme optimistic odhad, fill dorazí vzápětí.
@@ -542,6 +549,77 @@ impl BitfinexClient {
         Ok(records)
     }
 
+    /// Autoritativní rešení fillu orderu: dotáhne z `/trades/hist` VŠECHNY
+    /// filly daného orderu a spočítá VWAP + součet vyplněného množství.
+    ///
+    /// ## Proč to existuje
+    ///
+    /// ACK `on-req` pro okamžitě naplněný IOC vrací v `price_avg` (index 16)
+    /// LIMITNÍ cenu orderu, nikoliv reálnou fill cenu (naměřeno 26. 8. 2026:
+    /// ACK 78 959 vs reálný fill 78 926 — rozdíl přesně roven 5 bps prahu).
+    /// Účetnictví postavené na ACK ceně vykazovalo 100 % orderů se „slippage
+    /// +39 USD" a falešný win rate 1,9 %.
+    ///
+    /// `/trades/hist` je jediný autoritativní zdroj reálných fill cen.
+    ///
+    /// ## Vrácené stavy
+    ///
+    /// * `Ok(Some((vwap, qty)))` — order reálně vyplněn (může být částečně).
+    /// * `Ok(None)`              — order bez fillu (IOC vypršel) — potvrzeno
+    ///                             dotazem na burzu, není to chyba.
+    /// * `Err(_)`                — API nedostupné; volající by měl použít
+    ///                             fallback (ACK odhad) a ZALOGOVAT varování.
+    pub async fn resolve_fill(
+        &self,
+        symbol: &str,
+        order_id: i64,
+    ) -> PiranaResult<Option<(f64, f64)>> {
+        // Filly orderu musí mít MTS >= odeslání orderu. Bez start parametru
+        // by dotaz vracel celou historii; vezmeme posledních 60 s a
+        // matchneme přes order_id — což je exaktní klíč.
+        //
+        // RACE OCHRANA (nález oponentury): IOC fill se na burzi registruje
+        // asynchronně — první dotaz může doběhnout dřív, než je fill
+        // indexovaný. Krátký retry s rostoucím waitem to eliminuje;
+        // teprve po 3 pokusech prohlásíme order za 0-fill.
+        let start = (chrono::Utc::now().timestamp_millis() - 60_000).max(0);
+        let mut trades: Vec<TradeRecord> = Vec::new();
+        for attempt in 0..3 {
+            trades = self.get_trades_hist(symbol, start, 100).await?;
+
+            let has_fill = trades.iter().any(|t| t.order_id == order_id && t.qty() > 0.0);
+            if has_fill {
+                break;
+            }
+            if attempt < 2 {
+                // ~50 ms, ~150 ms — celkem < 250 ms navíc jen u 0-fillu.
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    50 * (attempt as u64 + 1),
+                ))
+                .await;
+            }
+        }
+
+        let mut total_cost = 0.0_f64;
+        let mut total_qty = 0.0_f64;
+        for t in &trades {
+            if t.order_id == order_id {
+                let qty = t.qty();
+                if qty > 0.0 && t.exec_price > 0.0 {
+                    total_cost += qty * t.exec_price;
+                    total_qty += qty;
+                }
+            }
+        }
+
+        if total_qty <= 0.0 {
+            // Žádný fill tohoto order_id v poslední minutě → potvrzený 0-fill.
+            Ok(None)
+        } else {
+            Ok(Some((total_cost / total_qty, total_qty)))
+        }
+    }
+
     /// Get active open order IDs for a symbol (for orphan reconciliation)
     pub async fn get_active_orders(&self, symbol: &str) -> PiranaResult<Vec<i64>> {
         let nonce = self.next_nonce();
@@ -627,6 +705,19 @@ mod tests {
         let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,-0.000052,-0.000052,"EXCHANGE MARKET",null,null,null,0,"ACTIVE",null,null,0,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
         let r = BitfinexClient::parse_order_execution(sample, 76288.0, -0.000052);
         assert_eq!(r.avg_fill_price, 76288.0);
+    }
+
+    /// [CASLAV v5.1 / OPONENTURA REGRESNÍ TEST 2] CANCELED IOC s NEGENULOVÝM
+    /// price_avg (Bitfinex tam vrací limit cenu orderu!): dřívější podmínka
+    /// `avg_fill_price <= 0.0` tuto variantu nechytila a 0-fill order prošel
+    /// jako 100% fill → ghost pozice.
+    #[test]
+    fn test_parse_order_execution_canceled_with_limit_price() {
+        // status CANCELED, price_avg = 78959 (LIMIT cena, ne fill!), amount == amount_orig.
+        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,0.000052,0.000052,"EXCHANGE IOC",null,null,null,0,"CANCELED",null,null,78959,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
+        let r = BitfinexClient::parse_order_execution(sample, 78920.0, 0.000052);
+        assert_eq!(r.filled_qty, 0.0, "CANCELED s limit price_avg musí být 0-fill, ne 100% fill");
+        assert_eq!(r.avg_fill_price, 0.0, "limit cena není fill cena — musí být vynulovaná");
     }
 
     /// [CASLAV v5.1 / OPONENTURA REGRESNÍ TEST] IOC zrušen bez fillu:
