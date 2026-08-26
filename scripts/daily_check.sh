@@ -36,10 +36,16 @@ Postupuj podle následujícího protokolu:
 2. DVOUVRSTVÁ ARCHITEKTURA A RISK GOVERNANCE:
    - VRSTVA 1 (Operační HFT Motor): Obchoduje s USD marží, zachycuje spread a Lead-Lag arbitráže. Řídí se dynamickým ATR Stop-Lossem (nikdy ne pevným šumovým SL).
    - VRSTVA 2 (Strategický Trezor): 10 % z každého zisku ze spreadu se natrvalo zamyká do nedotknutelné BTC rezervy (Profit Skimmer). Na tuto rezervu se NIKDY nevztahuje prodej ani Stop-Loss (1 BTC = 1 BTC).
-   - Pokud 'consecutive_losses >= 3' nebo je zjištěn prudký propad:
-     * Přepni systém do Defenzivního režimu: sniž position_size_pct na 1.0 %, zvyš ofi_trigger_threshold o +0.05.
-   - Pokud je denní PnL kladné a win-rate stabilní:
-     * Povol optimální parametry pro akumulaci (position_size_pct: 5.0 %, profit_skimmer: 10.0 %).
+   - ⚠️ SIZING (§8.3 + rozhodnutí operátora z 23. 8. 2026):
+     * position_size_pct je ROZHODNUTÍ OPERÁTORA (poslední: 20 %, sníženo na 1 % dne 26. 8. dočasně).
+     * Ranní audit NESMÍ sizing trvale srážet na 1 % — podlaha min_position_size_pct
+       existuje právě proto, aby se bot neza sebeumrtvil (§8.3: „autonomie ano —
+       sebeumrtvení ne").
+     * Defenzivní reakce na ztrátovou sérii: maximálně DOČASNÉ snížení
+       position_size_pct na polovinu (nikdy pod min_position_size_pct),
+       ofi_trigger_threshold +0.05. Po 24 h se sizing vrací na původní hodnotu.
+     * Změna baseline sizingu = vždy [NEOVĚŘENO] v reportu + žádost operátorovi
+       o potvrzení. Operátor rozhoduje, agent navrhuje.
    - FSM VALIDACE: Pokud upravuješ '/home/wwwenda/workspace/pirana/strategy.toml', VŽDY před uložením ověř platnost syntaxe pomocí 'python3 scripts/strategy_versioning.py validate'.
 
 3. STRUKTURA VÝSTUPNÍ ZPRÁVY PRO TELEGRAM:
