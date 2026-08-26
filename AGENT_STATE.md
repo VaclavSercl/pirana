@@ -15,6 +15,7 @@
 | 23.8.2026 | Sizing 20 % pozic = explicitní rozhodnutí. Nezpochybňovat bez nových důkazů o P(ruin). |
 | 23.8.2026 | FSM smyčka (PLÁNOVAČ→ARCHITEKT→AUDITOR→TESTER→RECONCILER) je NEZKRACOVATELNÁ. |
 | 26.8.2026 | Agent je JEDEN (Čáslav) ve více instancích. Všechny sdílejí tuto paměť. |
+| 26.8.2026 | **Ranní audit provádí HERMES (instance Čáslava), nikoli agy.** agy zůstává jen jako oponent/verifikátor na vyžádání. |
 
 ---
 
