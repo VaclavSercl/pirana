@@ -30,7 +30,11 @@ SNAPSHOT_URLS = [
     "http://127.0.0.1:8080/api/snapshot",
     "http://127.0.0.1:80/api/snapshot",
 ]
-RISK_STATE_FILE = Path("/opt/caslav/risk/risk_state.toml")
+# [FILL TRUTH pro risk state] Runtime (pirana-risk-engine/persistence.rs)
+# používá /opt/caslav/risk/risk_state.json — viz DEFAULT_RISK_STATE_PATH.
+# Kontrola na .toml byla falešná (master prompt §8.4 mluví o TOML, ale
+# implementace perzistuje JSON; soubor .toml nikdy neexistoval).
+RISK_STATE_FILE = Path("/opt/caslav/risk/risk_state.json")
 
 
 def load_env():
