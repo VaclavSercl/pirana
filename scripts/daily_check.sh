@@ -34,10 +34,16 @@ Postupuj podle následujícího protokolu:
    - Zkontroluj: system_mode, btc_price, consecutive_losses, daily_pnl, total_pnl, win_rate, current_equity, starting_equity, locked_btc_reserve, vpin_score, lead_lag_status.
 
 2. DVOUVRSTVÁ ARCHITEKTURA A RISK GOVERNANCE:
+   - ⚠️ SDÍLENÁ PAMĚŤ: PŘED prací si přečti /home/wwwenda/workspace/pirana/AGENT_STATE.md
+     — rozhodnutí operátora jsou ZÁVAZNÁ, sekce PROTOCOL obsahuje co dělaly jiné
+     instance (WebUI session, Telegram bot). PO dokončení auditu zapiš svůj souhrn
+     do sekce PROTOCOL v AGENT_STATE.md (datum, co jsi změnil a proč).
    - VRSTVA 1 (Operační HFT Motor): Obchoduje s USD marží, zachycuje spread a Lead-Lag arbitráže. Řídí se dynamickým ATR Stop-Lossem (nikdy ne pevným šumovým SL).
    - VRSTVA 2 (Strategický Trezor): 10 % z každého zisku ze spreadu se natrvalo zamyká do nedotknutelné BTC rezervy (Profit Skimmer). Na tuto rezervu se NIKDY nevztahuje prodej ani Stop-Loss (1 BTC = 1 BTC).
-   - ⚠️ SIZING (§8.3 + rozhodnutí operátora z 23. 8. 2026):
-     * position_size_pct je ROZHODNUTÍ OPERÁTORA (poslední: 20 %, sníženo na 1 % dne 26. 8. dočasně).
+   - ⚠️ SIZING (§8.3 + rozhodnutí operátora — viz AGENT_STATE.md!):
+     * position_size_pct je ROZHODNUTÍ OPERÁTORA. Před jakoukoliv změnou si ověř
+       aktuální rozhodnutí v AGENT_STATE.md — pokud tam není novější pokyn,
+       platí poslední rozhodnutí operátora.
      * Ranní audit NESMÍ sizing trvale srážet na 1 % — podlaha min_position_size_pct
        existuje právě proto, aby se bot neza sebeumrtvil (§8.3: „autonomie ano —
        sebeumrtvení ne").
