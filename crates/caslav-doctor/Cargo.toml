@@ -1,0 +1,15 @@
+[package]
+name = "caslav-doctor"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "caslav-doctor"
+path = "src/main.rs"
+
+[dependencies]
+pirana-core = { path = "../pirana-core" }
+pirana-risk-engine = { path = "../pirana-risk-engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

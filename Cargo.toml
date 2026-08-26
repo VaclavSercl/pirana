@@ -23,6 +23,7 @@ members = [
     "crates/pirana-risk-engine",
     "crates/pirana-execution",
     "crates/pirana-dashboard",
+    "crates/caslav-doctor",
 ]
 
 [workspace.package]
