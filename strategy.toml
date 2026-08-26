@@ -9,7 +9,7 @@ max_open_orders = 3
 entry_zone_spread_usd = 5.0
 take_profit_distance_usd = 15.0
 stop_loss_distance_usd = 400.0
-ofi_trigger_threshold = 0.85
+ofi_trigger_threshold = 0.90
 ofi_window_size = 100
 # HFT frekvence (2026-08-23): 20000 -> 2000 ms
 # Tvrdý strop je Bitfinex: 90 orderů/min = 1,5 obchodu/s (0,67 s).
@@ -58,12 +58,12 @@ use_dynamic_inventory = true
 
 [risk_management]
 max_slippage_bps = 5
-position_size_pct = 20.0
+position_size_pct = 1.0
 max_aggregate_exposure_pct = 90.0
 max_single_trade_risk_pct = 5.0
 # daily_loss_limit_usd odstraněno 24.8. — risk engine používá daily_loss_limit_sats (kalibrované).
 use_dynamic_winrate_sizing = true
-min_position_size_pct = 5.0
+min_position_size_pct = 1.0
 max_position_size_pct = 25.0
 
 [volatility]
