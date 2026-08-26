@@ -85,21 +85,21 @@ Postupuj podle následujícího protokolu:
 EOF
 )
 
-echo "[$(date -Iseconds)] Spouštím ranní audit agenta Čáslav..." >> "$LOG_FILE"
+echo "[$(date -Iseconds)] Spouštím ranní audit agenta Čáslav (hermes)... " >> "$LOG_FILE"
 
-# Timeout 5 minut — agy dnes ráno běžel 34 minut a skončil chybou.
-# Bez timeoutu čeká skript donekonečna a žádný report neodešle.
-# -k 30s: pokud agy ignoruje SIGTERM, pošleme SIGKILL po 30s.
-AGY_TIMEOUT=300
-REPORT_OUTPUT=$(timeout -k 30s "$AGY_TIMEOUT" /home/wwwenda/.local/bin/agy --dangerously-skip-permissions --print "$PROMPT_CONTENT" 2>&1)
-AGY_EXIT=$?
+# [ROZHODNUTÍ OPERÁTORA 26.8.]: Ranní audit provádí HERMES (instance Čáslava),
+# nikoli agy. agy zůstává pouze jako oponent/verifikátor na vyžádání.
+# Timeout 5 minut (hermes -z oneshot). -k 30s: SIGKILL po 30s po ignorování SIGTERM.
+AGENT_TIMEOUT=300
+REPORT_OUTPUT=$(timeout -k 30s "$AGENT_TIMEOUT" hermes -z "$PROMPT_CONTENT" --yolo 2>&1)
+AGENT_EXIT=$?
 
 # Timeout nebo chyba → fallback report, ne ticho
-if [ $AGY_EXIT -ne 0 ]; then
-    if [ $AGY_EXIT -eq 124 ]; then
-        REPORT_OUTPUT="⚠️ <b>ČÁSLAV :: RANNÍ AUDIT — TIMEOUT</b>\n\nAgent agy nestihl odpovědět do 5 minut (timeout -k 30s). Zkontroluj logy: journalctl -u pirana-daily-check.service"
+if [ $AGENT_EXIT -ne 0 ]; then
+    if [ $AGENT_EXIT -eq 124 ]; then
+        REPORT_OUTPUT="⚠️ <b>ČÁSLAV :: RANNÍ AUDIT — TIMEOUT</b>\n\nAgent hermes nestihl odpovědět do 5 minut (timeout -k 30s). Zkontroluj logy: journalctl -u pirana-daily-check.service"
     else
-        REPORT_OUTPUT="⚠️ <b>ČÁSLAV :: RANNÍ AUDIT — CHYBA AGENTA</b>\n\nAgent agy skončil s exit kódem $AGY_EXIT. Zkontroluj logy: journalctl -u pirana-daily-check.service"
+        REPORT_OUTPUT="⚠️ <b>ČÁSLAV :: RANNÍ AUDIT — CHYBA AGENTA</b>\n\nAgent hermes skončil s exit kódem $AGENT_EXIT. Zkontroluj logy: journalctl -u pirana-daily-check.service"
     fi
 fi
 
@@ -107,10 +107,23 @@ fi
 echo "$REPORT_OUTPUT" >> "$LOG_FILE"
 
 # 3. Bezpečné odeslání na Telegram (HTML parse mode)
+# Sanitizace: Telegram HTML nesnasi bare '<' '>' (napr. "win rate <50 %" ->
+# "Unsupported start tag"). Povolene tagy b/i/code/pre zachovame, vsechen jiny
+# obsah s < > & escapujeme.
+sanitize_for_telegram() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+        -e 's/&lt;b&gt;/<b>/g' -e 's/&lt;\/b&gt;/<\/b>/g' \
+        -e 's/&lt;i&gt;/<i>/g' -e 's/&lt;\/i&gt;/<\/i>/g' \
+        -e 's/&lt;code&gt;/<code>/g' -e 's/&lt;\/code&gt;/<\/code>/g' \
+        -e 's/&lt;pre&gt;/<pre>/g' -e 's/&lt;\/pre&gt;/<\/pre>/g'
+}
+
+REPORT_SANITIZED=$(sanitize_for_telegram "$REPORT_OUTPUT")
+
 HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
     -d "chat_id=${CHAT_ID}" \
     -d "parse_mode=HTML" \
-    --data-urlencode "text=${REPORT_OUTPUT}")
+    --data-urlencode "text=${REPORT_SANITIZED}")
 
 HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n1)
 

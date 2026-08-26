@@ -32,6 +32,13 @@
 
 ### 26.8.2026
 
+- **11:57 (ranní audit — Hermes WebUI)**: Audit bez zásahu do TOML. Stav: Defensive,
+  consec_losses 6/5(seed práh), WR 22,7 % (15/66), denní PnL -0,063 USD (-0,016 %),
+  equity 402,07 USD (start 402,76), OFI=0.0, VPIN 41,0 %, markout_1s -7,8 bps (záporný
+  trend exekuce). Sizing 1,0 % PONECHÁN — čeká na rozhodnutí operátora (3 varianty
+  20 %/1 %/5 %). Defenzivní půlení na 0,5 % nelze — podlaha min_position_size_pct=1,0.
+  ⚠️ POZOR: consec_losses=6 překračuje seed práh 5, ale FSM hlásí jen Defensive, ne
+  Halted — ověřit logiku přechodu Defensive→Halted v pirana-risk-engine.
 - **10:15 (WebUI session)**: Analýza sizingu — Kelly f* = −38 % (negativní edge na 28
   round-tripech, win rate 14 %). Doporučeno nechat 1 % dokud edge kladný. Vysvětleno
   operátorovi, že sizing srazil ranní audit (instance agy) — prompt ve skriptu to
