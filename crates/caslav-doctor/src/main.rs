@@ -201,8 +201,13 @@ fn trading_check() {
     );
 
     // 7. Journal: infrastruktura (maintenance, WS, panic)
+    // [FIX false positive] Holé "502"/"503" se matchuje na časová razítka
+    // (např. 1787750503 obsahuje "503")! Patterny musí být kontextové.
     let ws_errors = count_journal(&["WebSocket closed", "Connection reset", "tungstenite"], 10);
-    let maintenance = count_journal(&["502", "503", "maintenance"], 10);
+    let maintenance = count_journal(
+        &["502 Bad Gateway", "503 Service", "temporarily unavailable", "maintenance mode"],
+        10,
+    );
     let panics = count_journal(&["panicked at", "fatal runtime error"], 10);
     if ws_errors >= 3 || maintenance >= 3 || panics >= 1 {
         println!(
