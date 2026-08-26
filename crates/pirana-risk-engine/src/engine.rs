@@ -229,6 +229,13 @@ impl RiskEngine {
         effective_max_weekly_drawdown(self.calibrated.read().max_weekly_drawdown.value)
     }
 
+    /// Nahradí interní TradeLedger za obnovený z persistence (recovery).
+    /// Volá se jednou při startu po načtení snapshotu + JSONL — nové trasy
+    /// se pak zapisují do tohoto ledgeru a kalibrace vidí plnou historii.
+    pub fn adopt_ledger(&self, ledger: TradeLedger) {
+        *self.ledger.lock() = ledger;
+    }
+
     /// Efektivni prah po sobe jdoucich ztrat (kalibrace ∧ hard cap).
     pub fn consecutive_loss_threshold(&self) -> u32 {
         effective_consecutive_loss_threshold(self.calibrated.read().consecutive_loss_threshold.value)

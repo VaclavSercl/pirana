@@ -361,6 +361,33 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     } else {
         info!("TradeLedger: zadny snapshot, start od nuly");
     }
+    // [RECOVERY — nález 26. 8.] Snapshot si pamatuje jen metadata (closed_count),
+    // ne samotné trades. Bez obnovení z JSONL měl ledger po každém restartu
+    // sample_size 0 → kalibrace ani baseline nikdy nemohly konvergovat.
+    // Načteme posledních LEDGER_CAPACITY round-tripů z append-only logu.
+    match ledger_persistence::load_all_trades() {
+        Ok(trades) if !trades.is_empty() => {
+            let n = trades.len();
+            ledger.restore_closed_trades(trades);
+            info!(
+                "TradeLedger: obnoveno {} round-tripy z JSONL logu (sample_size po restartu: {})",
+                n,
+                ledger.len()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("TradeLedger: JSONL log necitelny ({}), pokracuji se snapshotem", e);
+        }
+    }
+    // [RECOVERY wiring] RiskEngine ma svuj interni (prazdny) ledger —
+    // nahradime ho obnovenym, aby kalibrace/baseline videly plnou historii.
+    // Bez tohoto kroku zil obnoveny ledger jen v lokalni promenne a zahodil se.
+    risk_engine.adopt_ledger(ledger);
+    info!(
+        "RiskEngine: ledger adoptovan — sample_size po startu = {}",
+        risk_engine.ledger_len()
+    );
 
     let active_positions = Arc::new(parking_lot::RwLock::new(Vec::<ActivePosition>::new()));
 

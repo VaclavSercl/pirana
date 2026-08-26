@@ -170,6 +170,21 @@ impl TradeLedger {
         self.open_lots = lots.into();
     }
 
+    /// Obnovi UZAVRENE round-tripy z JSONL logu (recovery po restartu).
+    ///
+    /// [Nález 26. 8.] Snapshot si pamatuje jen closed_count (metadata), ale
+    /// ne samotné trades — bez tohoto restore měl ledger po každém restartu
+    /// sample_size 0 a kalibrace/baseline nikdy nemohla konvergovat.
+    /// Berou se posledních LEDGER_CAPACITY záznamů (nejstarší zahazovány
+    /// stejně jako v živém provozu).
+    pub fn restore_closed_trades(&mut self, trades: Vec<ClosedTrade>) {
+        self.trades.clear();
+        let start = trades.len().saturating_sub(self.trades.capacity());
+        for t in trades.into_iter().skip(start) {
+            self.trades.push_back(t);
+        }
+    }
+
     /// Nastavi denni stav (pro snapshot recovery).
     pub fn set_day_state(&mut self, day: i64, start_equity: f64, pnl: f64) {
         self.current_day = day;
