@@ -64,7 +64,15 @@ impl From<std::io::Error> for LedgerPersistError {
 ///
 /// Neprebytecne rychle — vola se po kazdem uzavrenem obchodu.
 /// JSONL = line-by-line, zadna deserializace celeho souboru.
+///
+/// [Nález 26. 8.] Souběžné appendy z dvou vláken vytvořily slepený řádek
+/// '{...}{...}' — vždy jeden zámek na soubor. Atomicita jednoho write()
+/// na < PIPE_BUF (4096) je zaručena jádrem.
 pub fn append_trade(trade: &ClosedTrade) -> Result<(), LedgerPersistError> {
+    use std::sync::Mutex;
+    static APPEND_LOCK: Mutex<()> = Mutex::new(());
+
+    let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = Path::new(TRADE_LEDGER_PATH);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -84,6 +92,9 @@ pub fn append_trade(trade: &ClosedTrade) -> Result<(), LedgerPersistError> {
 /// Nacte vsechny round-tripsy z JSONL logu.
 ///
 /// Pouziva se pri disaster recovery — normalni start cte snapshot.
+/// Poškozené řádky (race condition při souběžném appendu — dva JSONy
+/// slepené v jednom řádku) se PřESKOČÍ s warningem, ne aby zahodily
+/// celou historii. Nález 26. 8.: jeden slepený řádek zrušil 196 záznamů.
 pub fn load_all_trades() -> Result<Vec<ClosedTrade>, LedgerPersistError> {
     let path = Path::new(TRADE_LEDGER_PATH);
     if !path.exists() {
@@ -93,14 +104,54 @@ pub fn load_all_trades() -> Result<Vec<ClosedTrade>, LedgerPersistError> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut trades = Vec::new();
+    let mut skipped = 0u32;
 
     for line in reader.lines() {
         let line = line?;
-        if line.trim().is_empty() {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        let trade: ClosedTrade = serde_json::from_str(&line).map_err(LedgerPersistError::Decode)?;
-        trades.push(trade);
+        // Slepené řádky: '{...}{...}' — zkusíme rozdělit na jednotlivé
+        // JSON objekty. Serde stream decoder by byl čistší, ale
+        // minimální robustní řešení: rozdělit před '{"pnl_sats"'.
+        let mut rest = line;
+        loop {
+            match serde_json::from_str::<ClosedTrade>(rest) {
+                Ok(t) => {
+                    trades.push(t);
+                    break;
+                }
+                Err(e) => {
+                    // Zkusit najít další objekt v řádku (slepené zápisy).
+                    if let Some(idx) = rest[1..].find("{\"pnl_sats\"") {
+                        let (head, tail) = rest.split_at(idx + 1);
+                        match serde_json::from_str::<ClosedTrade>(head) {
+                            Ok(t) => {
+                                trades.push(t);
+                                rest = tail;
+                                continue;
+                            }
+                            Err(_) => {
+                                skipped += 1;
+                                rest = tail;
+                                continue;
+                            }
+                        }
+                    }
+                    let _ = e; // nepoužitelný zbytek
+                    skipped += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            "Ledger JSONL: přeskočeno {} poškozených segmentů (race v appendu)",
+            skipped
+        );
     }
 
     Ok(trades)
