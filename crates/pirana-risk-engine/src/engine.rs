@@ -82,6 +82,9 @@ struct RiskState {
     paper_consecutive_wins: u32,
     /// Kdy system vstoupil do Defensive (Unix timestamp). 0 = neni Defensive.
     defensive_since: i64,
+    /// Poslední měřený markout +1 s (bps) pro markout gate baseline.
+    /// NaN = dosud neměřeno (po startu). [Podmínka operátora 26. 8.]
+    last_markout_1s_bps: f64,
 }
 
 impl RiskEngine {
@@ -158,6 +161,7 @@ impl RiskEngine {
                 weekly_drawdown_pct: 0.0,
                 paper_consecutive_wins: 0,
                 defensive_since: 0,
+                last_markout_1s_bps: f64::NAN, // dosud neměřeno
             })),
             calibrated: Arc::new(RwLock::new(calibrated)),
             ledger: Arc::new(Mutex::new(TradeLedger::new())),
@@ -284,10 +288,17 @@ impl RiskEngine {
             .lock()
             .record_close(pnl_usd, fill_price, equity_usd, vpin, now);
 
-        // [ADAPTIVE BASELINE] Sledování počtu RT od posledního zvýšení
-        // pro LKG rollback (nález oponentury: record_rt byl mrtvý kód).
+        // [ADAPTIVE BASELINE] Sledování počtu RT a kumulativního PnL od
+        // posledního zvýšení pro LKG rollback (nález oponentury: record_rt
+        // byl mrtvý kód; podmínka operátora: kritérium = kumulativní PnL).
+        // PnL v sats: pnl_usd / fill_price * 1e8.
         if let Some(b) = self.calibrated.write().adaptive_baseline.as_mut() {
-            b.record_rt();
+            let pnl_sats = if fill_price > 0.0 {
+                pnl_usd / fill_price * 100_000_000.0
+            } else {
+                0.0
+            };
+            b.record_rt_pnl(pnl_sats);
         }
     }
 
@@ -380,10 +391,13 @@ impl RiskEngine {
         let p_new = SelfCalibration::p_ruin_at_exposure(stats, baseline.value * 1.2); // worst-case krok
 
         let _ = (p_old, p_new); // P(ruin) se počítá uvnitř update (absolutní práh)
+        // [MARKOUT GATE — podmínka operátora] Reálný markout +1 s (bps)
+        // z MarkoutTrackeru; None pokud dosud neměřeno (konzervativně blokuje).
+        let markout_bps = self.last_markout_1s();
         let (next, changed) = baseline.update(
             stats,
             total_rts,
-            None, // markout: doplní main.rs přes setter, až bude dostupný
+            markout_bps,
             floor_pct,
             ceiling_pct,
             defensive,
@@ -408,6 +422,26 @@ impl RiskEngine {
             .adaptive_baseline
             .as_ref()
             .map(|b| b.value * 100.0)
+    }
+
+    /// [MARKOUT GATE — podmínka operátora 26. 8.] Záznam posledního měřeného
+    /// markoutu (+1 s, v bps) pro markout gate autonomní baseline.
+    /// Volá se z hot loopu po každém `process_price` na MarkoutTrackeru.
+    /// Hodnota slouží jako podmínka č. 2 zvýšení baseline: zvýšení je
+    /// povoleno jen při nezáporném markoutu (exekuce nepřichází pozdě).
+    pub fn record_markout_1s(&self, markout_bps: f64) {
+        let mut state = self.state.write();
+        state.last_markout_1s_bps = markout_bps;
+    }
+
+    /// Poslední měřený markout +1 s (bps); None pokud dosud neměřeno.
+    pub fn last_markout_1s(&self) -> Option<f64> {
+        let m = self.state.read().last_markout_1s_bps;
+        if m.is_finite() {
+            Some(m)
+        } else {
+            None
+        }
     }
 
     /// Rekalibrace, ktera sama zaloguje vysledek a nic nevyhazuje.

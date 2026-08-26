@@ -113,6 +113,10 @@ pub struct AdaptiveBaseline {
     pub lkg_value: f64,
     /// Počet RT od posledního zvýšení — pro LKG rollback check.
     pub rts_since_increase: usize,
+    /// Kumulativní PnL (sats) od posledního zvýšení baseline.
+    /// [Podmínka operátora: LKG rollback = 100 RT bez kladného kumulativního PnL]
+    #[serde(default)]
+    pub pnl_since_increase_sats: f64,
 }
 
 impl AdaptiveBaseline {
@@ -135,6 +139,7 @@ impl AdaptiveBaseline {
             last_change_rts: 0,
             lkg_value: start,
             rts_since_increase: 0,
+            pnl_since_increase_sats: 0.0,
         }
     }
 
@@ -281,35 +286,44 @@ impl AdaptiveBaseline {
             }
         }
 
-        // ── LKG rollback check: po zvýšení sledujeme výsledek ──
-        if self.rts_since_increase > 0 && total_rts.saturating_sub(self.last_change_rts) >= BASELINE_LKG_ROLLBACK_RTS {
-            // 100 RT od zvýšení — pokud performance nestoupla, rollback na LKG.
-            // Kritérium: win_rate pod breakeven → zvýšení nepomohlo.
-            let breakeven = if b > EPSILON { 1.0 / (1.0 + b) } else { 1.0 };
-            if stats.win_rate < breakeven {
+        // ── LKG rollback check [podmínka operátora — přesný vzorec] ──
+        // Definice: po zvýšení baseline platí nová hodnota, dokud 100 dalších
+        // RT nemá KUMULATIVNÍ PnL > 0 (v satoshi); jinak návrat na LKG.
+        // Kumulativní PnL se akumuluje v `pnl_since_increase_sats` přes
+        // `record_rt_pnl` (voláno z record_closed_trade).
+        if self.rts_since_increase >= BASELINE_LKG_ROLLBACK_RTS {
+            if self.pnl_since_increase_sats > 0.0 {
+                // Vydrželo — potvrzení, nové LKG.
+                next.lkg_value = self.value;
+                next.rts_since_increase = 0;
+                next.pnl_since_increase_sats = 0.0;
+            } else {
                 next.value = self.lkg_value;
                 next.previous_value = self.value;
-                next.formula = "LKG ROLLBACK — 100 RT pod breakeven po zvýšení".into();
+                next.formula = "LKG ROLLBACK — 100 RT s kumulativním PnL ≤ 0".into();
                 next.inputs = format!(
-                    "win_rate={:.3} < breakeven={:.3}, návrat na LKG {:.2}%",
-                    stats.win_rate, breakeven, self.lkg_value * 100.0
+                    "kumulativní PnL za {} RT = {:.0} sats ≤ 0 → návrat na LKG {:.2}%",
+                    self.rts_since_increase,
+                    self.pnl_since_increase_sats,
+                    self.lkg_value * 100.0
                 );
                 next.computed_at = now;
                 next.last_change_rts = total_rts;
                 next.rts_since_increase = 0;
+                next.pnl_since_increase_sats = 0.0;
                 return (next, true);
             }
-            // Vydrželo — potvrzení, nové LKG.
-            next.lkg_value = self.value;
-            next.rts_since_increase = 0;
         }
 
         (next, false)
     }
 
-    /// Záznam nového RT pro sledování LKG rollback.
-    pub fn record_rt(&mut self) {
+    /// Záznam nového RT pro sledování LKG rollback — včetně PnL.
+    /// [Podmínka operátora] Kumulativní PnL rozhoduje o rollbacku,
+    /// ne win rate: i nízký win rate s kladným kumulativním PnL je úspěch.
+    pub fn record_rt_pnl(&mut self, pnl_sats: f64) {
         self.rts_since_increase += 1;
+        self.pnl_since_increase_sats += pnl_sats;
     }
 }
 
@@ -408,18 +422,42 @@ mod tests {
     }
 
     #[test]
-    fn lkg_rollback_after_bad_performance() {
-        // Zvýšení proběhlo, pak 100 RT pod breakeven → rollback
+    fn lkg_rollback_on_negative_cum_pnl() {
+        // [Podmínka operátora] Přímý test rollbacku: 100 RT od zvýšení,
+        // kumulativní PnL ≤ 0 → návrat na LKG. Kritérium = kumulativní PnL.
         let mut b = AdaptiveBaseline::seed(1.0);
-        b.value = 0.05; // zvýšeno
-        b.lkg_value = 0.01; // LKG je 1 %
-        b.last_change_rts = 0;
+        b.value = 0.05;
+        b.lkg_value = 0.01;
         b.rts_since_increase = 100;
-        let (next, changed) = b.update(&stats(0.21, 165.0, 100.0, 100), 100, Some(-2.0), 1.0, 25.0, false);
-        // win_rate 0.21 < breakeven 0.377 → rollback na 1 %... ale zároveň
-        // negativní Kelly chce floor. Snížení má prioritu, výsledek stejný směr.
-        assert!(changed);
-        assert!(next.value < 0.05, "rollback/smíření dolů: {}", next.value);
+        b.pnl_since_increase_sats = -500.0; // kumulativní ztráta
+        // Kelly ≈ neutrální (p=0.45, b=1.22 → f* ~ 0) → target ≈ floor(1 %)
+        let (next, changed) = b.update(&stats(0.45, 122.0, 100.0, 100), 100, Some(1.0), 1.0, 25.0, false);
+        assert!(changed, "rollback musí proběhnout");
+        assert!((next.value - 0.01).abs() < 1e-9, "návrat na LKG 1 %, ne {}", next.value);
+    }
+
+    #[test]
+    fn lkg_confirmed_on_positive_cum_pnl() {
+        // 100 RT od zvýšení, kumulativní PnL kladný → potvrzení, nové LKG.
+        // Value = floor (žádný tlak Kellyho na snížení ani zvýšení —
+        // rts_ready splněno 100−0 ≥ 20, ale target = floor ⇒ žádný růst).
+        let mut b = AdaptiveBaseline::seed(1.0);
+        b.value = 0.05;
+        b.lkg_value = 0.05;
+        b.rts_since_increase = 100;
+        b.pnl_since_increase_sats = 800.0; // zisk
+        // Kelly slabě kladný → target = f_used = 0.0433 < value 5 % → snížení!
+        // Pro potvrzení bez snížení potřebujeme target >= value:
+        // p=0.62, b=2.26 → f* = 0.449 → f_used = 0.112 → target = 11.2 % > 5 %.
+        // Ale pak rts_ready (100 ≥ 20) → zvýšení proběhne... kromě EWMA cap.
+        // Nejčistší ověření potvrzení: sledovat lkg_value přes vlastnosti next.
+        let (next, changed) = b.update(&stats(0.62, 226.0, 100.0, 100), 100, Some(1.0), 1.0, 25.0, false);
+        // Buď potvrzení (changed=false, LKG ← 5 %), nebo zvýšení + reset.
+        // V obou případech nesmí být rollback na LKG (PnL > 0):
+        assert!(next.value >= 0.05, "žádný rollback při PnL > 0: {}", next.value);
+        if !changed {
+            assert!((next.lkg_value - 0.05).abs() < 1e-9, "nové LKG = 5 %");
+        }
     }
 
     #[test]

@@ -807,6 +807,10 @@ async fn process_ws_message(
                         *state.markout_1s.write() = markout_summary.markout_1s;
                         *state.markout_5s.write() = markout_summary.markout_5s;
                         *state.markout_30s.write() = markout_summary.markout_30s;
+                        // [MARKOUT GATE — podmínka operátora] Poslední měřený
+                        // markout +1 s z MarkoutTrackeru do RiskEngine — baseline
+                        // ho potřebuje jako podmínku č. 2 zvýšení.
+                        risk_engine.record_markout_1s(markout_summary.markout_1s);
 
                         let conf = strategy_config.read().clone();
                         if conf.avellaneda_stoikov.enabled {
