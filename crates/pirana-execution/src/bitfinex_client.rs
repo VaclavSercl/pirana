@@ -109,6 +109,24 @@ impl BitfinexClient {
     /// na KLIC, ne na klienta — dva klienti s vlastnim limiterem 80/min
     /// dohromady poslou az 160/min proti stropu 90/min. Pro dalsi klienty
     /// nad tymz klicem pouzij [`Self::with_shared_limiter`].
+    /// Test konstruktor: vlastní base_url (mock server) + sdílené složky
+    /// s existujícím klientem — přesně jako produkční `with_shared_limiter`.
+    #[cfg(test)]
+    pub fn new_for_test(base_url: String, api_key: String, api_secret: String, shared: Option<&Self>) -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("Failed to build HTTP client"),
+            base_url,
+            api_key,
+            api_secret,
+            rate_limiter: shared.map(|o| o.rate_limiter.clone()).unwrap_or_else(RateLimiter::with_default),
+            nonce_counter: shared.map(|o| Arc::clone(&o.nonce_counter)).unwrap_or_else(|| Arc::new(AtomicI64::new(chrono::Utc::now().timestamp_micros()))),
+            submit_mutex: shared.map(|o| Arc::clone(&o.submit_mutex)).unwrap_or_default(),
+        }
+    }
+
     pub fn new(api_key: String, api_secret: String) -> Self {
         Self {
             client: Client::builder()
@@ -186,6 +204,71 @@ impl BitfinexClient {
     /// Returns a parsed `OrderExecutionResult` containing the REAL average
     /// execution price reported by the exchange (index 16 of the order array
     /// in the `on-req` notification payload). Callers MUST use
+    /// Jediná cesta pro autentizované POST požadavky [DRY — oponentura P0].
+    ///
+    /// Zapouzdřuje kompletní sekvenci: submit_mutex (nonce race ochrana,
+    /// viz struct dokumentace) → nonce → podpis → rate limiter → odeslání
+    /// → přečtení odpovědi → klasifikace HTTP statusu.
+    ///
+    /// **Každý nový auth endpoint MUSÍ jít přes tuto metodu** — mutex,
+    /// rate limit i error handling se tím zaručí; ruční kopírování
+    /// sekvence je jako 26. 8. zdroj race bugů.
+    ///
+    /// Vrací (HTTP status, tělo odpovědi). Neúspěšný status vrací Err
+    /// (s výjimkou 429, které aktivuje backoff v rate limiteru).
+    async fn post_auth(&self, endpoint: &str, body: &str) -> PiranaResult<(reqwest::StatusCode, String)> {
+        use std::borrow::Cow;
+
+        // Nonce + odeslání pod jedním zámkem: alokace nonce a TCP odeslání
+        // jsou atomické → pořadí doručení = pořadí nonce = Bitfinex happy.
+        let _guard = self.submit_mutex.lock().await;
+        let nonce = self.next_nonce();
+
+        let payload = format!("{}{}{}", endpoint, nonce, body);
+        let signature = self.sign(&payload);
+        let url: Cow<str> = if self.base_url.starts_with("http") {
+            format!("{}/v2/{}", self.base_url, endpoint.trim_start_matches("/api/v2/")).into()
+        } else {
+            self.base_url.clone().into()
+        };
+        let url: String = url.to_string();
+
+        // Rate limit: pockat na token, nez zatizime burzu.
+        self.rate_limiter.acquire().await;
+
+        let response = self.client
+            .post(&url)
+            .header("bfx-apikey", &self.api_key)
+            .header("bfx-nonce", &nonce)
+            .header("bfx-signature", &signature)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| PiranaError::ExchangeApi {
+                code: -1,
+                message: format!("Auth request failed: {}", e),
+            })?;
+
+        let status = response.status();
+        let text = response.text().await.map_err(|e| PiranaError::ExchangeApi {
+            code: -1,
+            message: format!("Failed to read response: {}", e),
+        })?;
+
+        if status.as_u16() == 429 {
+            self.rate_limiter.record_rate_limited();
+            error!("Bitfinex rate limit (429): {}", text);
+            return Err(PiranaError::ExchangeApi {
+                code: 429,
+                message: format!("rate limited: {}", text),
+            });
+        }
+
+        self.rate_limiter.record_success();
+        Ok((status, text))
+    }
+
     /// `avg_fill_price` for PnL accounting instead of the ticker price at
     /// submission time — market orders slip.
     pub async fn submit_order(
@@ -203,13 +286,6 @@ impl BitfinexClient {
             });
         }
 
-        // [FIX nonce race] Nonce + odeslání pod jedním zámkem — viz
-        // submit_mutex dokumentace. Bez toho paralelní tasky alokovaly
-        // nonce A,B ale doručily B dřív → A odmítnuto (10114).
-        let _submit_guard = self.submit_mutex.lock().await;
-        let nonce = self.next_nonce();
-        let endpoint = "/api/v2/auth/w/order/submit";
-
         let type_str = match order_type {
             OrderType::Limit => "EXCHANGE LIMIT",
             OrderType::Market => "EXCHANGE MARKET",
@@ -223,46 +299,11 @@ impl BitfinexClient {
             r#"{{"type":"{}","symbol":"{}","amount":"{:.6}","price":"{:.2}"}}"#,
             type_str, symbol, quantity, price
         );
-        let payload = format!("{}{}{}", endpoint, nonce, &body_str);
-        let signature = self.sign(&payload);
-
-        let url = format!("{}/v2/auth/w/order/submit", self.base_url);
 
         debug!("Submitting order: {} {} {} @ {}", side_str(side), quantity, symbol, price);
 
-        // Rate limit: pockat na token, nez zatizime burzu.
-        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
-        self.rate_limiter.acquire().await;
-        let response = self.client
-            .post(&url)
-            .header("bfx-apikey", &self.api_key)
-            .header("bfx-nonce", &nonce)
-            .header("bfx-signature", &signature)
-            .header("Content-Type", "application/json")
-            .body(body_str)
-            .send()
-            .await
-            .map_err(|e| PiranaError::ExchangeApi {
-                code: -1,
-                message: format!("Order submission failed: {}", e),
-            })?;
-
-        let status = response.status();
-        let text = response.text().await.map_err(|e| PiranaError::ExchangeApi {
-            code: -1,
-            message: format!("Failed to read response: {}", e),
-        })?;
-
-        // HTTP 429 = prekrocili jsme tempo. Aktivovat exponencialni backoff,
-        // aby dalsi volani pockala. Ban od burzy je horsi nez zmeskany obchod.
-        if status.as_u16() == 429 {
-            self.rate_limiter.record_rate_limited();
-            error!("Bitfinex rate limit (429): {}", text);
-            return Err(PiranaError::ExchangeApi {
-                code: 429,
-                message: format!("rate limited: {text}"),
-            });
-        }
+        // [DRY] Veškerá nonce/mutex/rate-limit/error logika v post_auth.
+        let (status, text) = self.post_auth("/api/v2/auth/w/order/submit", &body_str).await?;
 
         if !status.is_success() {
             error!("Order rejected: {} - {}", status, text);
@@ -271,8 +312,6 @@ impl BitfinexClient {
                 message: text,
             });
         }
-
-        self.rate_limiter.record_success();
 
         info!("Order submitted successfully: {}", text);
         Ok(Self::parse_order_execution(&text, price, quantity))
@@ -363,48 +402,8 @@ impl BitfinexClient {
 
     /// Cancel an order
     pub async fn cancel_order(&self, order_id: i64) -> PiranaResult<String> {
-        let _submit_guard = self.submit_mutex.lock().await;
-        let nonce = self.next_nonce();
-        let endpoint = "/api/v2/auth/w/order/cancel";
-
         let body_str = format!(r#"{{"id":{}}}"#, order_id);
-        let payload = format!("{}{}{}", endpoint, nonce, &body_str);
-        let signature = self.sign(&payload);
-
-        let url = format!("{}/v2/auth/w/order/cancel", self.base_url);
-
-        // Rate limit: pockat na token, nez zatizime burzu.
-        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
-        self.rate_limiter.acquire().await;
-        let response = self.client
-            .post(&url)
-            .header("bfx-apikey", &self.api_key)
-            .header("bfx-nonce", &nonce)
-            .header("bfx-signature", &signature)
-            .header("Content-Type", "application/json")
-            .body(body_str)
-            .send()
-            .await
-            .map_err(|e| PiranaError::ExchangeApi {
-                code: -1,
-                message: format!("Cancel failed: {}", e),
-            })?;
-
-        let status = response.status();
-        let text = response.text().await.map_err(|e| PiranaError::ExchangeApi {
-            code: -1,
-            message: format!("Failed to read cancel response: {}", e),
-        })?;
-
-        // HTTP 429 = prekrocili jsme tempo. Aktivovat exponencialni backoff.
-        if status.as_u16() == 429 {
-            self.rate_limiter.record_rate_limited();
-            error!("Bitfinex rate limit (429) on cancel: {}", text);
-            return Err(PiranaError::ExchangeApi {
-                code: 429,
-                message: format!("rate limited: {text}"),
-            });
-        }
+        let (status, text) = self.post_auth("/api/v2/auth/w/order/cancel", &body_str).await?;
 
         if !status.is_success() {
             error!("Cancel rejected: {} - {}", status, text);
@@ -414,41 +413,14 @@ impl BitfinexClient {
             });
         }
 
-        self.rate_limiter.record_success();
-
         info!("Order {} cancelled: {}", order_id, text);
         Ok(text)
     }
 
     /// Get wallet balances
     pub async fn get_wallets(&self) -> PiranaResult<Vec<Balance>> {
-        let _submit_guard = self.submit_mutex.lock().await;
-        let nonce = self.next_nonce();
-        let endpoint = "/api/v2/auth/r/wallets";
-        let body = "{}";
-        let payload = format!("{}{}{}", endpoint, nonce, body);
-        let signature = self.sign(&payload);
-
-        let url = format!("{}/v2/auth/r/wallets", self.base_url);
-
-        // Rate limit: pockat na token, nez zatizime burzu.
-        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
-        self.rate_limiter.acquire().await;
-        let response = self.client
-            .post(&url)
-            .header("bfx-apikey", &self.api_key)
-            .header("bfx-nonce", &nonce)
-            .header("bfx-signature", &signature)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| PiranaError::ExchangeApi {
-                code: -1,
-                message: format!("Wallets request failed: {}", e),
-            })?;
-
-        let json: serde_json::Value = response.json().await.map_err(|e| {
+        let (_status, text) = self.post_auth("/api/v2/auth/r/wallets", "{}").await?;
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             PiranaError::ExchangeApi {
                 code: -1,
                 message: format!("Wallets parse failed: {}", e),
@@ -490,43 +462,9 @@ impl BitfinexClient {
         start: i64,
         limit: i32,
     ) -> PiranaResult<Vec<TradeRecord>> {
-        let _submit_guard = self.submit_mutex.lock().await;
-        let nonce = self.next_nonce();
         let endpoint = format!("/api/v2/auth/r/trades/{}/hist", symbol);
         let body = format!(r#"{{"start":{},"limit":{}}}"#, start, limit);
-        let payload = format!("{}{}{}", endpoint, nonce, body);
-        let signature = self.sign(&payload);
-
-        let url = format!("{}/v2/auth/r/trades/{}/hist", self.base_url, symbol);
-
-        self.rate_limiter.acquire().await;
-        let response = self.client
-            .post(&url)
-            .header("bfx-apikey", &self.api_key)
-            .header("bfx-nonce", &nonce)
-            .header("bfx-signature", &signature)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| PiranaError::ExchangeApi {
-                code: -1,
-                message: format!("Trades history request failed: {}", e),
-            })?;
-
-        let status = response.status();
-        let text = response.text().await.map_err(|e| PiranaError::ExchangeApi {
-            code: -1,
-            message: format!("Trades history read failed: {}", e),
-        })?;
-
-        if status.as_u16() == 429 {
-            self.rate_limiter.record_rate_limited();
-            return Err(PiranaError::ExchangeApi {
-                code: 429,
-                message: "Rate limit hit on trades history".into(),
-            });
-        }
+        let (status, text) = self.post_auth(&endpoint, &body).await?;
         if !status.is_success() {
             return Err(PiranaError::ExchangeApi {
                 code: status.as_u16() as i32,
@@ -638,33 +576,9 @@ impl BitfinexClient {
 
     /// Get active open order IDs for a symbol (for orphan reconciliation)
     pub async fn get_active_orders(&self, symbol: &str) -> PiranaResult<Vec<i64>> {
-        let _submit_guard = self.submit_mutex.lock().await;
-        let nonce = self.next_nonce();
         let endpoint = format!("/api/v2/auth/r/orders/{}", symbol);
-        let body = "{}";
-        let payload = format!("{}{}{}", endpoint, nonce, body);
-        let signature = self.sign(&payload);
-
-        let url = format!("{}/v2/auth/r/orders/{}", self.base_url, symbol);
-
-        // Rate limit: pockat na token, nez zatizime burzu.
-        // Bitfinex dovoluje 90 req/min; limiter drzi 80 a po 429 couva.
-        self.rate_limiter.acquire().await;
-        let response = self.client
-            .post(&url)
-            .header("bfx-apikey", &self.api_key)
-            .header("bfx-nonce", &nonce)
-            .header("bfx-signature", &signature)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| PiranaError::ExchangeApi {
-                code: -1,
-                message: format!("Active orders request failed: {}", e),
-            })?;
-
-        let json: serde_json::Value = response.json().await.map_err(|e| {
+        let (_status, text) = self.post_auth(&endpoint, "{}").await?;
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             PiranaError::ExchangeApi {
                 code: -1,
                 message: format!("Active orders parse failed: {}", e),
@@ -706,6 +620,90 @@ fn side_str(side: Side) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [DOKONALÁ OPRAVA 26. 8. — nonce race test] Paralelní submity musí
+    /// dorazit na server v pořadí nonce. Mock server záměrně zpozdí
+    /// odpověď PRVNÍHO požadavku — bez submit_mutex by druhý (vyšší nonce)
+    /// dorazil dřív a Bitfinex by odmítl první jako "nonce: small".
+    ///
+    /// Reprodukuje produkční bug z 26. 8. (40 % ztracených close orderů).
+    #[tokio::test]
+    async fn parallel_submits_arrive_in_nonce_order() {
+        // [DOKONALÁ OPRAVA 26. 8.] 8 paralelních submitů; server u každého
+        // spojení náhodně zdrží čtení (simulace sítě). Invariant: nonce
+        // v pořadí DORUČENÍ na server musí být striktně rostoucí —
+        // přesně co Bitfinex vyžaduje. Bez submit_mutex by dvě úlohy
+        // vydaly nonce A<B, ale doručily B dřív → 10114 "nonce: small".
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let arrival: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let srv_arrival = arrival.clone();
+        let server = tokio::spawn(async move {
+            for i in 0..16 {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let arr = srv_arrival.clone();
+                tokio::spawn(async move {
+                    // nahodne zpozdeni cteni — rozbiti deterministickoho poradi
+                    tokio::time::sleep(std::time::Duration::from_millis(i as u64 * 3 % 17)).await;
+                    let mut buf = vec![0u8; 16384];
+                    let mut raw = Vec::new();
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&buf[..n]);
+                                if raw.windows(4).any(|w| w == b"\r\n\r\n") && raw.len() > 100 {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&raw);
+                    if let Some(line) = text.lines().find(|l| l.to_lowercase().starts_with("bfx-nonce:")) {
+                        let nonce = line.split(':').nth(1).unwrap_or("").trim().to_string();
+                        arr.lock().unwrap().push(nonce);
+                    }
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let base = format!("http://{}", addr);
+        let client = BitfinexClient::new_for_test(base.clone(), "k".into(), "s".into(), None);
+
+        // 8 souběžných submitů přes klony — jako paralelní TP/SL spawny.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let c = BitfinexClient::new_for_test(base.clone(), "k".into(), "s".into(), Some(&client));
+            handles.push(tokio::spawn(async move {
+                let qty = if i % 2 == 0 { 0.001 } else { -0.001 };
+                let _ = c.submit_order("tBTCUSD", Side::Buy, OrderType::Market, qty, 78000.0).await;
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        drop(server);
+
+        let nonces = arrival.lock().unwrap().clone();
+        assert!(nonces.len() >= 8, "server dostal {} < 8 požadavků", nonces.len());
+        let mut prev: i64 = 0;
+        for (i, n) in nonces.iter().enumerate() {
+            let v: i64 = n.parse().unwrap_or(0);
+            assert!(v > prev, "požadavek #{i}: nonce {v} ≤ {prev} — dorazil mimo pořadí (race)!");
+            prev = v;
+        }
+    }
+
+
 
     #[test]
     fn test_parse_order_execution_extracts_avg_price() {
