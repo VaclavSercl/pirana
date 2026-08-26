@@ -44,6 +44,7 @@
 //! vlastni HashMap pozic paralelne k `positions` v main.rs. Dve pravdy
 //! o expozici jsou horsi nez jedna; mel nula volani zvenci.
 
+pub mod adaptive_baseline;
 pub mod engine;
 pub mod ledger_persistence;
 pub mod limits;

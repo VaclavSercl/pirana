@@ -218,6 +218,11 @@ pub struct RiskState {
     pub exposure_ceiling: f64,
     /// Podíl zisku ukládaný do BTC trezoru ⟨0;1⟩.
     pub skim_ratio: f64,
+    /// Autonomní baseline sizing (rozhodnutí operátora 26. 8. 2026).
+    /// `None` = starší risk_state.json bez baseline — seeduje se při prvním
+    /// načtení, aby perzistence zůstala zpětně kompatibilní.
+    #[serde(default)]
+    pub adaptive_baseline: Option<crate::adaptive_baseline::AdaptiveBaseline>,
     pub calibrated_at: i64,
     pub calibration_generation: u64,
 }
@@ -270,6 +275,7 @@ impl RiskState {
             exposure_floor: 0.05,
             exposure_ceiling: 0.60,
             skim_ratio: 0.10,
+            adaptive_baseline: None, // seeduje se z strategy.toml při startu
             calibrated_at: 0,
             calibration_generation: 0,
         }

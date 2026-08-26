@@ -246,6 +246,13 @@ impl RiskEngine {
         self.calibrated.read().clone()
     }
 
+    /// Write přístup ke kalibrovanému stavu — výhradně pro seedování
+    /// adaptive_baseline při startu (main.rs). Běžný update jde přes
+    /// `recalibrate_now`, které perzistuje.
+    pub fn calibrated_mut(&self) -> parking_lot::RwLockWriteGuard<'_, CalibratedRisk> {
+        self.calibrated.write()
+    }
+
     /// Generace kalibrace (0 = dosud jen seed).
     pub fn calibration_generation(&self) -> u64 {
         self.calibrated.read().calibration_generation
@@ -276,6 +283,12 @@ impl RiskEngine {
         self.ledger
             .lock()
             .record_close(pnl_usd, fill_price, equity_usd, vpin, now);
+
+        // [ADAPTIVE BASELINE] Sledování počtu RT od posledního zvýšení
+        // pro LKG rollback (nález oponentury: record_rt byl mrtvý kód).
+        if let Some(b) = self.calibrated.write().adaptive_baseline.as_mut() {
+            b.record_rt();
+        }
     }
 
     /// Rekalibrace z namerenych dat.
@@ -306,6 +319,13 @@ impl RiskEngine {
             return Err(RiskError::OutOfRange("equity_sats", equity_sats));
         }
 
+        // [ADAPTIVE BASELINE — nález oponentury P0] Update baseline probíhá
+        // NEZÁVISLE na klasické kalibraci. Okamžité snížení při negativním
+        // Kelly musí proběhnout i když klasická kalibrace selže
+        // (InsufficientSample / P(ruin) brána) — dřívější `?` na řádku
+        // výše baseline blokoval a LKG rollback nikdy nenastal.
+        self.update_adaptive_baseline(&stats, equity_usd, price_usd);
+
         let next = SelfCalibration::recalibrate(&current, &stats, equity_sats)?;
         let generation = next.calibration_generation;
 
@@ -331,6 +351,63 @@ impl RiskEngine {
         self.persist_calibration();
 
         Ok(generation)
+    }
+
+    /// Autonomní update baseline sizingu. Volá se z `recalibrate_now`
+    /// (každých 15 min). Všechna zábradlí řeší `AdaptiveBaseline::update`;
+    /// tady jen dodáme runtime kontext (defensive režim, P(ruin), podlahy).
+    fn update_adaptive_baseline(&self, stats: &TradingStats, equity_usd: f64, price_usd: f64) {
+        use crate::adaptive_baseline::AdaptiveBaseline;
+
+        let current = self.calibrated.read().clone();
+        let baseline = match &current.adaptive_baseline {
+            Some(b) => b.clone(),
+            None => return, // baseline není aktivní (seeduje se v main.rs)
+        };
+
+        let defensive = self.state.read().mode != pirana_core::types::SystemMode::Active;
+        let total_rts = stats.sample_size;
+
+        // Dynamická podlaha: max(min_pct, 2× Bitfinex minimum / equity).
+        // 2× rezerva: order musí být životaschopný i po částečném fillu.
+        let min_order_usd = pirana_core::constants::MIN_ORDER_SIZE_BTC * price_usd;
+        let floor_pct = (2.0 * min_order_usd / equity_usd.max(1e-9) * 100.0)
+            .max(pirana_core::constants::MIN_BASELINE_PCT);
+        let ceiling_pct = pirana_core::constants::MAX_BASELINE_PCT;
+
+        // P(ruin) brána: stará vs nová expozice za týchž podmínek.
+        let p_old = SelfCalibration::p_ruin_at_exposure(stats, baseline.value);
+        let p_new = SelfCalibration::p_ruin_at_exposure(stats, baseline.value * 1.2); // worst-case krok
+
+        let _ = (p_old, p_new); // P(ruin) se počítá uvnitř update (absolutní práh)
+        let (next, changed) = baseline.update(
+            stats,
+            total_rts,
+            None, // markout: doplní main.rs přes setter, až bude dostupný
+            floor_pct,
+            ceiling_pct,
+            defensive,
+        );
+
+        if changed {
+            info!(
+                "Risk Engine [BASELINE]: {:.2}% → {:.2}% ({}) [{}]",
+                baseline.value * 100.0,
+                next.value * 100.0,
+                next.formula,
+                next.inputs
+            );
+            self.calibrated.write().adaptive_baseline = Some(next);
+        }
+    }
+
+    /// Aktuální autonomní baseline jako procento (0.0 = baseline neaktivní).
+    pub fn adaptive_baseline_pct(&self) -> Option<f64> {
+        self.calibrated
+            .read()
+            .adaptive_baseline
+            .as_ref()
+            .map(|b| b.value * 100.0)
     }
 
     /// Rekalibrace, ktera sama zaloguje vysledek a nic nevyhazuje.

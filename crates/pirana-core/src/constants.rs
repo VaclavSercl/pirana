@@ -47,6 +47,13 @@ pub const MAX_POSITION_SIZE_BTC: f64 = 1.0;
 /// Minimum order size in BTC (Bitfinex enforces minimum 0.00004 BTC for tBTCUSD)
 pub const MIN_ORDER_SIZE_BTC: f64 = 0.00004;
 
+/// Minimální baseline sizing v % equity (podlaha autonomní baseline,
+/// rozhodnutí operátora 26. 8. 2026 — §8.3 „sebeumrtvení ne").
+pub const MIN_BASELINE_PCT: f64 = 1.0;
+
+/// Maximální baseline sizing v % equity (strop autonomní baseline).
+pub const MAX_BASELINE_PCT: f64 = 25.0;
+
 /// WebSocket reconnection delay in milliseconds
 pub const WS_RECONNECT_DELAY_MS: u64 = 1000;
 

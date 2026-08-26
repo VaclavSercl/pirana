@@ -329,6 +329,29 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     );
     risk_engine.activate();
 
+    // [ADAPTIVE BASELINE 26.8.] Seed autonomní baseline z strategy.toml —
+    // pouze pokud dosud neexistuje (první běh / starší risk_state.json).
+    // Jinak pokračuje perzistovaná hodnota; strategy.toml position_size_pct
+    // je od teď jen studený start, skutečnou baseline řídí risk engine.
+    {
+        let mut calibrated = risk_engine.calibrated_mut();
+        if calibrated.adaptive_baseline.is_none() {
+            let seed_pct = strategy_config.read().risk_management.position_size_pct;
+            calibrated.adaptive_baseline =
+                Some(pirana_risk_engine::adaptive_baseline::AdaptiveBaseline::seed(seed_pct));
+            info!(
+                "Adaptive baseline: seedován z strategy.toml ({} %) — autonomie začne po nasbírání vzorku",
+                seed_pct
+            );
+            // Persist hned po seedu (nález oponentury: pád před první
+            // rekalibrací by seed zahodil a příští start by seedoval znovu).
+            drop(calibrated);
+            let _ = risk_engine.persist_calibration();
+        } else {
+            drop(calibrated);
+        }
+    }
+
     // [CASLAV v5.1 / PERSISTENCE] TradeLedger persistence + reconstruction
     // TradeLedger se nacita ze snapshotu a doplnuje se gapem z burzy.
     let mut ledger = TradeLedger::new();
@@ -1430,15 +1453,25 @@ async fn process_ws_message(
                                     conf.risk_management.max_aggregate_exposure_pct,
                                 );
 
+                                // [ADAPTIVE BASELINE 26.8.] Baseline sizingu přebírá
+                                // autonomní baseline z risk engine (risk_state.json),
+                                // pokud existuje. strategy.toml position_size_pct je
+                                // pak jen seed pro studený start. Operator lock
+                                // (baseline_mode=locked) baseline zmrazí.
+                                let base_pos_pct = match risk_engine.adaptive_baseline_pct() {
+                                    Some(pct) if pct > 0.0 => pct,
+                                    _ => conf.risk_management.position_size_pct,
+                                };
+
                                 let dynamic_pos_pct_raw = if conf.risk_management.use_dynamic_winrate_sizing {
                                     dynamic_sizer.calculate_dynamic_position_pct(
-                                        conf.risk_management.position_size_pct,
+                                        base_pos_pct,
                                         *state.win_rate.read(),
                                         *state.trades_today.read(),
                                         *state.consecutive_losses.read(),
                                     )
                                 } else {
-                                    conf.risk_management.position_size_pct
+                                    base_pos_pct
                                 };
 
                                 let as_multiplier_buy = if conf.avellaneda_stoikov.enabled {
