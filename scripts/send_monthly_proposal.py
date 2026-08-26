@@ -400,7 +400,7 @@ def generate_institutional_proposal_html(now=None):
         f"{proposal['sre_budget']}\n"
         f"──────────────────────────\n"
         f"🛠 <b>PŘÍKAZ PRO OKAMŽITÉ SCHVÁLENÍ A NASAZENÍ:</b>\n"
-        f"<code>agy --dangerously-skip-permissions \"{proposal['fsm_prompt']}\"</code>"
+        f"<code>hermes -z \"{proposal['fsm_prompt']}\" --yolo</code>"
     )
 
     return html
