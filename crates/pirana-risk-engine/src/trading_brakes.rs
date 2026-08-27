@@ -48,7 +48,13 @@ pub const VPIN_DEADZONE_TOP: f64 = 0.65;
 /// blížící se vyčerpání nákupního tlaku (nákup vrcholu do distribuce).
 /// Override platí POUZE pro nerozhodné pásmo (deadzone), nikdy pro plnou
 /// toxicitu.
-pub const TREND_MOMENTUM_6H: f64 = 0.003; // +0.3 %
+pub const TREND_MOMENTUM_6H: f64 = 0.003; // +0.3 % — podlaha (floor)
+
+/// [OPONENTURA P1 — σ-adaptivní práh] Fallback-práh při vysoké volatilitě
+/// je šum. Efektivní práh = max(TREND_MOMENTUM_6H, k · σ_6h) kde σ_6h je
+/// směrodatná odchylka hodinových výnosů. Při σ=1 % denně → práh ~0.3 %,
+/// při σ=6 % → ~1.1 % (pumpa musí být skutečná, ne šum).
+pub const TREND_SIGMA_MULT: f64 = 1.5;
 
 /// VPIN nad touto hranou = extrémní toxicita — žádný trend override.
 /// (Governance práh risk enginu 0.65 řeší střední toxicitu běžně.)
@@ -137,18 +143,22 @@ impl TradingBrakes {
     pub fn momentum_6h(&self) -> Option<f64> {
         // POZOR na formát bucketů: record_price ukládá `ts - ts % 3600`
         // (absolutní unix hodina). Zde musíme stejný formát!
-        let now_bucket = {
-            let ts = chrono::Utc::now().timestamp();
-            ts - ts % 3600
-        };
-        let mut oldest: Option<(i64, f64)> = None;
+        // [OPONENTURA P0 fix] Vezme bucket NEJBLIŽŠÍ T−6h, ne nejstarší
+        // ≥ 6h — po rehydrataci by jinak momentum měřilo přes 16 h.
+        let now_ts = chrono::Utc::now().timestamp();
+        let target = now_ts - 6 * 3600;
+        let target_bucket = target - target % 3600;
+
+        // nejstarší bucket s h <= target_bucket, nejblíže k němu
+        let mut base: Option<(i64, f64)> = None;
         for (h, p) in self.price_history.iter() {
-            if now_bucket - h >= 6 {
-                oldest = Some((*h, *p)); // nejstarší vhodná (nejbližší 6h)
-                break;
+            if *h <= target_bucket {
+                base = Some((*h, *p));
+                break; // iterační pořadí = od nejstaršího; první ≤ target je nejblíž
             }
         }
-        let (_, old_price) = oldest?;
+        // fallback: žádný bucket ≤ target → málo historie → None
+        let (_, old_price) = base?;
         let (_, cur_price) = *self.price_history.back()?;
         if old_price <= 0.0 {
             return None;
@@ -156,9 +166,35 @@ impl TradingBrakes {
         Some((cur_price - old_price) / old_price)
     }
 
-    /// Trh v pumpě? (6h momentum > práh → VPIN brzda se vypína)
+    /// Směrodatná odchylka hodinových výnosů (log-returns) za okno.
+    /// None = < 3 hodiny dat.
+    pub fn sigma_hourly(&self) -> Option<f64> {
+        let prices: Vec<f64> = self.price_history.iter().map(|(_, p)| *p).collect();
+        if prices.len() < 3 {
+            return None;
+        }
+        let rets: Vec<f64> = prices.windows(2)
+            .map(|w| (w[1] / w[0]).ln())
+            .collect();
+        let n = rets.len() as f64;
+        let mean = rets.iter().sum::<f64>() / n;
+        let var = rets.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        Some(var.sqrt())
+    }
+
+    /// Efektivní trend práh: max(floor, k·σ_6h).
+    /// σ chybí-li (málo dat) → jen floor (konzervativnější = vyšší blok).
+    pub fn effective_trend_threshold(&self) -> f64 {
+        match self.sigma_hourly() {
+            Some(s) => TREND_MOMENTUM_6H.max(TREND_SIGMA_MULT * s * 6.0_f64.sqrt()),
+            None => TREND_MOMENTUM_6H,
+        }
+    }
+
+    /// Trh v pumpě? (6h momentum ≥ efektivní práh → VPIN brzda se vypína)
     pub fn trending_up(&self) -> bool {
-        self.momentum_6h().map(|m| m >= TREND_MOMENTUM_6H).unwrap_or(false)
+        let thr = self.effective_trend_threshold();
+        self.momentum_6h().map(|m| m >= thr).unwrap_or(false)
     }
 
     /// Aktualizace VPIN (z hot loopu, každý tick).
@@ -293,6 +329,38 @@ impl TradingBrakes {
         self.update_rolling();
     }
 
+    /// Rehydratace cen z historie RT (fill_price, ts) — po restartu máme
+    /// okamžitě trend data místo 6 h slepoty. Bere posledních ~8 h,
+    /// hodinové průměry per bucket (shodná agregace jako record_price).
+    pub fn rehydrate_prices(&mut self, fills: &[(i64, f64)]) {
+        self.price_history.clear();
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 8 * 3600;
+        // seřadit podle času a agregovat do hodinových bucketů
+        let mut sorted: Vec<(i64, f64)> = fills
+            .iter()
+            .filter(|(ts, p)| *ts >= cutoff && *p > 0.0)
+            .cloned()
+            .collect();
+        sorted.sort_by_key(|(ts, _)| *ts);
+
+        for (ts, price) in sorted {
+            let hour = ts - ts % 3600;
+            match self.price_history.back_mut() {
+                Some((h, p)) if *h == hour => {
+                    *p = (*p + price) / 2.0;
+                }
+                _ => {
+                    self.price_history.push_back((hour, price));
+                }
+            }
+        }
+        if self.price_history.len() > 16 {
+            let excess = self.price_history.len() - 16;
+            self.price_history.drain(0..excess);
+        }
+    }
+
     /// Vyřadí záznamy mimo okno.
     fn trim_window(&mut self, now: Instant) {
         while let Some((t, _)) = self.closed.front() {
@@ -327,6 +395,71 @@ impl TradingBrakes {
 
     pub fn rolling_engaged(&self) -> bool {
         self.rolling_engaged
+    }
+}
+
+/// Tržní režim pro reporty a governance [FÁZE 2b].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketRegime {
+    /// Silný vzestupný trend — pumpa (trend override aktivní).
+    TrendUp,
+    /// Silný sestupný trend — dump (defenziva).
+    TrendDown,
+    /// Boční trh — scalping režim (dnešní primární strategie).
+    Range,
+    /// Extrémní toxicita — flow proti nám, žádné vstupy.
+    Toxic,
+}
+
+impl MarketRegime {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TrendUp => "TREND-UP",
+            Self::TrendDown => "TREND-DOWN",
+            Self::Range => "RANGE",
+            Self::Toxic => "TOXIC",
+        }
+    }
+}
+
+impl TradingBrakes {
+    /// Klasifikace tržního režimu ze všech dostupných dat.
+    /// Toxic > TrendDown > TrendUp > Range (nejhorší vyhrává).
+    /// Čisté čtení — volané z entry_allowed/detail (tam už běží tick()).
+    /// Pro hot loop existuje `classify_regime_cached` (P1 oponentury:
+    /// klasifikace každý tick = zbytečná práce na RPi4).
+    pub fn classify_regime(&self) -> MarketRegime {
+        if self.vpin >= VPIN_EXTREME {
+            return MarketRegime::Toxic;
+        }
+        match self.momentum_6h() {
+            Some(m) => {
+                let thr = self.effective_trend_threshold();
+                if m >= thr {
+                    MarketRegime::TrendUp
+                } else if m <= -thr {
+                    MarketRegime::TrendDown
+                } else {
+                    MarketRegime::Range
+                }
+            }
+            None => MarketRegime::Range, // málo dat = neutrální předpoklad
+        }
+    }
+
+    /// Popis režimu pro report: label + momentum + sigma + práh.
+    pub fn regime_report(&self) -> String {
+        let m = self.momentum_6h();
+        let sigma = self.sigma_hourly();
+        let thr = self.effective_trend_threshold();
+        format!(
+            "{} (6h momentum {:+.2} %, σ/h {:.2} %, práh {:.2} %, VPIN {:.2})",
+            self.classify_regime().label(),
+            m.map(|x| x * 100.0).unwrap_or(f64::NAN),
+            sigma.map(|x| x * 100.0).unwrap_or(f64::NAN),
+            thr * 100.0,
+            self.vpin
+        )
     }
 }
 
@@ -622,6 +755,86 @@ mod tests {
         }
         b.record_vpin(0.60);
         assert!(b.entry_allowed().is_none(), "pumpa + умерátní VPIN → volno");
+    }
+
+
+    // ── FÁZE 2: regime klasifikace + sigma adaptivni prah ──
+
+    #[test]
+    fn regime_pump_up() {
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            b.record_price(78_000.0 * (1.0 + 0.002 * i as f64), now - (7 - i) * 3600);
+        }
+        assert_eq!(b.classify_regime(), MarketRegime::TrendUp);
+        assert!(b.regime_report().contains("TREND-UP"));
+    }
+
+    #[test]
+    fn regime_dump_down() {
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            b.record_price(80_000.0 * (1.0 - 0.002 * i as f64), now - (7 - i) * 3600);
+        }
+        assert_eq!(b.classify_regime(), MarketRegime::TrendDown);
+    }
+
+    #[test]
+    fn regime_range_side() {
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            let price = 78_000.0 + (i as f64 % 2.0) * 50.0;
+            b.record_price(price, now - (7 - i) * 3600);
+        }
+        assert_eq!(b.classify_regime(), MarketRegime::Range);
+    }
+
+    #[test]
+    fn regime_toxic_wins_over_trend() {
+        // Pumpa + extrémní toxicita → TOXIC (ne TrendUp)
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            b.record_price(78_000.0 * (1.0 + 0.002 * i as f64), now - (7 - i) * 3600);
+        }
+        b.record_vpin(0.9);
+        assert_eq!(b.classify_regime(), MarketRegime::Toxic);
+    }
+
+    #[test]
+    fn sigma_adaptive_threshold_grows_with_vol() {
+        // Klidný trh: σ malé → práh ~floor 0.3 %
+        let mut calm = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            calm.record_price(78_000.0 * (1.0 + 0.0001 * i as f64), now - (7 - i) * 3600);
+        }
+        // Divoký trh: σ velké → práh výrazně nad floor
+        let mut wild = TradingBrakes::new();
+        for i in 0..7 {
+            let price = 78_000.0 * (1.0 + if i % 2 == 0 { 0.004 } else { -0.004 });
+            wild.record_price(price, now - (7 - i) * 3600);
+        }
+        let t_calm = calm.effective_trend_threshold();
+        let t_wild = wild.effective_trend_threshold();
+        assert!(t_calm >= TREND_MOMENTUM_6H - 1e-12);
+        assert!(t_wild > t_calm * 2.0, "volatilní trh: práh {t_wild} musí být výrazně nad {t_calm}");
+    }
+
+    #[test]
+    fn rehydrate_prices_restores_trend() {
+        // Po restartu: fill history → trend data okamžitě
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        let fills: Vec<(i64, f64)> = (0..7)
+            .map(|i| (now - (7 - i) * 3600 + 60, 78_000.0 * (1.0 + 0.002 * i as f64)))
+            .collect();
+        b.rehydrate_prices(&fills);
+        assert!(b.momentum_6h().is_some(), "trend data dostupná hned po restartu");
+        assert_eq!(b.classify_regime(), MarketRegime::TrendUp);
     }
 
     // ── kombinace ──

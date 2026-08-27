@@ -394,6 +394,20 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
             "Trading brakes: rehydratováno {} RT do rolling okna",
             hist.len()
         );
+        // [FÁZE 2b] Ceny z RT fillů → trend data okamžitě po restartu
+        // (konec 6 h slepoty vůči pumpě).
+        let price_fills: Vec<(i64, f64)> = ledger
+            .recent_closed(300)
+            .iter()
+            .filter(|t| t.fill_price > 0.0)
+            .map(|t| (t.ts, t.fill_price))
+            .collect();
+        risk_engine.brakes_rehydrate_prices(&price_fills);
+        info!(
+            "Trading brakes: rehydratováno {} cen pro trend/momentum",
+            price_fills.len()
+        );
+        info!("Trading brakes: režim po startu — {}", risk_engine.brakes_regime_report());
     }
 
     // [RECOVERY wiring] RiskEngine ma svuj interni (prazdny) ledger —
@@ -861,6 +875,22 @@ async fn process_ws_message(
                             risk_engine.brakes_record_vpin(vpin_now);
                         }
                         risk_engine.brakes_record_price(price, (now_ms / 1000) as i64);
+                        // [FÁZE 2 / P1 oponentury] Režim do snapshotu —
+                        // přepočet jen když se změní (string alokace
+                        // jen na hraně režimu, ne každý tick).
+                        {
+                            let new_label = risk_engine.brakes_regime().label();
+                            let mut reg = state.market_regime.write();
+                            if *reg != new_label {
+                                info!(
+                                    "Market regime: {} → {} ({})",
+                                    if reg.is_empty() { "?" } else { reg.as_str() },
+                                    new_label,
+                                    risk_engine.brakes_regime_report()
+                                );
+                                *reg = new_label.to_string();
+                            }
+                        }
 
                         let conf = strategy_config.read().clone();
                         if conf.avellaneda_stoikov.enabled {

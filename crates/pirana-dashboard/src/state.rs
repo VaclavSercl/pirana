@@ -86,6 +86,8 @@ pub struct DashboardState {
     pub hawkes_status: Arc<parking_lot::RwLock<String>>,
     /// VPIN (Volume-Synchronized Probability of Toxicity) score [0.0 - 1.0]
     pub vpin_score: Arc<parking_lot::RwLock<f64>>,
+    /// Tržní režim label (naplněno z risk engine v hot loopu).
+    pub market_regime: Arc<parking_lot::RwLock<String>>,
     /// VPIN status / adverse selection alert
     pub vpin_status: Arc<parking_lot::RwLock<String>>,
     /// [CASLAV v5.1] Kalibrovany rizikovy stav (sebekalibrace)
@@ -275,6 +277,8 @@ pub struct DashboardSnapshot {
     pub hawkes_zscore: f64,
     pub hawkes_status: String,
     pub vpin_score: f64,
+    /// Tržní režim (TREND-UP/DOWN/RANGE/TOXIC) — FÁZE 2.
+    pub market_regime: String,
     pub vpin_status: String,
     pub calibration: CalibrationView,
     pub reservation_price: f64,
@@ -343,6 +347,7 @@ impl DashboardState {
             hawkes_zscore: Arc::new(parking_lot::RwLock::new(0.0)),
             hawkes_status: Arc::new(parking_lot::RwLock::new("Baseline".to_string())),
             vpin_score: Arc::new(parking_lot::RwLock::new(0.0)),
+            market_regime: Arc::new(parking_lot::RwLock::new(String::new())),
             vpin_status: Arc::new(parking_lot::RwLock::new("Low Toxicity / Initializing".to_string())),
             calibration: Arc::new(parking_lot::RwLock::new(CalibrationView::default())),
             reservation_price: Arc::new(parking_lot::RwLock::new(0.0)),
@@ -401,6 +406,7 @@ impl DashboardState {
             hawkes_zscore: *self.hawkes_zscore.read(),
             hawkes_status: self.hawkes_status.read().clone(),
             vpin_score: *self.vpin_score.read(),
+            market_regime: self.market_regime.read().clone(),
             vpin_status: self.vpin_status.read().clone(),
             calibration: self.calibration.read().clone(),
             reservation_price: *self.reservation_price.read(),

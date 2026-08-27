@@ -283,6 +283,21 @@ impl RiskEngine {
         self.brakes.lock().trending_up()
     }
 
+    /// [TRADING BRAKES / FÁZE 2] Tržní režim (TREND-UP/DOWN/RANGE/TOXIC).
+    pub fn brakes_regime(&self) -> crate::trading_brakes::MarketRegime {
+        self.brakes.lock().classify_regime()
+    }
+
+    /// [TRADING BRAKES / FÁZE 2] Popis režimu pro reporty.
+    pub fn brakes_regime_report(&self) -> String {
+        self.brakes.lock().regime_report()
+    }
+
+    /// [TRADING BRAKES / FÁZE 2] Rehydratace cen (fill_price, ts) po restartu.
+    pub fn brakes_rehydrate_prices(&self, fills: &[(i64, f64)]) {
+        self.brakes.lock().rehydrate_prices(fills);
+    }
+
     /// [TRADING BRAKES] Rehydratace stavu brzd po restartu z historie RT.
     pub fn brakes_rehydrate(&self, closed: &[(i64, f64)]) {
         self.brakes.lock().rehydrate(closed);
