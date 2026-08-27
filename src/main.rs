@@ -380,6 +380,22 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
             warn!("TradeLedger: JSONL log necitelny ({}), pokracuji se snapshotem", e);
         }
     }
+    // [TRADING BRAKES — rehydratace po restartu] Naplní rolling okno
+    // brzd z posledních 3 h uzavřených RT a obnoví loss-cooldown.
+    // (P0 z oponentury: bez toho restart smazal veškerý stav brzd.)
+    {
+        let hist: Vec<(i64, f64)> = ledger
+            .recent_closed(200)
+            .iter()
+            .map(|t| (t.ts, t.pnl_sats))
+            .collect();
+        risk_engine.brakes_rehydrate(&hist);
+        info!(
+            "Trading brakes: rehydratováno {} RT do rolling okna",
+            hist.len()
+        );
+    }
+
     // [RECOVERY wiring] RiskEngine ma svuj interni (prazdny) ledger —
     // nahradime ho obnovenym, aby kalibrace/baseline videly plnou historii.
     // Bez tohoto kroku zil obnoveny ledger jen v lokalni promenne a zahodil se.
@@ -838,6 +854,11 @@ async fn process_ws_message(
                         // markout +1 s z MarkoutTrackeru do RiskEngine — baseline
                         // ho potřebuje jako podmínku č. 2 zvýšení.
                         risk_engine.record_markout_1s(markout_summary.markout_1s);
+                        // [TRADING BRAKES] VPIN feed pro hysterzní deadzone.
+                        let vpin_now = *state.vpin_score.read();
+                        if vpin_now.is_finite() && vpin_now > 0.0 {
+                            risk_engine.brakes_record_vpin(vpin_now);
+                        }
 
                         let conf = strategy_config.read().clone();
                         if conf.avellaneda_stoikov.enabled {

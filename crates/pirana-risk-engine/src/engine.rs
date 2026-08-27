@@ -51,6 +51,9 @@ pub struct RiskEngine {
     ledger: Arc<Mutex<TradeLedger>>,
     /// Cesta k perzistentnimu `risk_state.json`. `None` = jen RAM (testy).
     state_path: Option<PathBuf>,
+    /// [TRADING BRAKES 27. 8.] Tři daty podložené brzdy vstupu —
+    /// loss-cooldown, VPIN deadzone, rolling brake. Entry-only.
+    brakes: Arc<Mutex<crate::trading_brakes::TradingBrakes>>,
 }
 
 #[derive(Debug)]
@@ -166,6 +169,7 @@ impl RiskEngine {
             calibrated: Arc::new(RwLock::new(calibrated)),
             ledger: Arc::new(Mutex::new(TradeLedger::new())),
             state_path,
+            brakes: Arc::new(Mutex::new(crate::trading_brakes::TradingBrakes::new())),
         }
     }
 
@@ -252,7 +256,34 @@ impl RiskEngine {
         }
     }
 
-    /// Kopie kalibrovaneho stavu pro dashboard / report.
+        /// [TRADING BRAKES] Zápis VPIN pro hysterzní deadzone brzdu.
+    /// Volá se z hot loopu při každé aktualizaci VPIN.
+    pub fn brakes_record_vpin(&self, vpin: f64) {
+        self.brakes.lock().record_vpin(vpin);
+    }
+
+    /// [TRADING BRAKES] Může být otevřen nový vstup?
+    /// Entry-only — výstupy (TP/SL/close) tuto brzdu NEvolají.
+    pub fn brakes_entry_allowed(&self) -> Option<&'static str> {
+        self.brakes.lock().entry_allowed()
+    }
+
+    /// [TRADING BRAKES] Detail všech aktivních brzd pro logy.
+    pub fn brakes_entry_detail(&self) -> Option<String> {
+        self.brakes.lock().entry_block_detail()
+    }
+
+    /// [TRADING BRAKES] Rehydratace stavu brzd po restartu z historie RT.
+    pub fn brakes_rehydrate(&self, closed: &[(i64, f64)]) {
+        self.brakes.lock().rehydrate(closed);
+    }
+
+    /// [TRADING BRAKES] PnL rolling okna v sats (diagnostika/dashboard).
+    pub fn brakes_rolling_pnl_sats(&self) -> f64 {
+        self.brakes.lock().rolling_pnl_sats()
+    }
+
+/// Kopie kalibrovaneho stavu pro dashboard / report.
     pub fn calibration_snapshot(&self) -> CalibratedRisk {
         self.calibrated.read().clone()
     }
@@ -294,6 +325,17 @@ impl RiskEngine {
         self.ledger
             .lock()
             .record_close(pnl_usd, fill_price, equity_usd, vpin, now);
+
+        // [TRADING BRAKES 27. 8.] Rolling brake + loss-cooldown potřebují
+        // PnL každého uzavřeného RT (v sats).
+        {
+            let pnl_sats = if fill_price > 0.0 {
+                pnl_usd / fill_price * 100_000_000.0
+            } else {
+                0.0
+            };
+            self.brakes.lock().record_close(pnl_sats);
+        }
 
         // [ADAPTIVE BASELINE] Sledování počtu RT a kumulativního PnL od
         // posledního zvýšení pro LKG rollback (nález oponentury: record_rt
@@ -574,6 +616,32 @@ impl RiskEngine {
     /// HFT STRATEGY: Buy and sell in milliseconds, profit from spread capture
     /// BTC is the base asset — we trade around it actively, no panic selling
     pub fn evaluate_trade(&self, signal: &Signal, current_price: f64) -> PiranaResult<RiskAssessment> {
+        // [TRADING BRAKES 27. 8. — rozhodnutí operátora] Tři daty podložené
+        // brzdy vstupu: loss-cooldown 60 s, VPIN deadzone (hystereze),
+        // rolling brake (3h PnL okno). ENTRY-ONLY: výstupní signály
+        // (DistributionExit) brzdy neblokují — zavřít pozici musí jít
+        // vždy (§1: ochrana kapitálu).
+        if signal.signal_type != SignalType::DistributionExit {
+            if let Some(reason) = self.brakes_entry_detail() {
+                debug!("Trading brakes blocked entry: {}", reason);
+                // Reálné metriky stavu (oponentura P1: nuly by křivily
+                // telemetrii — dashboard/log musí vidět skutečný stav).
+                let (exp, ddd, wdd, cl) = {
+                    let st = self.state.read();
+                    (st.aggregate_exposure, st.daily_drawdown_pct, st.weekly_drawdown_pct, st.consecutive_losses)
+                };
+                return Ok(RiskAssessment {
+                    approved: false,
+                    rejection_reason: Some(format!("trading-brakes: {reason}")),
+                    adjusted_position_size: 0.0,
+                    current_exposure_pct: exp,
+                    daily_drawdown_pct: ddd,
+                    weekly_drawdown_pct: wdd,
+                    consecutive_losses: cl,
+                });
+            }
+        }
+
         // Efektivni limity se ctou PRED zamkem stavu — kazda hodnota uz je
         // oramovana tvrdym stropem z constants.rs (viz limits.rs).
         // Poradi zamku: calibrated.read() -> state.write(). Rekalibrace bere

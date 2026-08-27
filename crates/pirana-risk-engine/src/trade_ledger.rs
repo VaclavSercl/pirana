@@ -165,6 +165,11 @@ impl TradeLedger {
         self.daily_returns = returns.into();
     }
 
+    /// Posledních n uzavřených RT (pro rehydrataci trading brakes).
+    pub fn recent_closed(&self, n: usize) -> Vec<ClosedTrade> {
+        self.trades.iter().rev().take(n).cloned().collect()
+    }
+
     /// Nastavi otevrene pozice (pro snapshot recovery).
     pub fn set_open_lots(&mut self, lots: Vec<OpenLot>) {
         self.open_lots = lots.into();

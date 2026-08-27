@@ -51,3 +51,4 @@ pub mod limits;
 pub mod persistence;
 pub mod self_calibration;
 pub mod trade_ledger;
+pub mod trading_brakes;

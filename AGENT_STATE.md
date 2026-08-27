@@ -31,6 +31,18 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 27.8.2026
+
+- **07:00 (ranní audit — Hermes WebUI)**: Audit bez zásahu do TOML. Stav: Defensive,
+  consec_losses 7/5 (seed práh), WR 45,7 % (16/35), denní PnL +0,007 USD (+0,002 %),
+  equity 402,57 USD (start 402,56), OFI=0.0, VPIN 34,3 % (nedostatek dat 3/10 košů),
+  spread $11, markout_1s +2,81 bps, markout_30s -5,56 bps, slippage EWMA 0,77 bps.
+  Bot v Defensive modu — všechny signály DENIED (SpreadCapture, DistributionExit).
+  Poslední trade 04:50:35. Sizing 1,0 % PONECHÁN — čeká na rozhodnutí operátora
+  (3 varianty 20 %/1 %/5 %). Defenzivní půlení na 0,5 % nelze — podlaha min_position_size_pct=1,0.
+  ⚠️ NÁLEZ: consecutive_losses=7 překračuje seed práh 5, ale FSM hlásí jen Defensive, ne Halted —
+  stejný problém jako 26.8. Žádná změna TOML.
+
 ### 26.8.2026
 
 - **15:53 (Telegram bot)**: Ověřen TTS Piper — provider `piper`, hlas `cs_CZ-kasandra-medium`
@@ -55,6 +67,17 @@
   (ACK price_avg = limit cena!). Slippage EWMA 4.94 → 0.92 bps. Commit `1ac99f1`.
 - **07:01 (ranní audit — instance agy)**: ⚠️ Srazil position_size_pct 20 % → 1 % a
   min_position_size_pct 5 % → 1 % bez vědomí operátora. Prompt to přikazoval (nyní opraven).
+
+- **17:53 (WebUI session — večerní audit po rebootu)**: Audit po manuálním `sudo reboot`
+  operátora v 17:40 (dnes 12. boot — kumulativní statistiky přežívají v
+  `/var/lib/pirana/trade_ledger.jsonl`, 394 round-tripů). Stav: Active, consec_losses 0,
+  equity 400,10 USD, denní PnL (ledger): -144,5 sats (-0,113 USD, 282 RT, WR 33 %),
+  ale posledních 30 RT: WR 60 %, +33,2 sats — edge se po přepnutí na Lead-Lag
+  front-run zlepšuje. ⚠️ NÁLEZ 1: trailing-stop exekuce používá `EXCHANGE MARKET`
+  (main.rs:1034) — odchylka od konvence č.3 (vždy EXCHANGE IOC ± 5 bps); dopad malý
+  (poplatky 0 %), ale zaznamenáno ke sjednocení. ⚠️ NÁLEZ 2: START RECONCILIATION po
+  každém restartu vidí BTC na burze bez pozic — řeší REBALANCE SELL, známé.
+  Sizing ponechán 1,0 % — čeká na operátora (3 varianty). Žádná změna TOML.
 
 ### 25.8.2026
 
