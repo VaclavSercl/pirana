@@ -301,6 +301,10 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let initial_as_conf = strategy_config.read().avellaneda_stoikov.clone();
     let mut as_model = AvellanedaStoikovModel::from_config(&initial_as_conf);
     let markout_tracker = Arc::new(parking_lot::Mutex::new(MarkoutTracker::new(100)));
+    // [FÁZE 2c] Pullback detektor pro trendové vstupy (TrendUp režim).
+    let pullback_detector = Arc::new(parking_lot::Mutex::new(
+        pirana_risk_engine::trading_brakes::PullbackDetector::new(),
+    ));
     // [CASLAV v5.1 / SLIPPAGE P2] Telemetrie realizovaného slippage —
     // EWMA + P90 z rolling okna 500 fillů. Publikuje se do dashboardu,
     // později vstup pro kalibraci max_slippage_bps (§8.1).
@@ -785,7 +789,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &markout_tracker, &slippage_telemetry, &mut order_book, &mut log_throttler, &router, &mut validator, &governance, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &markout_tracker, &slippage_telemetry, &mut order_book, &mut log_throttler, &router, &mut validator, &governance, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine, &pullback_detector).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -844,6 +848,7 @@ async fn process_ws_message(
     last_trade_time: &mut std::time::Instant,
     active_positions: &Arc<parking_lot::RwLock<Vec<ActivePosition>>>,
     lead_lag_engine: &Arc<parking_lot::RwLock<LeadLagEngine>>,
+    pullback_detector: &Arc<parking_lot::Mutex<pirana_risk_engine::trading_brakes::PullbackDetector>>,
 ) {
     if let Some(array) = data.as_array() {
         if array.len() >= 2 {
@@ -875,6 +880,8 @@ async fn process_ws_message(
                             risk_engine.brakes_record_vpin(vpin_now);
                         }
                         risk_engine.brakes_record_price(price, (now_ms / 1000) as i64);
+                        // [FÁZE 2c] Pullback detektor feed (levné — update O(1)).
+                        pullback_detector.lock().update(price, (now_ms / 1000) as i64);
                         // [FÁZE 2 / P1 oponentury] Režim do snapshotu —
                         // přepočet jen když se změní (string alokace
                         // jen na hraně režimu, ne každý tick).
@@ -1503,7 +1510,17 @@ async fn process_ws_message(
                                     return;
                                 }
 
-                                let is_buying = is_lead_lag_buy || is_hawkes_buy || if conf.order_book.use_l2_depth_imbalance {
+                                // [FÁZE 2c] Pullback entry: v TrendUp režimu
+                                // vstupujeme na odraženém dipu (ne na vrcholu).
+                                // OFI podmínka odpadá — odraz JE tok; velikost
+                                // pozice se řeší sizing kaskádou (baseline je
+                                // v trendu typicky vyšší).
+                                let is_trend_up = risk_engine.brakes_regime()
+                                    == pirana_risk_engine::trading_brakes::MarketRegime::TrendUp;
+                                let pullback_signal = is_trend_up
+                                    && pullback_detector.lock().is_signal_active();
+
+                                let is_buying = is_lead_lag_buy || is_hawkes_buy || pullback_signal || if conf.order_book.use_l2_depth_imbalance {
                                     ofi.is_buying_pressure() && l2_depth.is_buying_supported() && composite_signal >= conf.strategy.ofi_trigger_threshold
                                 } else {
                                     ofi.is_buying_pressure()

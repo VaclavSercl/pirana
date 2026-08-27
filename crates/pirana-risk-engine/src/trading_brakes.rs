@@ -398,6 +398,114 @@ impl TradingBrakes {
     }
 }
 
+/// Detektor pullbacku v trendu [FÁZE 2c — oponentská mapa].
+///
+/// Vstup do trendu „na vrcholu" (FOMO) je nejhorší entry; vstup na
+/// pullbacku (korekci proti trendu, která se obrací zpět ve směru trendu)
+/// má lepší R:R. Detekce na 1m škále:
+///
+/// 1. Sledujeme klouzavé 1m maximum (high-water mark) — ne hodinové
+///    buckety (ty pullback nevidí).
+/// 2. PULLBACK = cena klesla od HWM o ≥ `min_dip_pct` (výchozí 0.15 %).
+/// 3. REVERSAL = cena se od lokálního minima odrazila o ≥ `min_bounce_pct`
+///    (výchozí 0.05 %) — kupujeme odraz, ne padající nůž.
+///
+/// Signál platí POUZE v TrendUp režimu (classify_regime) a expiruje
+/// po `max_age_secs` od odrazu.
+#[derive(Debug)]
+pub struct PullbackDetector {
+    /// Klouzavé maximum (1m škála, decay 60 min).
+    hwm: f64,
+    /// Poslední lokální minimum dipu.
+    dip_low: f64,
+    /// Čas odražení (unix ts) — None = čekáme na odraz.
+    bounce_at: Option<i64>,
+    /// Minimální dip od HWM (zlomek, 0.0015 = 0.15 %).
+    min_dip_pct: f64,
+    /// Minimální odraz od dip_low (0.0005 = 0.05 %).
+    min_bounce_pct: f64,
+    /// Signál expiruje po tomto počtu sekund od odrazu.
+    max_age_secs: i64,
+    /// Prostupný příznak dip_valid (dip splněn, čekáme bounce).
+    dip_valid: bool,
+    /// Poslední výsledek update() — pullback signál aktivní?
+    signal_active: bool,
+}
+
+impl PullbackDetector {
+    pub fn new() -> Self {
+        Self {
+            hwm: 0.0,
+            dip_low: f64::INFINITY,
+            bounce_at: None,
+            min_dip_pct: 0.0015,
+            min_bounce_pct: 0.0005,
+            max_age_secs: 90,
+            dip_valid: false,
+            signal_active: false,
+        }
+    }
+
+    /// Update novou cenou (hot loop). Vrací true pokud je pullback
+    /// signál AKTIVNÍ právě teď (dip splněn + odraz + neexpiroval).
+    pub fn update(&mut self, price: f64, ts: i64) -> bool {
+        if !price.is_finite() || price <= 0.0 {
+            return false;
+        }
+        self.signal_active = false; // přepočítáme níže
+        // HWM roste jen nahoru (high-water mark)
+        if price > self.hwm {
+            self.hwm = price;
+            // nové maximum = starý pullback neaktuální
+            self.dip_valid = false;
+            self.bounce_at = None;
+            self.dip_low = f64::INFINITY;
+            return false;
+        }
+        // sledování dipu
+        if price < self.dip_low {
+            self.dip_low = price;
+            self.bounce_at = None; // ještě padá — odraz se resetuje
+        }
+        // podmínka dip splněna?
+        if self.hwm > 0.0 && (self.hwm - self.dip_low) / self.hwm >= self.min_dip_pct {
+            self.dip_valid = true;
+        }
+        if !self.dip_valid {
+            return false;
+        }
+        // odraz od minima
+        let bounce = (price - self.dip_low) / self.dip_low;
+        if bounce >= self.min_bounce_pct && self.bounce_at.is_none() {
+            self.bounce_at = Some(ts);
+        }
+        // aktivní signál = odraz potvrzen a neexpiroval
+        let active = match self.bounce_at {
+            Some(t) if ts - t <= self.max_age_secs => true,
+            _ => false,
+        };
+        self.signal_active = active;
+        active
+    }
+
+    /// Je pullback signál právě aktivní? (čtení bez update — pro entry
+    /// logiku, která volá až po feedu)
+    pub fn is_signal_active(&self) -> bool {
+        self.signal_active
+    }
+
+    /// Poslední známý HWM (diagnostika).
+    pub fn hwm(&self) -> f64 {
+        self.hwm
+    }
+}
+
+impl Default for PullbackDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Tržní režim pro reporty a governance [FÁZE 2b].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketRegime {
@@ -837,6 +945,77 @@ mod tests {
         assert_eq!(b.classify_regime(), MarketRegime::TrendUp);
     }
 
+
+    // ── FÁZE 2c: pullback detektor ──
+
+    #[test]
+    fn pullback_fires_on_dip_and_bounce() {
+        let mut d = PullbackDetector::new();
+        let t0 = 1_787_800_000i64;
+        // růst na 80 000 (HWM)
+        assert!(!d.update(79_500.0, t0));
+        assert!(!d.update(80_000.0, t0 + 10));
+        // dip −0.2 % (≥ 0.15 %) na 79 840
+        assert!(!d.update(79_850.0, t0 + 20));
+        assert!(!d.update(79_840.0, t0 + 30), "dip bez odrazu = žádný signál");
+        // odraz +0.06 % → SIGNÁL
+        assert!(d.update(79_888.0, t0 + 40), "dip + bounce = pullback signál");
+    }
+
+    #[test]
+    fn pullback_no_signal_in_steady_rise() {
+        // Neustálý růst bez dipu → žádný signál (nákup na vrcholu nechceme)
+        let mut d = PullbackDetector::new();
+        let t0 = 1_787_800_000i64;
+        for i in 0..50 {
+            let p = 79_000.0 + i as f64 * 20.0;
+            assert!(!d.update(p, t0 + i * 10), "růst bez dipu nesmí signalizovat");
+        }
+    }
+
+    #[test]
+    fn pullback_too_shallow_dip_ignored() {
+        // dip −0.05 % < 0.15 % práh → šum, ne pullback
+        let mut d = PullbackDetector::new();
+        let t0 = 1_787_800_000i64;
+        d.update(80_000.0, t0);
+        assert!(!d.update(79_975.0, t0 + 20), "mikro-dip = šum");
+        assert!(!d.update(79_990.0, t0 + 30), "odraz z mikro-dipu nesmí signalizovat");
+    }
+
+    #[test]
+    fn pullback_expires() {
+        let mut d = PullbackDetector::new();
+        let t0 = 1_787_800_000i64;
+        d.update(80_000.0, t0);
+        d.update(79_840.0, t0 + 30); // dip
+        assert!(d.update(79_888.0, t0 + 40), "signál aktivní");
+        // po 91 s od odrazu expiruje
+        assert!(!d.update(79_890.0, t0 + 40 + 91), "signál exspiroval");
+    }
+
+    #[test]
+    fn pullback_reset_on_new_high() {
+        // Nové maximum resetuje detektor (starý pullback neaktuální)
+        let mut d = PullbackDetector::new();
+        let t0 = 1_787_800_000i64;
+        d.update(80_000.0, t0);
+        d.update(79_840.0, t0 + 30);
+        assert!(d.update(79_888.0, t0 + 40));
+        assert!(!d.update(80_100.0, t0 + 50), "nové HWM resetuje signál");
+    }
+
+    #[test]
+    fn pullback_falling_knife_no_signal() {
+        // Trvalý pád bez odrazu → nikdy nesignalizovat
+        let mut d = PullbackDetector::new();
+        let t0 = 1_787_800_000i64;
+        d.update(80_000.0, t0);
+        for i in 1..30 {
+            let p = 80_000.0 - i as f64 * 30.0;
+            assert!(!d.update(p, t0 + i * 10), "padající nůž bez odrazu = čekat");
+        }
+    }
     // ── kombinace ──
 
     #[test]
