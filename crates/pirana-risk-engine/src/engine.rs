@@ -273,6 +273,16 @@ impl RiskEngine {
         self.brakes.lock().entry_block_detail()
     }
 
+    /// [TRADING BRAKES] Zápis ceny pro 6h momentum (trend override VPIN brzdy).
+    pub fn brakes_record_price(&self, price: f64, ts_unix: i64) {
+        self.brakes.lock().record_price(price, ts_unix);
+    }
+
+    /// [TRADING BRAKES] Trh v pumpě? (6h momentum ≥ práh)
+    pub fn brakes_trending_up(&self) -> bool {
+        self.brakes.lock().trending_up()
+    }
+
     /// [TRADING BRAKES] Rehydratace stavu brzd po restartu z historie RT.
     pub fn brakes_rehydrate(&self, closed: &[(i64, f64)]) {
         self.brakes.lock().rehydrate(closed);

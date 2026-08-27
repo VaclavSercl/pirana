@@ -854,11 +854,13 @@ async fn process_ws_message(
                         // markout +1 s z MarkoutTrackeru do RiskEngine — baseline
                         // ho potřebuje jako podmínku č. 2 zvýšení.
                         risk_engine.record_markout_1s(markout_summary.markout_1s);
-                        // [TRADING BRAKES] VPIN feed pro hysterzní deadzone.
+                        // [TRADING BRAKES] VPIN feed pro hysterzní deadzone
+                        // + cena pro 6h momentum (trend override).
                         let vpin_now = *state.vpin_score.read();
                         if vpin_now.is_finite() && vpin_now > 0.0 {
                             risk_engine.brakes_record_vpin(vpin_now);
                         }
+                        risk_engine.brakes_record_price(price, (now_ms / 1000) as i64);
 
                         let conf = strategy_config.read().clone();
                         if conf.avellaneda_stoikov.enabled {

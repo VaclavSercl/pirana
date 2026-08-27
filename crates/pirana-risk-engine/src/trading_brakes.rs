@@ -27,11 +27,32 @@ use std::time::{Duration, Instant};
 /// Kolik sekund po uzavřené ztrátě nechat systém vychladnout.
 pub const LOSS_COOLDOWN_SECS: u64 = 60;
 
-/// VPIN hodnota, od které se nové vstupy blokují.
+/// VPIN hodnota, od které se nové vstupy blokují (spodní hrana deadzone).
 pub const VPIN_BLOCK_ABOVE: f64 = 0.50;
 
 /// VPIN hodnota, pod kterou se (po předchozím bloku) vstupy odblokují.
 pub const VPIN_UNBLOCK_BELOW: f64 = 0.45;
+
+/// Horní hrana deadzone [OPRAVA 27. 8. večer — overfitting na range trh].
+/// Měřená ztrácí zóna je 0.50–0.65; VPIN 0.7+ je historicky ZISKOVÝ
+/// (+184 sats @0.7, +53 @0.9) — vysoký VPIN v trendu = flow, ne toxicita.
+/// Nad touto hranou rozhoduje governance prah risk enginu (0.65).
+pub const VPIN_DEADZONE_TOP: f64 = 0.65;
+
+/// Trend override práh [FÁZE 1]: 6h momentum nad touto hranou → trh v pumpě,
+/// VPIN deadzone (0.50–0.65) se neuplatní — elevated VPIN v trendu =
+/// participation, ne toxicita.
+///
+/// [OPONENTURA P0] Extrémní toxicita (≥ `VPIN_EXTREME`) trendem přebita
+/// být NESMÍ: VPIN > 0.80 při pumpě = agresivní vybírání likvidity a
+/// blížící se vyčerpání nákupního tlaku (nákup vrcholu do distribuce).
+/// Override platí POUZE pro nerozhodné pásmo (deadzone), nikdy pro plnou
+/// toxicitu.
+pub const TREND_MOMENTUM_6H: f64 = 0.003; // +0.3 %
+
+/// VPIN nad touto hranou = extrémní toxicita — žádný trend override.
+/// (Governance práh risk enginu 0.65 řeší střední toxicitu běžně.)
+pub const VPIN_EXTREME: f64 = 0.80;
 
 /// Délka klouzavého okna rolling brake.
 pub const ROLLING_WINDOW: Duration = Duration::from_secs(3 * 3600);
@@ -54,6 +75,9 @@ pub struct TradingBrakes {
     closed: VecDeque<(Instant, f64)>,
     /// Rolling brake aktivní (PnL okna pod prahem) — čeká na obrat.
     rolling_engaged: bool,
+    /// Hodinové ceny pro 6h momentum (trend override VPIN brzdy).
+    /// Posledních ~8 hodnot (ts_unix, price).
+    price_history: VecDeque<(i64, f64)>,
 }
 
 impl Default for TradingBrakes {
@@ -70,6 +94,7 @@ impl TradingBrakes {
             vpin_blocked: false,
             closed: VecDeque::with_capacity(512),
             rolling_engaged: false,
+            price_history: VecDeque::with_capacity(16),
         }
     }
 
@@ -85,9 +110,62 @@ impl TradingBrakes {
         self.update_rolling();
     }
 
+    /// Zápis aktuální ceny (hot loop). Agreguje se po hodinách — pro
+    /// 6h momentum potřebujeme cenu před ~6 h. Threshold 0.3 %/6h
+    /// je pomalý, hodinový rozlišení stačí.
+    pub fn record_price(&mut self, price: f64, ts_unix: i64) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        // hodinova bucket agregace: posledni (ts_h, ceny…) → průměr hodiny
+        let hour = ts_unix - (ts_unix % 3600);
+        match self.price_history.back_mut() {
+            Some((h, p)) if *h == hour => {
+                *p = (*p + price) / 2.0; // běžící průměr hodiny
+            }
+            _ => {
+                self.price_history.push_back((hour, price));
+                if self.price_history.len() > 16 {
+                    self.price_history.pop_front();
+                }
+            }
+        }
+    }
+
+    /// 6h momentum z hodinových cen: (nyní − cena před ≥6 h)/cena.
+    /// None = málo dat (po startu) — trend override se neuplatní.
+    pub fn momentum_6h(&self) -> Option<f64> {
+        // POZOR na formát bucketů: record_price ukládá `ts - ts % 3600`
+        // (absolutní unix hodina). Zde musíme stejný formát!
+        let now_bucket = {
+            let ts = chrono::Utc::now().timestamp();
+            ts - ts % 3600
+        };
+        let mut oldest: Option<(i64, f64)> = None;
+        for (h, p) in self.price_history.iter() {
+            if now_bucket - h >= 6 {
+                oldest = Some((*h, *p)); // nejstarší vhodná (nejbližší 6h)
+                break;
+            }
+        }
+        let (_, old_price) = oldest?;
+        let (_, cur_price) = *self.price_history.back()?;
+        if old_price <= 0.0 {
+            return None;
+        }
+        Some((cur_price - old_price) / old_price)
+    }
+
+    /// Trh v pumpě? (6h momentum > práh → VPIN brzda se vypína)
+    pub fn trending_up(&self) -> bool {
+        self.momentum_6h().map(|m| m >= TREND_MOMENTUM_6H).unwrap_or(false)
+    }
+
     /// Aktualizace VPIN (z hot loopu, každý tick).
     pub fn record_vpin(&mut self, vpin: f64) {
-        // Hystereze: blok při překročení 0.50, odblok až pod 0.45.
+        // Hystereze vstupu do deadzone: blok při ≥ 0.50, odblok pod 0.45.
+        // Horní hranu 0.65 řeší entry_allowed (pásmo, ne práh) —
+        // vpin_blocked značí „jsme V zóně", nikoli „nad ní".
         if !self.vpin_blocked && vpin >= VPIN_BLOCK_ABOVE {
             self.vpin_blocked = true;
         } else if self.vpin_blocked && vpin < VPIN_UNBLOCK_BELOW {
@@ -118,8 +196,18 @@ impl TradingBrakes {
             }
         }
 
-        // 2. VPIN mrtvé pásmo
-        if self.vpin_blocked {
+        // 2. VPIN mrtvé pásmo — PÁSMO 0.50–0.65, ne vše nad 0.50.
+        // [OPRAVA overfittingu] Původní blok vše ≥ 0.50 zablokoval i
+        // ziskové zóny 0.7+ a 7 hodin pumpy 27. 8. (12 413 zamítnutých
+        // vstupů). Nad 0.65 rozhoduje governance práh risk enginu.
+        // Trend override: při pumpě (6h momentum ≥ +0.3 %) se brzda
+        // neuplatní vůbec — elevated VPIN v trendu = flow.
+        // [OPONENTURA P0] Extrémní toxicita blokuje VŽDY — ani pumpa
+        // nepřebije VPIN ≥ 0.80 (nákup vrcholu do distribuce).
+        let extreme_toxicity = self.vpin >= VPIN_EXTREME;
+        // Override jen pro nerozhodné pásmo (deadzone), ne pro plnou toxicitu.
+        let in_deadzone = self.vpin_blocked && self.vpin < VPIN_DEADZONE_TOP;
+        if (in_deadzone && !self.trending_up()) || extreme_toxicity {
             return Some("vpin-deadzone");
         }
 
@@ -145,9 +233,16 @@ impl TradingBrakes {
                 ));
             }
         }
-        if self.vpin_blocked {
+        let extreme_toxicity = self.vpin >= VPIN_EXTREME;
+        let in_deadzone = self.vpin_blocked && self.vpin < VPIN_DEADZONE_TOP;
+        if extreme_toxicity {
             reasons.push(format!(
-                "vpin-deadzone: VPIN {:.3} ≥ {VPIN_BLOCK_ABOVE} (odblok < {VPIN_UNBLOCK_BELOW})",
+                "vpin-EXTREME: {:.3} ≥ {VPIN_EXTREME} — trend override neplatí (ochrana před distribucí)",
+                self.vpin
+            ));
+        } else if in_deadzone && !self.trending_up() {
+            reasons.push(format!(
+                "vpin-deadzone: VPIN {:.3} v pásmu {VPIN_BLOCK_ABOVE}–{VPIN_DEADZONE_TOP} (odblok < {VPIN_UNBLOCK_BELOW})",
                 self.vpin
             ));
         }
@@ -420,6 +515,113 @@ mod tests {
         let mut b = TradingBrakes::new();
         b.rehydrate(&[]);
         assert!(b.entry_allowed().is_none());
+    }
+
+
+    // ── FÁZE 1: deadzone pásmo + trend override (27. 8. večer) ──
+
+    #[test]
+    fn deadzone_is_band_not_threshold() {
+        // VPIN 0.7+ je zisková zóna — NESMÍ blokovat (původní bug)
+        let mut b = TradingBrakes::new();
+        b.record_vpin(0.72);
+        assert!(b.vpin_blocked(), "hystereze vstoupila");
+        assert!(b.entry_allowed().is_none(), "0.72 > 0.65 = mimo deadzone → volno");
+    }
+
+    #[test]
+    fn deadzone_band_still_blocks_050_to_065() {
+        let mut b = TradingBrakes::new();
+        b.record_vpin(0.58);
+        assert!(b.entry_allowed().is_some(), "0.58 v ztrácí zóně → blok");
+        b.record_vpin(0.63);
+        assert!(b.entry_allowed().is_some(), "0.63 stále v zóně");
+        b.record_vpin(0.68);
+        assert!(b.entry_allowed().is_none(), "0.68 > 0.65 → volno");
+    }
+
+    #[test]
+    fn trend_override_disables_vpin_brake() {
+        // Pumpa: 6h momentum +1 % → VPIN brzda neplatí ani v zóně
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        // 7 hodinových cen: 78 000 → 78 800 (+1 %)
+        for i in 0..7 {
+            let price = 78_000.0 * (1.0 + 0.0017 * i as f64);
+            b.record_price(price, now - (7 - i) * 3600);
+        }
+        assert!(b.trending_up(), "momentum ~+1 % → trend UP");
+        b.record_vpin(0.55); // v deadzone zóně
+        assert!(b.entry_allowed().is_none(), "trend override → VPIN brzda vypnuta");
+    }
+
+    #[test]
+    fn no_trend_no_override() {
+        // Boční trh: momentum ~0 → VPIN brzda platí normálně
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            let price = 78_000.0 + (i as f64 % 2.0) * 40.0; // oscilace ±0.05 %
+            b.record_price(price, now - (7 - i) * 3600);
+        }
+        assert!(!b.trending_up(), "momentum ~0 → žádný trend");
+        b.record_vpin(0.55);
+        assert!(b.entry_allowed().is_some(), "bez trendu VPIN brzda platí");
+    }
+
+    #[test]
+    fn insufficient_price_data_no_override() {
+        // Po startu (málo cen) se override NEuplatní — konzervativní
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        b.record_price(80_000.0, now); // jen 1 hodina
+        b.record_vpin(0.55);
+        assert!(b.entry_allowed().is_some(), "málo dat → bez override → blok");
+    }
+
+    #[test]
+    fn downtrend_does_not_override() {
+        // Momentum −1 % (dump) NENÍ pumpa → VPIN brzda platí
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            let price = 80_000.0 * (1.0 - 0.0017 * i as f64);
+            b.record_price(price, now - (7 - i) * 3600);
+        }
+        assert!(!b.trending_up(), "dump ≠ pumpa");
+        b.record_vpin(0.55);
+        assert!(b.entry_allowed().is_some());
+    }
+
+
+    #[test]
+    fn extreme_vpin_blocks_even_in_pump() {
+        // [OPONENTURA P0] VPIN 0.85 + pumpa +1 % → STLLE BLOK.
+        // Nákup vrcholu do distribuce = P(ruin) riska.
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            let price = 78_000.0 * (1.0 + 0.0017 * i as f64);
+            b.record_price(price, now - (7 - i) * 3600);
+        }
+        assert!(b.trending_up(), "pumpa potvrzena");
+        b.record_vpin(0.85);
+        assert!(b.entry_allowed().is_some(), "extrémní toxicita blokuje VŽDY");
+        let d = b.entry_block_detail().unwrap();
+        assert!(d.contains("EXTREME"), "detail: {d}");
+    }
+
+    #[test]
+    fn moderate_vpin_passes_in_pump() {
+        // VPIN 0.60 (deadzone) + pumpa → override platí, volno
+        let mut b = TradingBrakes::new();
+        let now = chrono::Utc::now().timestamp();
+        for i in 0..7 {
+            let price = 78_000.0 * (1.0 + 0.0017 * i as f64);
+            b.record_price(price, now - (7 - i) * 3600);
+        }
+        b.record_vpin(0.60);
+        assert!(b.entry_allowed().is_none(), "pumpa + умерátní VPIN → volno");
     }
 
     // ── kombinace ──
