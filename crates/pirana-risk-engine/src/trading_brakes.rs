@@ -90,6 +90,18 @@ pub const ROLLING_FLOOR_DEEP_CLAMP: f64 = -600.0;
 /// Minimální počet ztrát v okně, aby adaptivní výpočet měl smysl.
 const ROLLING_MIN_LOSSES_FOR_ADAPTIVE: usize = 10;
 
+/// [ROZHODNUTÍ OPERÁTORA 28. 8. večer] Konzistenční podmínka engage:
+/// posledních `ROLLING_CONSISTENCY_RT` RT s win rate pod
+/// `ROLLING_CONSISTENCY_WR` → brake i bez hloubky PnL.
+///
+/// Motivace (odpoledne 28. 8.): 57 RT, 1 výhra, WR ~2 %, ale PnL jen
+/// −0,095 USD — drobné, plynulé krvácení, které adaptivní floor (měří
+/// hloubku) nikdy netrefí. Konzistence selhávání je statisticky
+/// signifikantní signál: při skutečném WR 30 % je P(WR ≤ 3/30) ≈ 0,2 %.
+/// Release zůstává PnL okna ≥ 0 (plný obrat — hystereze).
+pub const ROLLING_CONSISTENCY_RT: usize = 30;
+pub const ROLLING_CONSISTENCY_WR: f64 = 0.10;
+
 /// Stav všech tří brzd. Voláno z hot loopu před governance/entry.
 #[derive(Debug)]
 pub struct TradingBrakes {
@@ -305,7 +317,15 @@ impl TradingBrakes {
             ));
         }
         if self.rolling_engaged {
-            reasons.push("rolling-brake: 3h PnL pod prahem — čekám na obrat".to_string());
+            if self.consistency_failure() {
+                reasons.push(format!(
+                    "rolling-brake: konzistenční selhání (WR < {:.0} % na {} RT) — čekám na obrat",
+                    ROLLING_CONSISTENCY_WR * 100.0,
+                    ROLLING_CONSISTENCY_RT
+                ));
+            } else {
+                reasons.push("rolling-brake: 3h PnL pod prahem — čekám na obrat".to_string());
+            }
         }
         if reasons.is_empty() {
             None
@@ -326,16 +346,19 @@ impl TradingBrakes {
 
         self.closed.clear();
         let mut last_loss_ts: Option<i64> = None;
-        for (ts, pnl) in closed.iter() {
-            if *ts < cutoff {
-                continue;
-            }
+        // [OPONENTURA P0] Vstup řadíme podle času vzestupně — volající
+        // (recent_closed) vrací RT od nejnovějšího, bez řazení by
+        // konzistenční tail bral nejstarší obchody místo nejnovějších.
+        let mut sorted: Vec<(i64, f64)> =
+            closed.iter().filter(|(ts, _)| *ts >= cutoff).cloned().collect();
+        sorted.sort_by_key(|(ts, _)| *ts);
+        for (ts, pnl) in sorted.into_iter() {
             // převedeme absolutní ts na Instant (relativně k nynějšku)
-            let age = (now_ts - *ts).max(0) as u64;
+            let age = (now_ts - ts).max(0) as u64;
             let at = now_instant - Duration::from_secs(age);
-            self.closed.push_back((at, *pnl));
-            if *pnl < 0.0 {
-                last_loss_ts = Some(*ts);
+            self.closed.push_back((at, pnl));
+            if pnl < 0.0 {
+                last_loss_ts = Some(ts);
             }
         }
 
@@ -426,17 +449,50 @@ impl TradingBrakes {
         floor
     }
 
-    /// Přepočet rolling brzdy: engage při PnL okna < floor,
-    /// disengage až při PnL okna ≥ 0 (plný obrat — hystereze).
-    /// Floor je adaptivní (viz `rolling_floor_sats`).
+    /// Přepočet rolling brzdy — DVA nezávislé důvody k engage:
+    ///
+    /// 1. HLoubKA: PnL okna < adaptivní floor (noční scénář — velké ztráty)
+    /// 2. KONZISTENCE: posledních 30 RT s WR < 10 % (odpolední scénář —
+    ///    drobné, ale vytrvalé selhávání; 28. 8.: 57 RT, 1 výhra)
+    ///
+    /// Disengage vždy až při PnL okna ≥ 0 (plný obrat — hystereze),
+    /// takže po konzistenčním engage systém vyžaduje reálné zotavení,
+    /// ne jen vypršení špatné série.
     fn update_rolling(&mut self) {
         let window_pnl: f64 = self.closed.iter().map(|(_, p)| p).sum();
-        let floor = self.rolling_floor_sats();
-        if !self.rolling_engaged && window_pnl < floor {
-            self.rolling_engaged = true;
-        } else if self.rolling_engaged && window_pnl >= 0.0 {
+
+        if !self.rolling_engaged {
+            let depth_hit = window_pnl < self.rolling_floor_sats();
+            let consistency_hit = self.consistency_failure();
+            if depth_hit || consistency_hit {
+                self.rolling_engaged = true;
+            }
+        } else if self.rolling_engaged
+            && window_pnl >= 0.0
+            && !self.consistency_failure()
+        {
+            // [OPONENTURA P0] PnL ≥ 0 samo o sobě nestačí: pokud konzistence
+            // selhávání stále trvá (WR < 10 % na 30 RT), brzda drží — jinak
+            // by velká historická výhra v okně uvolnila brzdu uprostřed
+            // aktivní špatné série.
             self.rolling_engaged = false;
         }
+    }
+
+    /// Konzistence selhávání: posledních `ROLLING_CONSISTENCY_RT` uzavřených
+    /// RT (celé okno, pokud je kratší) má win rate pod prahem.
+    /// Méně než 30 RT v okně → nezahlásit (malý vzorek = šum).
+    fn consistency_failure(&self) -> bool {
+        if self.closed.len() < ROLLING_CONSISTENCY_RT {
+            return false; // malý vzorek = šum
+        }
+        let wins = self.closed
+            .iter()
+            .rev()
+            .take(ROLLING_CONSISTENCY_RT)
+            .filter(|(_, p)| *p > 0.0)
+            .count();
+        (wins as f64 / ROLLING_CONSISTENCY_RT as f64) < ROLLING_CONSISTENCY_WR
     }
 
     /// PnL aktuálního okna (diagnostika).
@@ -1162,6 +1218,86 @@ mod tests {
         assert!((f10 - (-600.0)).abs() < 1e-9, "f10 = {f10}");
         assert!(f10 <= f9, "10. ztráta nesmí floor uvolnit: {f10} > {f9}");
         assert!(b.rolling_engaged(), "brake stále aktivní po přechodu");
+    }
+
+
+    // ── KONZISTENČNÍ ENGAGE [ROZHODNUTÍ OPERÁTORA 28. 8. večer] ──
+
+    #[test]
+    fn consistency_engages_on_losing_streak() {
+        // Odpolední scénář 28. 8.: drobné ztráty, WR ~0 % — PnL nad
+        // hloubkovým floorem, ale konzistence selhávání jasná.
+        let mut b = TradingBrakes::new();
+        for _ in 0..30 {
+            b.record_close(-2.0); // −60 sats — daleko nad floor(−150)
+        }
+        assert!(b.rolling_engaged(), "30 RT, 0 výher → konzistenční engage");
+        assert!(b.entry_block_detail().unwrap().contains("rolling"));
+    }
+
+    #[test]
+    fn consistency_not_triggered_above_wr_threshold() {
+        // WR 20 % (6/30) > práh 10 % → žádný engage (ani při ztrátovém PnL
+        // nad floorem)
+        let mut b = TradingBrakes::new();
+        for i in 0..30 {
+            let pnl = if i % 5 == 0 { 3.0 } else { -2.0 };
+            b.record_close(pnl);
+        }
+        // PnL = 6×3 − 24×2 = −30 sats > floor(−60 z adaptivního? floor =
+        // min(−(2×30)=−60, fallback −150) = −150; −30 > −150 → hloubka ne)
+        assert!(!b.rolling_engaged(), "WR 20 % + PnL −30 nad prahy → volno");
+    }
+
+    #[test]
+    fn consistency_boundary_exactly_10pct_no_engage() {
+        // Přesně 10 % (3/30) NENÍ pod prahem → neengage (strict less)
+        let mut b = TradingBrakes::new();
+        for i in 0..30 {
+            let pnl = if i < 3 { 3.0 } else { -2.0 };
+            b.record_close(pnl);
+        }
+        assert!(!b.rolling_engaged(), "WR přesně 10 % = na prahu, ne pod");
+    }
+
+    #[test]
+    fn consistency_needs_full_sample() {
+        // 25 RT s 0 výhrami — pod 30 vzorků → neengage (šum)
+        let mut b = TradingBrakes::new();
+        for _ in 0..25 {
+            b.record_close(-2.0);
+        }
+        assert!(!b.rolling_engaged(), "25 RT < 30 vzorků → čekat");
+    }
+
+    #[test]
+    fn consistency_release_requires_pnl_recovery() {
+        // Po konzistenčním engage: obnovení PnL ≥ 0 uvolní (hystereze
+        // společná pro obě větve)
+        let mut b = TradingBrakes::new();
+        for _ in 0..30 {
+            b.record_close(-2.0);
+        }
+        assert!(b.rolling_engaged());
+        // výhry vyléčí PnL okna (−60 → kladné)
+        for _ in 0..35 {
+            b.record_close(2.0);
+        }
+        assert!(!b.rolling_engaged(), "PnL ≥ 0 → release");
+    }
+
+    #[test]
+    fn consistency_wins_in_tail_reset() {
+        // 30 RT kde posledních 10 obsahuje výhry → tail WR ≥ práh → ne
+        let mut b = TradingBrakes::new();
+        for _ in 0..20 {
+            b.record_close(-2.0); // staré ztráty
+        }
+        for _ in 0..10 {
+            b.record_close(5.0); // čerstvé výhry
+        }
+        // tail 30 = celé okno: 10/30 = 33 % > 10 % → neengage
+        assert!(!b.rolling_engaged());
     }
 
     // ── kombinace ──

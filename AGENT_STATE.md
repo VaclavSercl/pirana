@@ -31,6 +31,20 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 28.8.2026
+
+- **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Stav: Defensive,
+  consec_losses 6/5 (seed práh), WR 0,0 % (0/6 dnes), denní PnL −0,0127 USD (−0,003 %),
+  equity 406,05 USD (start 406,06), BTC 0,004509, OFI=0.0, VPIN 53,9 % (nedostatek dat
+  1/10 košů), spread $16, markout_1s −3,5 bps, markout_30s +2,25 bps, slippage EWMA 0,89 bps.
+  Uptime 17 min (restart 06:43:46). Poslední trade 04:48:27 — od té doby všechny signály
+  DENIED (Defensive). Sizing 1,0 % PONECHÁN — čeká na rozhodnutí operátora (3 varianty
+  20 %/1 %/5 %). Defenzivní půlení na 0,5 % nelze — podlaha min_position_size_pct=1,0.
+  ⚠️ NÁLEZ (3. den v řadě): consec_losses=6 překračuje seed práh 5, ale FSM hlásí jen
+  Defensive, ne Halted — logika přechodu Defensive→Halted v pirana-risk-engine stále
+  neověřena. Doporučeno operátorovi: ověřit prahovou logiku FSM. Žádná změna TOML
+  (validace strategy_versioning.py: OK).
+
 ### 27.8.2026
 
 - **07:00 (ranní audit — Hermes WebUI)**: Audit bez zásahu do TOML. Stav: Defensive,
