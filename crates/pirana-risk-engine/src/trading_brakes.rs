@@ -63,10 +63,32 @@ pub const VPIN_EXTREME: f64 = 0.80;
 /// Délka klouzavého okna rolling brake.
 pub const ROLLING_WINDOW: Duration = Duration::from_secs(3 * 3600);
 
-/// Práh rolling brake: pokud PnL okna klesne pod tuto hodnotu (sats),
-/// vstupy se pozastaví až do obratu (okno PnL ≥ 0).
-/// ~0.13 % equity denně — mírně konzervativní vůči měřenému bleed rate.
-pub const ROLLING_PNL_FLOOR_SATS: f64 = -400.0;
+/// Rolling brake floor [ROZHODNUTÍ OPERÁTORA 28. 8.] — ADAPTIVNÍ.
+///
+/// Statický −400 sats selhával: při nočním tempu ~20 RT/hod se 3h okno
+/// nestačilo naplnit a brake nikdy nezabral (noc 27./28. 8.: −0,21 USD,
+/// 03:00–04:00 WR 0 %). Nová logika škáluje floor s měřenou velikostí
+/// ztrát:
+///
+/// ```text
+/// floor = −(avg_abs_loss_okna × TARGET_RT_COUNT)   // 60 RT ≈ plné 3h okno
+/// ```
+///
+/// Diskriminace: spustí se PO hodině typu „28 RT, 0 výher" (≈ 60 % plného
+/// okna stejnoměrných ztrát), ale NE po smíšené hodině (výhry floor
+/// zvedají). Clamp drží floor v rozumném pásmu; fallback pro studený
+/// start (málo ztrát v okně) je konstanta.
+/// Počet RT pro adaptivní floor [OPONENTURA P1: 60 → 30]. Při nočním
+/// tempu 15–20 RT/hod zabere brake po ~1–1,5 h čistého selhání.
+pub const ROLLING_TARGET_RT_COUNT: f64 = 30.0;
+/// Fallback floor bez měřených ztrát (studený start / čisté okno).
+pub const ROLLING_FLOOR_FALLBACK_SATS: f64 = -150.0;
+/// Clamp: floor nikdy mělčejší než to (jinak brake bliká na šumu).
+pub const ROLLING_FLOOR_SHALLOW_CLAMP: f64 = -50.0;
+/// Clamp: floor nikdy hlubší než to (jinak brake nikdy nezabere).
+pub const ROLLING_FLOOR_DEEP_CLAMP: f64 = -600.0;
+/// Minimální počet ztrát v okně, aby adaptivní výpočet měl smysl.
+const ROLLING_MIN_LOSSES_FOR_ADAPTIVE: usize = 10;
 
 /// Stav všech tří brzd. Voláno z hot loopu před governance/entry.
 #[derive(Debug)]
@@ -372,11 +394,45 @@ impl TradingBrakes {
         }
     }
 
+    /// Adaptivní floor rolling brzdy (sats, záporný).
+    ///
+    /// `−(avg_abs_loss × 60)` clampovaný do ⟨−600, −50⟩; fallback −150
+    /// dokud v okně není ≥ 10 ztrát. Podrobnosti v dokumentaci konstant.
+    pub fn rolling_floor_sats(&self) -> f64 {
+        // [OPONENTURA P0 — cliff fix] Fallback je vždy HORNÍ závorou:
+        // přechodem na adaptivní výpočet (10. ztráta) nesmí floor
+        // skokově ZPŘÍSNIT dolů (= uvolnit brzdu). max() na záporných
+        // číslech vybere mělčí hodnotu — proto porovnáváme "hloubku":
+        // vždy ta STRICTĚJŠÍ (hlubší, dál od nuly) z fallback a adaptive.
+        let losses: Vec<f64> = self
+            .closed
+            .iter()
+            .filter(|(_, p)| *p < 0.0)
+            .map(|(_, p)| -*p)
+            .collect();
+        let adaptive = if losses.len() < ROLLING_MIN_LOSSES_FOR_ADAPTIVE {
+            f64::NEG_INFINITY // fallback platí sám
+        } else {
+            let avg = losses.iter().sum::<f64>() / losses.len() as f64;
+            let raw = -(avg * ROLLING_TARGET_RT_COUNT);
+            raw.max(ROLLING_FLOOR_DEEP_CLAMP).min(ROLLING_FLOOR_SHALLOW_CLAMP)
+        };
+        // strictější = hlubší (menší, dál od nuly)
+        let floor = if adaptive == f64::NEG_INFINITY {
+            ROLLING_FLOOR_FALLBACK_SATS
+        } else {
+            adaptive.min(ROLLING_FLOOR_FALLBACK_SATS) // min = hlubší
+        };
+        floor
+    }
+
     /// Přepočet rolling brzdy: engage při PnL okna < floor,
     /// disengage až při PnL okna ≥ 0 (plný obrat — hystereze).
+    /// Floor je adaptivní (viz `rolling_floor_sats`).
     fn update_rolling(&mut self) {
         let window_pnl: f64 = self.closed.iter().map(|(_, p)| p).sum();
-        if !self.rolling_engaged && window_pnl < ROLLING_PNL_FLOOR_SATS {
+        let floor = self.rolling_floor_sats();
+        if !self.rolling_engaged && window_pnl < floor {
             self.rolling_engaged = true;
         } else if self.rolling_engaged && window_pnl >= 0.0 {
             self.rolling_engaged = false;
@@ -646,10 +702,12 @@ mod tests {
     #[test]
     fn rolling_engages_below_floor() {
         let mut b = TradingBrakes::new();
+        // 50 ztrát po −15 sats = −750; adaptivní floor: -(15×60) = −900 →
+        // clamp na −600. −750 < −600 → engage.
         for _ in 0..50 {
-            b.record_close(-10.0); // −500 sats < −400 práh
+            b.record_close(-15.0);
         }
-        assert!(b.rolling_engaged(), "−500 sats v okně → brake");
+        assert!(b.rolling_engaged(), "−750 sats < adaptivní floor −600 → brake");
         assert!(b.entry_allowed().is_some());
         assert!(b.entry_block_detail().unwrap().contains("rolling"));
     }
@@ -658,17 +716,17 @@ mod tests {
     fn rolling_disengages_on_full_recovery() {
         let mut b = TradingBrakes::new();
         for _ in 0..50 {
-            b.record_close(-10.0);
+            b.record_close(-15.0); // −750 < −600 → engage
         }
         assert!(b.rolling_engaged());
-        // částečné uzdravení (−100) NESTAČÍ — hystereze
-        for _ in 0..40 {
-            b.record_close(10.0);
+        // částečné uzdravení (−300) NESTAČÍ — hystereze
+        for _ in 0..30 {
+            b.record_close(15.0);
         }
-        assert!(b.rolling_engaged(), "−100 sats: brake drží (čeká plný obrat)");
+        assert!(b.rolling_engaged(), "−300 sats: brake drží (čeká plný obrat)");
         // plný obrat
-        for _ in 0..20 {
-            b.record_close(10.0);
+        for _ in 0..30 {
+            b.record_close(15.0);
         }
         assert!(!b.rolling_engaged(), "PnL ≥ 0 → brake uvolněn");
     }
@@ -703,7 +761,7 @@ mod tests {
         // by okno nikdy neořizlo → stuck navždy. tick() to řeší.
         let mut b = TradingBrakes::new();
         for _ in 0..50 {
-            b.record_close(-10.0); // −500 sats → engage
+            b.record_close(-15.0); // −750 < −600 → engage
         }
         assert!(b.rolling_engaged());
         // Tick samotný (bez obchodů) — v reálném case by po 3 h staré
@@ -721,13 +779,13 @@ mod tests {
     fn rehydrate_restores_rolling_window() {
         let mut b = TradingBrakes::new();
         let now = chrono::Utc::now().timestamp();
-        // 45 ztrát po −10 sats v poslední hodině → −450 sats < −400 práh
+        // 45 ztrát po −15 sats v poslední hodině → −675 sats < clamp −600
         let hist: Vec<(i64, f64)> = (0..45)
-            .map(|i| (now - 3600 + i * 10, -10.0))
+            .map(|i| (now - 3600 + i * 10, -15.0))
             .collect();
         b.rehydrate(&hist);
         assert_eq!(b.closed.len(), 45);
-        assert!(b.rolling_engaged(), "−450 sats z historie → brake aktivní po restartu");
+        assert!(b.rolling_engaged(), "−675 sats z historie → brake aktivní po restartu");
     }
 
     #[test]
@@ -1016,6 +1074,96 @@ mod tests {
             assert!(!d.update(p, t0 + i * 10), "padající nůž bez odrazu = čekat");
         }
     }
+
+    // ── ADAPTIVNÍ FLOOR [ROZHODNUTÍ OPERÁTORA 28. 8.] ──
+
+    #[test]
+    fn adaptive_floor_discriminates_bad_hour() {
+        // Scénář noci 27./28. 8.: hodina s WR ~0 % (28 čistých ztrát).
+        // Ztráty ~2.5 sats (měřená avg loss z JSONL: 0.0024 USD ≈ 3 sats).
+        let mut b = TradingBrakes::new();
+        for _ in 0..28 {
+            b.record_close(-3.0);
+        }
+        // floor = -(3 × 60) = −180; PnL −84 > −180 → NE (1 hodina ještě ne)
+        assert!(!b.rolling_engaged(), "jedna špatná hodina (−84) ještě pod práh");
+        // Dvě špatné hodiny: 56 ztrát = −168 < −180? Těsně ne.
+        for _ in 0..28 {
+            b.record_close(-3.0);
+        }
+        // PnL −168, floor −180 → stále ne. Třetí hodina:
+        for _ in 0..28 {
+            b.record_close(-3.0);
+        }
+        assert!(b.rolling_engaged(), "tři špatné hodiny (−252 < −180) → brake");
+    }
+
+    #[test]
+    fn adaptive_floor_ignores_mixed_hours() {
+        // Smíšená hodina (WR 40 %, payoff 1.6) = mírně kladná/nulová
+        let mut b = TradingBrakes::new();
+        for i in 0..120 {
+            let pnl = if i % 5 < 2 { 5.0 } else { -3.0 };
+            b.record_close(pnl);
+        }
+        // PnL = 48×5 − 72×3 = +24 → daleko nad floor
+        assert!(!b.rolling_engaged(), "smíšené hodiny nesmí spustit brake");
+    }
+
+    #[test]
+    fn adaptive_floor_scales_with_loss_size() {
+        // [P0 cliff fix + P1 mult 30] fallback −150 je HORNÍ závora:
+        // floor(3 sats) = min(−90, −150) = −150 (fallback strictější).
+        // floor(10 sats) = min(−300, −150) = −300 (adaptivní strictější).
+        let mut small = TradingBrakes::new();
+        for _ in 0..20 { small.record_close(-3.0); }
+        let mut big = TradingBrakes::new();
+        for _ in 0..20 { big.record_close(-10.0); }
+        let f_small = small.rolling_floor_sats();
+        let f_big = big.rolling_floor_sats();
+        assert!((f_small - (-150.0)).abs() < 1e-9, "floor(3 sats) = {f_small}");
+        assert!((f_big - (-300.0)).abs() < 1e-9, "floor(10 sats) = {f_big}");
+        assert!(f_small > f_big, "větší ztráty → hlubší floor");
+    }
+
+    #[test]
+    fn adaptive_floor_fallback_cold_start() {
+        // Studený start (< 10 ztrát v okně): fallback −150
+        let mut b = TradingBrakes::new();
+        for _ in 0..5 { b.record_close(-100.0); } // −500, ale jen 5 ztrát
+        assert!((b.rolling_floor_sats() - (-150.0)).abs() < 1e-9);
+        // −500 < −150 → brake i se fallbackem (velké ztráty blokovat hned)
+        assert!(b.rolling_engaged(), "−500 < fallback −150 → brake");
+    }
+
+    #[test]
+    fn adaptive_floor_clamped_shallow() {
+        // Mikro-ztráty (0.2 sats): raw = −6, clamp −50, ale fallback −150
+        // je strictější → floor = −150 (brzda nikdy triviálně mělce).
+        let mut b = TradingBrakes::new();
+        for _ in 0..30 { b.record_close(-0.2); }
+        assert!((b.rolling_floor_sats() - (-150.0)).abs() < 1e-9, "fallback −150 jako strop");
+    }
+
+
+    #[test]
+    fn no_cliff_when_adaptive_kicks_in() {
+        // [OPONENTURA P0] 10. ztráta nesmí floor UVOLNIT (skok −150→mělčeji).
+        // 9 ztrát: fallback −150. 10. ztráta: adaptivní přejme, ale floor
+        // musí zůstat ≤ −150 (stejně nebo strictěji).
+        let mut b = TradingBrakes::new();
+        for _ in 0..9 { b.record_close(-30.0); } // −270, fallback −150 → engage? -270 < -150 → ano
+        assert!(b.rolling_engaged());
+        let f9 = b.rolling_floor_sats();
+        assert!((f9 - (-150.0)).abs() < 1e-9);
+        b.record_close(-30.0); // 10. ztráta → adaptivní
+        let f10 = b.rolling_floor_sats();
+        // adaptivní = min(−(30×30)=−900 clamp −600, −150) = −600
+        assert!((f10 - (-600.0)).abs() < 1e-9, "f10 = {f10}");
+        assert!(f10 <= f9, "10. ztráta nesmí floor uvolnit: {f10} > {f9}");
+        assert!(b.rolling_engaged(), "brake stále aktivní po přechodu");
+    }
+
     // ── kombinace ──
 
     #[test]
