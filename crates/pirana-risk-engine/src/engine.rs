@@ -308,6 +308,13 @@ impl RiskEngine {
         self.brakes.lock().rolling_pnl_sats()
     }
 
+    /// [TRADING BRAKES] Rolling brake ENGAGE stav (hystereze + adaptivní
+    /// floor) — pro režimový inventářní strop (oponentura: jakékoliv
+    /// záporné PnL okna flappovalo strop 10/20 %).
+    pub fn brakes_rolling_engaged(&self) -> bool {
+        self.brakes.lock().rolling_engaged()
+    }
+
 /// Kopie kalibrovaneho stavu pro dashboard / report.
     pub fn calibration_snapshot(&self) -> CalibratedRisk {
         self.calibrated.read().clone()

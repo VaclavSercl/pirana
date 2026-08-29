@@ -75,12 +75,20 @@ ticks_per_bar = 50
 # vyzaduje payoff > 2, ne 0.18. Nove: TP 0.8×ATR (dvojnasobne vyhry),
 # SL 1.5×ATR + floor 150 USD — riziko ~0.5 % pozice, asymetrie ~1.9:1
 # ve prospech vyher (breakeven WR ~35 %).
-atr_tp_multiplier = 0.8
-atr_sl_multiplier = 1.5
+# [OPONENTURA P0 FIX 29.8.] Původní navrh (TP 0.8, SL 1.5, min_sl 150) měl
+# kritickou chybu: min_sl floor 150 USD zvracel asymetrii — při ATR ~25 USD
+# byl SL 6× nad TP (ztráta 150 vs výhra 20 = 7.5:1 PROTI nám, breakeven
+# WR 88 %!). Scalp s WR 33 % potřebuje: TP > SL. Nově:
+#   TP = 1.8×ATR (~45 USD při ATR 25), SL = 0.7×ATR (~18, floor 30 pro
+#   ochranu proti šumu v klidném trhu)
+#   → payoff ~1.5-2.5:1 pro výhry, breakeven WR ~30-40 % (splnitelné).
+# Během směrového pohybu trailing stop řídí výstup — SL je pojistka.
+atr_tp_multiplier = 1.8
+atr_sl_multiplier = 0.7
 min_tp_usd = 10.0
 max_tp_usd = 300.0
-min_sl_usd = 150.0
-max_sl_usd = 800.0
+min_sl_usd = 30.0
+max_sl_usd = 400.0
 
 [order_book]
 use_l2_depth_imbalance = true

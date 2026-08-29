@@ -50,6 +50,11 @@ pub struct ActivePosition {
     pub lowest_price_seen: f64,
     pub is_breakeven: bool,
     pub trailing_active: bool,
+    /// [OPONENTURA P0 FIX] Syntetická pozice z REBALANCE SELL (deadlock
+    /// odblokování) — reálný vstup nikdy neexistoval, entry_price je
+    /// jen signální cena. NESMÍ se zapisovat do TradeLedger jako
+    /// regulérní RT (kazila by Kellyho sizing a volatilitu).
+    pub is_rebalance: bool,
 }
 
 /// Monotonní čítač pozic — jedinečná ID pro robustní match po fillu.
@@ -1606,7 +1611,11 @@ async fn process_ws_message(
                                     == pirana_risk_engine::trading_brakes::MarketRegime::TrendUp;
                                 let trend_down = regime
                                     == pirana_risk_engine::trading_brakes::MarketRegime::TrendDown;
-                                let rolling_negative = risk_engine.brakes_rolling_pnl_sats() < 0.0;
+                                // [OPONENTURA P0 FIX] rolling_negative = ENGAGE stavu brzdy
+                                // (hystereze + adaptivní floor), ne jakéhokoliv záporného
+                                // PnL okna — to flappovalo strop 10/20 % i u zdravého
+                                // tradingu (52 % dne je přirozeně pod nulou).
+                                let rolling_negative = risk_engine.brakes_rolling_engaged();
                                 let max_allowed_btc = if conf.inventory.use_dynamic_inventory {
                                     dynamic_sizer.calculate_regime_inventory_btc(
                                         total_portfolio_usd,
@@ -1773,6 +1782,7 @@ async fn process_ws_message(
                                              state.add_signal(executed_view);
 
                                              active_positions.write().push(ActivePosition {
+                                                 is_rebalance: false,
                                                  position_id: next_position_id(),
                                                  entry_price: price,
                                                  quantity: final_trade_size,
@@ -1870,6 +1880,7 @@ async fn process_ws_message(
                                                      // [P0 accountování] ID uloženo pro robustní korekci po fillu.
                                                      let tracked_position_id = next_position_id();
                                                      active_positions.write().push(ActivePosition {
+                                                         is_rebalance: false,
                                                          position_id: tracked_position_id,
                                                          entry_price: price,
                                                          quantity: final_trade_size,
@@ -2296,7 +2307,7 @@ async fn process_ws_message(
                                                                     == pirana_risk_engine::trading_brakes::MarketRegime::TrendUp,
                                                                 risk_engine.brakes_regime()
                                                                     == pirana_risk_engine::trading_brakes::MarketRegime::TrendDown,
-                                                                risk_engine.brakes_rolling_pnl_sats() < 0.0,
+                                                                risk_engine.brakes_rolling_engaged(),
                                                             )
                                                         } else {
                                                             conf.inventory.max_inventory_btc
@@ -2312,6 +2323,7 @@ async fn process_ws_message(
                                                             // Svazat velikost orderu STRIKTNE s prebytkem.
                                                             final_trade_size = excess_btc.min(final_trade_size.max(excess_btc)).max(MIN_ORDER_SIZE_BTC);
                                                             ActivePosition {
+                                                                is_rebalance: true,
                                                                 position_id: next_position_id(),
                                                                 entry_price: price,
                                                                 quantity: excess_btc,
@@ -2474,23 +2486,32 @@ async fn process_ws_message(
                                                                     let equity_usd = *state_clone.btc_balance.read() * fill_price
                                                                         + *state_clone.usd_balance.read();
                                                                     let vpin_now = *state_clone.vpin_score.read();
-                                                                    risk_engine_clone.record_closed_trade(
-                                                                        realized_pnl,
-                                                                        fill_price,
-                                                                        equity_usd,
-                                                                        vpin_now,
-                                                                    );
+                                                                    // [OPONENTURA P0 FIX] Rebalance syntetická pozice se
+                                                                    // nezapisuje do kalibrační knihy — reálný vstup
+                                                                    // neexistoval (jen slippage), kazila by Kellyho.
+                                                                    if !pos_to_restore.is_rebalance {
+                                                                        risk_engine_clone.record_closed_trade(
+                                                                            realized_pnl,
+                                                                            fill_price,
+                                                                            equity_usd,
+                                                                            vpin_now,
+                                                                        );
+                                                                    }
                                                                 }
 
                                                                 // [CASLAV v5.1 / PERSISTENCE P0 — bod 1] Signálová SELL
                                                                 // cesta dříve NEzapisovala ClosedTrade do JSONL (jen TP/SL
                                                                 // cesta) → offline analýza viděla jen ~38 % round-tripů.
+                                                                // [OPONENTURA P0 FIX] Rebalance pozice vynechána.
+                                                                if !pos_to_restore.is_rebalance {
                                                                 {
                                                                     let closed_trade = pirana_risk_engine::trade_ledger::ClosedTrade {
                                                                         pnl_sats: (realized_pnl / fill_price) * 100_000_000.0,
                                                                         ts: chrono::Utc::now().timestamp(),
                                                                         vpin_at_close: *state_clone.vpin_score.read(),
-                                                                        side: if realized_pnl > 0.0 { Side::Buy } else { Side::Sell },
+                                                                        // [OPONENTURA P0 FIX] Side CLOSE orderu — SELL výstup
+                                                                        // z long pozice je vždy Sell (ne podle znaménka PnL).
+                                                                        side: Side::Sell,
                                                                         fill_price,
                                                                         qty: filled_qty,
                                                                         fee_sats: 0.0,
@@ -2500,6 +2521,7 @@ async fn process_ws_message(
                                                                     };
                                                                     let _ = pirana_risk_engine::ledger_persistence::append_trade(&closed_trade);
                                                                 }
+                                                                } // if !pos_to_restore.is_rebalance
 
                                                                 // Asymmetric BTC Profit Skimmer: lock profit portion in BTC reserve
                                                                 if realized_pnl > 0.0 && fill_price > 0.0 {
