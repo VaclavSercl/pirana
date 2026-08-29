@@ -31,6 +31,17 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 29.8.2026
+
+- **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Stav: Active,
+  consec_losses 0/5, WR 25,8 % (17/66 dnes), denní PnL −0,083 USD (−0,021 %),
+  equity ~398,61 USD (start 398,70), BTC 0,002511, OFI=0.0, VPIN 62,3 % (moderátní,
+  40/50 košů), spread $7, markout_1s +1,86 bps, markout_30s +2,15 bps, slippage EWMA
+  0,85 bps. Uptime 4h41m. Lead-Lag disparity +$7,93 (v prahu ±$15). Sizing 1,0 %
+  PONECHÁN — stále čeká na rozhodnutí operátora (3 varianty 20 %/1 %/5 %).
+  Trezor: 3,8e-8 BTC (profit skimmer prakticky nulový — zisky zatím nepokrývají
+  miner fee/zaokrouhlení). Žádná změna TOML.
+
 ### 28.8.2026
 
 - **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Stav: Defensive,

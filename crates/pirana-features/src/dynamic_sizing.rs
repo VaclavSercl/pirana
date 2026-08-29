@@ -53,6 +53,47 @@ impl DynamicSizer {
 
     /// Dynamically calculate the maximum allowed BTC inventory for the portfolio based on current equity,
     /// price, and the maximum aggregate exposure budget (up to 90%).
+    /// Režimově-vážený strop inventáře [BOD 2 — 29. 8. „vydělávat i v tomto trhu"].
+    ///
+    /// Původní verze tolerovala `max_aggregate_exposure_pct` (až 90 %)
+    /// equity v BTC — v klesajícím trhu to znamenalo držet ~49 % účtu
+    /// v assetu, který padá (měřeno: inventář −4.66 USD vs trading
+    /// −0.36 USD za jednu noc). BTC standard (§1b) neříká „drž vše" —
+    /// říká „úspěš se měří v sats", a směrové riziko se má řídit režimem:
+    ///
+    /// * `Range` — 20 % equity (scalping vyžaduje jen malý inventář)
+    /// * `TrendDown` nebo klouzavý PnL pod prahem — 10 % (defenziva)
+    /// * `TrendUp` — 35 % (participace na pumpě, ale ne plná expozice)
+    ///
+    /// Strop je VŽDY min(původní limit, režimový) — nikdy ne vyšší
+    /// než stávající governance.
+    pub fn calculate_regime_inventory_btc(
+        &self,
+        total_portfolio_usd: f64,
+        current_btc_price: f64,
+        trend_up: bool,
+        trend_down: bool,
+        rolling_pnl_negative: bool,
+    ) -> f64 {
+        if current_btc_price <= 0.0 || total_portfolio_usd <= 0.0 {
+            return 0.0001;
+        }
+        let cap_pct = if trend_down || rolling_pnl_negative {
+            0.10
+        } else if trend_up {
+            0.35
+        } else {
+            0.20
+        };
+        let cap_usd = total_portfolio_usd * cap_pct;
+        let cap_btc = cap_usd / current_btc_price;
+        // nikdy nad puvodni (aggregate) strop
+        let hard_btc = (total_portfolio_usd * (self.max_aggregate_exposure_pct / 100.0)
+            / current_btc_price)
+            .max(0.00004);
+        cap_btc.min(hard_btc).max(0.00004)
+    }
+
     pub fn calculate_dynamic_max_inventory_btc(
         &self,
         total_portfolio_usd: f64,
@@ -128,4 +169,49 @@ mod tests {
         let reduced = sizer.calculate_as_adjusted_position_pct(base_pct, 0.5);
         assert_eq!(reduced, 2.5);
     }
+
+    #[test]
+    fn regime_inventory_range_20pct() {
+        let s = DynamicSizer::new(1.0, 5.0, 90.0);
+        // RANGE: 400 USD @ 80 000 → 20 % = 80 USD → 0.001 BTC
+        let max = s.calculate_regime_inventory_btc(400.0, 80_000.0, false, false, false);
+        assert!((max - 80.0 / 80_000.0).abs() < 1e-9, "range cap = {max}");
+    }
+
+    #[test]
+    fn regime_inventory_trend_down_10pct() {
+        let s = DynamicSizer::new(1.0, 5.0, 90.0);
+        let max = s.calculate_regime_inventory_btc(400.0, 80_000.0, false, true, false);
+        assert!((max - 40.0 / 80_000.0).abs() < 1e-9, "trend-down cap = {max}");
+    }
+
+    #[test]
+    fn regime_inventory_rolling_negative_10pct() {
+        let s = DynamicSizer::new(1.0, 5.0, 90.0);
+        let max = s.calculate_regime_inventory_btc(400.0, 80_000.0, false, false, true);
+        assert!((max - 40.0 / 80_000.0).abs() < 1e-9, "rolling-negative cap = {max}");
+    }
+
+    #[test]
+    fn regime_inventory_trend_up_35pct() {
+        let s = DynamicSizer::new(1.0, 5.0, 90.0);
+        let max = s.calculate_regime_inventory_btc(400.0, 80_000.0, true, false, false);
+        assert!((max - 140.0 / 80_000.0).abs() < 1e-9, "trend-up cap = {max}");
+    }
+
+    #[test]
+    fn regime_inventory_never_above_hard_cap() {
+        // aggregate exposure 10 % → režimový 35 % se ořízne na 10 %
+        let s = DynamicSizer::new(1.0, 5.0, 10.0);
+        let max = s.calculate_regime_inventory_btc(400.0, 80_000.0, true, false, false);
+        assert!((max - 40.0 / 80_000.0).abs() < 1e-9, "hard cap 10 % vyhrává: {max}");
+    }
+
+    #[test]
+    fn regime_inventory_never_below_min_order() {
+        let s = DynamicSizer::new(1.0, 5.0, 90.0);
+        let max = s.calculate_regime_inventory_btc(0.01, 80_000.0, false, false, false);
+        assert!(max >= 0.00004, "nikdy pod minimální order");
+    }
+
 }

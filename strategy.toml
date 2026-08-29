@@ -70,12 +70,17 @@ max_position_size_pct = 25.0
 use_dynamic_atr = true
 atr_period = 14
 ticks_per_bar = 50
-atr_tp_multiplier = 0.4
-atr_sl_multiplier = 2.5
+# [BOD 3 — 29. 8. vyrovnani TP/SL asymetrie] Puvodne TP 0.4×ATR vs SL 2.5×ATR
+# = asymetrie 6:1 ve prospech ztrat (SL floor 350 USD!). Mean-reverze s WR 33 %
+# vyzaduje payoff > 2, ne 0.18. Nove: TP 0.8×ATR (dvojnasobne vyhry),
+# SL 1.5×ATR + floor 150 USD — riziko ~0.5 % pozice, asymetrie ~1.9:1
+# ve prospech vyher (breakeven WR ~35 %).
+atr_tp_multiplier = 0.8
+atr_sl_multiplier = 1.5
 min_tp_usd = 10.0
 max_tp_usd = 300.0
-min_sl_usd = 350.0
-max_sl_usd = 1200.0
+min_sl_usd = 150.0
+max_sl_usd = 800.0
 
 [order_book]
 use_l2_depth_imbalance = true

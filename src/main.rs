@@ -35,6 +35,10 @@ use config::StrategyConfig;
 
 #[derive(Debug, Clone)]
 pub struct ActivePosition {
+    /// Unikátní ID pozice [P0 accountování 29. 8.] — robustní match
+    /// pro korekci entry_price na reálný fill (dříve křehký match na
+    /// (entry_price, quantity) mohl opravit špatnou pozici).
+    pub position_id: u64,
     pub entry_price: f64,
     pub quantity: f64,
     pub side: Side,
@@ -46,6 +50,13 @@ pub struct ActivePosition {
     pub lowest_price_seen: f64,
     pub is_breakeven: bool,
     pub trailing_active: bool,
+}
+
+/// Monotonní čítač pozic — jedinečná ID pro robustní match po fillu.
+static NEXT_POSITION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_position_id() -> u64 {
+    NEXT_POSITION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Helper to rate-limit high-frequency warning logs and prevent disk/systemd journal spamming
@@ -1586,8 +1597,24 @@ async fn process_ws_message(
                                 };
                                 let dynamic_pos_pct = dynamic_sizer.calculate_as_adjusted_position_pct(dynamic_pos_pct_raw, as_multiplier_buy);
 
+                                // [BOD 2 — režimový inventářní strop] Držení BTC
+                                // se řídí tržním režimem (Range 20 %, TrendDown/krize
+                                // 10 %, TrendUp 35 %) místo 90 % aggregate limitu.
+                                // V klesajícím trhu přestaneme „prodělávat trhem".
+                                let regime = risk_engine.brakes_regime();
+                                let trend_up = regime
+                                    == pirana_risk_engine::trading_brakes::MarketRegime::TrendUp;
+                                let trend_down = regime
+                                    == pirana_risk_engine::trading_brakes::MarketRegime::TrendDown;
+                                let rolling_negative = risk_engine.brakes_rolling_pnl_sats() < 0.0;
                                 let max_allowed_btc = if conf.inventory.use_dynamic_inventory {
-                                    dynamic_sizer.calculate_dynamic_max_inventory_btc(total_portfolio_usd, price)
+                                    dynamic_sizer.calculate_regime_inventory_btc(
+                                        total_portfolio_usd,
+                                        price,
+                                        trend_up,
+                                        trend_down,
+                                        rolling_negative,
+                                    )
                                 } else {
                                     conf.inventory.max_inventory_btc
                                 };
@@ -1746,6 +1773,7 @@ async fn process_ws_message(
                                              state.add_signal(executed_view);
 
                                              active_positions.write().push(ActivePosition {
+                                                 position_id: next_position_id(),
                                                  entry_price: price,
                                                  quantity: final_trade_size,
                                                  side: Side::Buy,
@@ -1839,7 +1867,10 @@ async fn process_ws_message(
 
                                                      // Track active position BEFORE tokio::spawn to prevent race condition
                                                      // where SELL arrives before BUY position is registered
+                                                     // [P0 accountování] ID uloženo pro robustní korekci po fillu.
+                                                     let tracked_position_id = next_position_id();
                                                      active_positions.write().push(ActivePosition {
+                                                         position_id: tracked_position_id,
                                                          entry_price: price,
                                                          quantity: final_trade_size,
                                                          side: Side::Buy,
@@ -1885,6 +1916,7 @@ async fn process_ws_message(
                                                     let risk_engine_clone = risk_engine.clone();
                                                     let slippage_telemetry_clone = slippage_telemetry.clone();
                                                     let exp_size = assessment.adjusted_position_size;
+                                                    let tracked_position_id = tracked_position_id;
 
                                                     tokio::spawn(async move {
                                                          // [CASLAV v5.1 / SLIPPAGE P1] IOC LIMIT místo MARKET:
@@ -1915,7 +1947,7 @@ async fn process_ws_message(
                                                                     tracing::info!("IOC BUY order vypršel bez fillu (limit {:.0} nedosažen) — rollback optimistic state", ioc_limit_price);
                                                                     let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, 0.0, 0.0, None);
                                                                     let mut positions = active_positions_clone.write();
-                                                                    if let Some(idx) = positions.iter().position(|p| p.entry_price == price && p.quantity == final_trade_size && !p.is_paper) {
+                                                                    if let Some(idx) = positions.iter().position(|p| p.position_id == tracked_position_id) {
                                                                         positions.remove(idx);
                                                                     }
                                                                     *state_clone.btc_balance.write() -= final_trade_size;
@@ -1961,9 +1993,11 @@ async fn process_ws_message(
                                                                 }
 
                                                                 // Fix position entry price and quantity to real fill so TP/SL and PnL are exact
+                                                                // [P0 accountování] Robustní match podle position_id — ne podle
+                                                                // (entry_price, quantity), které se může opakovat.
                                                                 {
                                                                     let mut positions = active_positions_clone.write();
-                                                                    if let Some(pos) = positions.iter_mut().rev().find(|p| p.side == Side::Buy && !p.is_paper && (p.entry_price - price).abs() < 1e-6) {
+                                                                    if let Some(pos) = positions.iter_mut().find(|p| p.position_id == tracked_position_id) {
                                                                         pos.entry_price = fill_price;
                                                                         pos.quantity = filled_qty;
                                                                     }
@@ -1981,7 +2015,7 @@ async fn process_ws_message(
                                                                 let _ = router_clone.lock().update_order(order_id, OrderStatus::Rejected, final_trade_size, price, None);
                                                                 // Rollback: remove the position we added optimistically
                                                                 let mut positions = active_positions_clone.write();
-                                                                if let Some(idx) = positions.iter().position(|p| p.entry_price == price && p.quantity == final_trade_size && !p.is_paper) {
+                                                                if let Some(idx) = positions.iter().position(|p| p.position_id == tracked_position_id) {
                                                                     positions.remove(idx);
                                                                 }
                                                                 // Rollback balances
@@ -2254,7 +2288,16 @@ async fn process_ws_message(
                                                         let locked_reserve = *state.locked_btc_reserve.read();
                                                         let tradable_btc = (current_btc - locked_reserve).max(0.0);
                                                         let max_allowed_btc = if conf.inventory.use_dynamic_inventory {
-                                                            dynamic_sizer.calculate_dynamic_max_inventory_btc(total_portfolio_usd, price)
+                                                            // [BOD 2] režimový strop i pro REBALANCE
+                                                            dynamic_sizer.calculate_regime_inventory_btc(
+                                                                total_portfolio_usd,
+                                                                price,
+                                                                risk_engine.brakes_regime()
+                                                                    == pirana_risk_engine::trading_brakes::MarketRegime::TrendUp,
+                                                                risk_engine.brakes_regime()
+                                                                    == pirana_risk_engine::trading_brakes::MarketRegime::TrendDown,
+                                                                risk_engine.brakes_rolling_pnl_sats() < 0.0,
+                                                            )
                                                         } else {
                                                             conf.inventory.max_inventory_btc
                                                         };
@@ -2269,6 +2312,7 @@ async fn process_ws_message(
                                                             // Svazat velikost orderu STRIKTNE s prebytkem.
                                                             final_trade_size = excess_btc.min(final_trade_size.max(excess_btc)).max(MIN_ORDER_SIZE_BTC);
                                                             ActivePosition {
+                                                                position_id: next_position_id(),
                                                                 entry_price: price,
                                                                 quantity: excess_btc,
                                                                 side: Side::Buy,
@@ -2436,6 +2480,25 @@ async fn process_ws_message(
                                                                         equity_usd,
                                                                         vpin_now,
                                                                     );
+                                                                }
+
+                                                                // [CASLAV v5.1 / PERSISTENCE P0 — bod 1] Signálová SELL
+                                                                // cesta dříve NEzapisovala ClosedTrade do JSONL (jen TP/SL
+                                                                // cesta) → offline analýza viděla jen ~38 % round-tripů.
+                                                                {
+                                                                    let closed_trade = pirana_risk_engine::trade_ledger::ClosedTrade {
+                                                                        pnl_sats: (realized_pnl / fill_price) * 100_000_000.0,
+                                                                        ts: chrono::Utc::now().timestamp(),
+                                                                        vpin_at_close: *state_clone.vpin_score.read(),
+                                                                        side: if realized_pnl > 0.0 { Side::Buy } else { Side::Sell },
+                                                                        fill_price,
+                                                                        qty: filled_qty,
+                                                                        fee_sats: 0.0,
+                                                                        cid: format!("pirana_sell_{}", chrono::Utc::now().timestamp()),
+                                                                        order_id: 0,
+                                                                        trade_id: 0,
+                                                                    };
+                                                                    let _ = pirana_risk_engine::ledger_persistence::append_trade(&closed_trade);
                                                                 }
 
                                                                 // Asymmetric BTC Profit Skimmer: lock profit portion in BTC reserve
