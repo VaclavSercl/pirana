@@ -33,6 +33,25 @@
 
 ### 29.8.2026
 
+- **10:30 (WebUI session — BODY 1-3 „vydělávat i v tomto trhu")**: Analýza ukázala,
+  že hlavní krvácení nebylo trading (JSONL: +0.27/+0.15/+0.04/+0.02 USD denně!),
+  ale INVENTÁŘ (49 % equity v BTC = −4.66 USD/noc při poklesu 2.4 %, 13× víc
+  než trading) + špatné accountování. Implementace:
+  BOD 1 (P0 accountování): signálová SELL cesta nezapisovala RT do JSONL
+  (jen TP/SL cesta, ~38 % dat!) — nyní symetricky; position_id (AtomicU64
+  counter) nahradil křehký match (entry_price, quantity) pro korekci
+  entry_price na reálný fill (2 místa: korekce + rollback).
+  BOD 2 (režimový inventářní strop): calculate_regime_inventory_btc —
+  Range 20 %, TrendDown/rolling-PnL-záporný 10 %, TrendUp 35 % equity
+  (dříve 90 % aggregate limit!). Wiring: BUY gate + REBALANCE deadlock gate.
+  BOD 3 (TP/SL asymetrie): dříve TP 0.4×ATR vs SL 2.5×ATR (6:1 ve prospěch
+  ztrát, SL floor 350 USD!) s payoff 0.18. Nově TP 0.8×ATR, SL 1.5×ATR,
+  min_sl 150 USD — asymetrie 1.9:1 pro výhry, breakeven WR ~35 %.
+  Živě po deployi: inventář 49 % → 10 % equity, režim TREND-DOWN detekován.
+  Testy: 24 sad workspace 0 failed, +6 regime_inventory. Commit 904ddd7.
+  Předtím: konzistenční rolling brake (WR<10 % na 30 RT, oponentura 2×P0:
+  self-release mid-streak, rehydrate řazení) — commit 9b0de07.
+
 - **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Stav: Active,
   consec_losses 0/5, WR 25,8 % (17/66 dnes), denní PnL −0,083 USD (−0,021 %),
   equity ~398,61 USD (start 398,70), BTC 0,002511, OFI=0.0, VPIN 62,3 % (moderátní,
