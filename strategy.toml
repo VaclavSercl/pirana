@@ -75,20 +75,23 @@ ticks_per_bar = 50
 # vyzaduje payoff > 2, ne 0.18. Nove: TP 0.8×ATR (dvojnasobne vyhry),
 # SL 1.5×ATR + floor 150 USD — riziko ~0.5 % pozice, asymetrie ~1.9:1
 # ve prospech vyher (breakeven WR ~35 %).
-# [OPONENTURA P0 FIX 29.8.] Původní navrh (TP 0.8, SL 1.5, min_sl 150) měl
-# kritickou chybu: min_sl floor 150 USD zvracel asymetrii — při ATR ~25 USD
-# byl SL 6× nad TP (ztráta 150 vs výhra 20 = 7.5:1 PROTI nám, breakeven
-# WR 88 %!). Scalp s WR 33 % potřebuje: TP > SL. Nově:
-#   TP = 1.8×ATR (~45 USD při ATR 25), SL = 0.7×ATR (~18, floor 30 pro
-#   ochranu proti šumu v klidném trhu)
-#   → payoff ~1.5-2.5:1 pro výhry, breakeven WR ~30-40 % (splnitelné).
-# Během směrového pohybu trailing stop řídí výstup — SL je pojistka.
-atr_tp_multiplier = 1.8
-atr_sl_multiplier = 0.7
-min_tp_usd = 10.0
-max_tp_usd = 300.0
-min_sl_usd = 30.0
-max_sl_usd = 400.0
+# [FAZE B REPLAY 30.8. — ROZHODNUTÍ OPERÁTORA 'Přepni na SCALP']
+# A/B test na 447 reálných vstupech (replay_real_signals.py): SCALP
+# konfigurace = 6× méně ztrát než stará (−0.13 vs −0.85 USD), nejlepší
+# ze 5 testovaných exit strategií. TP konečně dosažitelný (24 hitů vs 2).
+# Komentář k předchozí verzi zachován pro historii níže.
+#
+# Historie asymetrie (pro budoucí audit):
+#   29.8. ráno: TP 0.4 / SL 2.5 (stará — payoff 0.02, vše viselo)
+#   29.8. 11:06: TP 0.8 / SL 1.5, min_sl 150 (omyl — breakeven WR 88 %)
+#   29.8. 13:00: TP 1.8 / SL 0.7, min_sl 30 (oponentská oprava)
+#   30.8. (nyní): TP 0.3 / SL 0.4, těsné stropy (SCALP — replay výběr)
+atr_tp_multiplier = 0.3
+atr_sl_multiplier = 0.4
+min_tp_usd = 8.0
+max_tp_usd = 60.0
+min_sl_usd = 25.0
+max_sl_usd = 100.0
 
 [order_book]
 use_l2_depth_imbalance = true
@@ -98,10 +101,11 @@ l2_weight_alpha = 0.40
 min_l2_imbalance_threshold = 0.15
 
 [trailing_stop]
+# [SCALP replay] trail 0.3×ATR, trigger 6 USD — těsné, viz replay konfigurace
 enabled = true
-min_trigger_usd = 10.0
+min_trigger_usd = 6.0
 be_offset_usd = 2.0
-trail_multiplier = 0.5
+trail_multiplier = 0.3
 
 [profit_skimmer]
 enabled = true
