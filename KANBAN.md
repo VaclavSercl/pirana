@@ -14,7 +14,7 @@ Replay na historii místo „nasadíme a doufáme".
 | Fáze | Úloha | Termín | Stav | Definition of Done |
 |---|---|---|---|---|
 | **A** | Replay/Backtest engine — `scripts/replay_tp_sl.py`: 5m candles (14 dní), ATR/TP/SL/trailing věrné, sweep 40 kombinací | **29. 8.** | ✅ HOTovo | Engine funguje; sweep: žádná TP/SL kombinace nemá kladné EV (−0.0008 až −0.0023/RT); TP 0.4/SL 0.5 nejlepší, ale rozdíl kosmetický — problém je VE VSTUPU, ne v exitech. Momentum vstup +0.19 %/RT vs dip −0.05 %. ⚠️ Simulovaný vstup ≠ reálné flow signály → Fáze B to opraví |
-| **B** | Shadow/A-B mode + replay z REÁLNÝCH signálů — (1) replay: vezme zaznamenané signály z journalu (ts+cena každého vstupu) a na nich testuje TP/SL varianty = věrný A/B bez aproximačního vstupního signálu; (2) shadow: nová konfigurace paper-obchoduje na živých cenách WS, stará reálně | **30. 8. (zítra)** | ⏳ | Replay na reálných vstupech: verdikt A vs B; shadow paper RT zapisovány zvlášť do JSONL (cid prefix shadow_) |
+| **B** | Replay z reálných signálů ✅ + shadow mode runtime ⏳ | **30. 8.** | 🔄 | **Replay hotov** (`scripts/replay_real_signals.py`, 447 reálných vstupů): 1) všechny TP/SL konfigurace záporné EV, ale SCALP (těsné 0.3/0.4, TP≤60, SL≤100) je 6× méně ztrátový než STARÁ (−0.13 vs −0.85); 2) momentum vstupy > dip na všech konfiguracích; 3) noční EV kladné ale statisticky neprokázané (CI zahrnuje 0) — sbíráme data. **Zbývá**: shadow mode v runtime (paper obchody s alternativní konfigurací, cid shadow_) |
 | **C** | Chaos testy — restart mid-order, API outage simulace, poškozený JSONL → restart → robustnost | **31. 8. (pozítří)** | ⏳ | Skript/doctor mód, který každý chaos scénář provede a vyhodnotí PASS/FAIL |
 
 **Ověřovací otázky pro Fázi A (od operátora):**

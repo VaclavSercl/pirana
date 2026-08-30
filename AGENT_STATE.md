@@ -31,8 +31,31 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 30.8.2026
+
+- **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Služba Active,
+  uptime 3h49m (restart 03:11 po WebUI deployi z 10:30 včera). Stav: Active,
+  consec_losses 1/5, WR 27,8 % (10/36 dnes), denní PnL −0,0139 USD (−0,0035 %),
+  equity ~398,39 USD (start 398,20), BTC 0,00095 (inventář ~23 % equity),
+  OFI snapshot 0,0 (signály 0,98), VPIN 33,4 % (15/50 košů, Low Toxicity),
+  spread $12, markout_1s −5,1 bps / markout_30s −7,2 bps (negativní — SELL
+  exekuce průměrně prodává pod signál, sledovat), slippage EWMA 1,09 bps
+  (pod guard 5 bps). Lead-Lag disparity −$16,55 (BFX prémie, blízko prahu
+  ±$15 → DistributionExit SELL signály DENIED od 04:58). Poslední trade
+  04:58:48, režim RANGE. Sizing 1,0 % PONECHÁN — stále čeká na rozhodnutí
+  operátora (3 varianty 20 %/1 %/5 %). Žádná změna TOML.
+
 ### 29.8.2026
 
+- **17:28 (ranní/odpolední audit — Hermes CLI)**: Audit bez zásahu do TOML. Služba
+  aktivní, ale uptime pouze 33 s (restart 17:27:50 — bot právě nastartoval, po
+  WebUI deployi z 10:30). Stav: Active, consec_losses 0/5, denní PnL 0,0 (0 trades
+  — den resetován restartem), equity ~398,04 USD (start 398,04), BTC 0,000886,
+  OFI 0,0, VPIN 5,4 % (warming up, 0/10 košů — nespolehlivé), spread $7, markout
+  0,0, slippage 0,0. Lead-Lag disparity +$4,86 (v prahu ±$15). Signál
+  SpreadCapture conf 0,95 DENIED nespuštěn (nový běh). Kalibrace risk engine:
+  SEED (n=0) — Treasury kalibrace zatím bez dat. Sizing 1,0 % PONECHÁN — stále
+  čeká na rozhodnutí operátora (3 varianty 20 %/1 %/5 %). Žádná změna TOML.
 - **10:30 (WebUI session — BODY 1-3 „vydělávat i v tomto trhu")**: Analýza ukázala,
   že hlavní krvácení nebylo trading (JSONL: +0.27/+0.15/+0.04/+0.02 USD denně!),
   ale INVENTÁŘ (49 % equity v BTC = −4.66 USD/noc při poklesu 2.4 %, 13× víc
