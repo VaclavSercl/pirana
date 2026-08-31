@@ -55,6 +55,12 @@ pub struct ActivePosition {
     /// jen signální cena. NESMÍ se zapisovat do TradeLedger jako
     /// regulérní RT (kazila by Kellyho sizing a volatilitu).
     pub is_rebalance: bool,
+    /// [FÁZE B/2 — SHADOW MODE] Stínová A/B pozice: stejný vstup jako
+    /// reálný obchod, ale ALTERNATIVNÍ TP/SL konfigurace. Paper-only
+    /// (žádný order na burzu), zapisuje se do JSONL s cid shadow_
+    /// prefixem pro offline srovnání živé (SCALP) vs stínové (TIGHT)
+    /// strategie.
+    pub is_shadow: bool,
 }
 
 /// Monotonní čítač pozic — jedinečná ID pro robustní match po fillu.
@@ -996,8 +1002,11 @@ async fn process_ws_message(
                                         }
 
                                         // 3. Exit check
-                                        if price >= pos.entry_price + vol_cfg.max_tp_usd {
-                                            tracing::info!("🎯 BUY Position Max TP Ceiling Hit! Price {} >= Max TP {}", price, pos.entry_price + vol_cfg.max_tp_usd);
+                                        // [OPONENTURA P0-1 FIX] TP check per-pozice: pos.tp_price
+                                        // (ATR-based z entry), ne globální ceiling. Jinak shadow
+                                        // TIGHT i reálný SCALP exitují na stejném nesmyslném místě.
+                                        if price >= pos.tp_price {
+                                            tracing::info!("🎯 BUY Position TP Hit! Price {} >= TP {}", price, pos.tp_price);
                                             should_close = true;
                                         } else if price <= pos.sl_price {
                                             if pos.is_breakeven {
@@ -1036,8 +1045,8 @@ async fn process_ws_message(
                                             }
                                         }
 
-                                        if price <= pos.entry_price - vol_cfg.max_tp_usd {
-                                            tracing::info!("🎯 SELL Position Max TP Ceiling Hit! Price {} <= Max TP {}", price, pos.entry_price - vol_cfg.max_tp_usd);
+                                        if price <= pos.tp_price {
+                                            tracing::info!("🎯 SELL Position TP Hit! Price {} <= TP {}", price, pos.tp_price);
                                             should_close = true;
                                         } else if price >= pos.sl_price {
                                             if pos.is_breakeven {
@@ -1078,9 +1087,31 @@ async fn process_ws_message(
                                         Side::Sell => (pos_clone.entry_price - price) * pos_clone.quantity,
                                     };
 
-                                    tracing::info!("🔒 [PAPER TRADING] TP/SL Hit! Closed stínovou position (entry price: {}, side: {:?}). Realized PnL: {:.6} USD", pos_clone.entry_price, pos_clone.side, pnl);
-
-                                    risk_engine_clone.record_paper_trade_result(pnl);
+                                    // [FÁZE B/2 — SHADOW MODE] Stínová A/B pozice: zapsat do
+                                    // JSONL (shadow_ prefix) pro offline srovnání, ale NEFORE
+                                    // risk engine (žádný vliv na kalibraci/brzdy — jen data).
+                                    if pos_clone.is_shadow {
+                                        let closed_trade = pirana_risk_engine::trade_ledger::ClosedTrade {
+                                            pnl_sats: (pnl / price) * 100_000_000.0,
+                                            ts: chrono::Utc::now().timestamp(),
+                                            vpin_at_close: *state_clone.vpin_score.read(),
+                                            side: Side::Sell,
+                                            fill_price: price,
+                                            qty: pos_clone.quantity,
+                                            fee_sats: 0.0,
+                                            cid: format!("shadow_{}", chrono::Utc::now().timestamp()),
+                                            order_id: 0,
+                                            trade_id: 0,
+                                        };
+                                        let _ = pirana_risk_engine::ledger_persistence::append_trade(&closed_trade);
+                                        tracing::info!(
+                                            "SHADOW A/B close: {} → {:.0} (TP {:.0}/SL {:.0}) PnL {:+.5} USD [TIGHT config]",
+                                            pos_clone.entry_price, price, pos_clone.tp_price, pos_clone.sl_price, pnl
+                                        );
+                                    } else {
+                                        tracing::info!("🔒 [PAPER TRADING] TP/SL Hit! Closed stínovou position (entry price: {}, side: {:?}). Realized PnL: {:.6} USD", pos_clone.entry_price, pos_clone.side, pnl);
+                                        risk_engine_clone.record_paper_trade_result(pnl);
+                                    }
 
                                     // Sync system mode in dashboard state
                                     *state_clone.system_mode.write() = risk_engine_clone.mode();
@@ -1783,6 +1814,7 @@ async fn process_ws_message(
 
                                              active_positions.write().push(ActivePosition {
                                                  is_rebalance: false,
+                                                 is_shadow: false,
                                                  position_id: next_position_id(),
                                                  entry_price: price,
                                                  quantity: final_trade_size,
@@ -1858,6 +1890,8 @@ async fn process_ws_message(
                                                  // nikdy nezaplatí víc než práh.
                                                  let ioc_limit_price = slippage_guard.ioc_limit_price(Side::Buy, price);
 
+                                                 // [SHADOW] ID stínové pozice — 0 = nebyla vytvořena.
+                                                 let mut shadow_position_id: u64 = 0;
                                                  if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
                                                      tracing::info!("Buying Pressure (Composite: {:.2}) -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, SL: -{:.1})", composite_signal, final_trade_size, tp_dist, sl_dist);
                                                      
@@ -1881,6 +1915,7 @@ async fn process_ws_message(
                                                      let tracked_position_id = next_position_id();
                                                      active_positions.write().push(ActivePosition {
                                                          is_rebalance: false,
+                                                         is_shadow: false,
                                                          position_id: tracked_position_id,
                                                          entry_price: price,
                                                          quantity: final_trade_size,
@@ -1894,6 +1929,38 @@ async fn process_ws_message(
                                                          is_breakeven: false,
                                                          trailing_active: false,
                                                     });
+
+                                                    // [FÁZE B/2 — SHADOW MODE] Paralelní stínová pozice se
+                                                    // stejným vstupem, ale TIGHT konfigurací (TP 0.5×ATR /
+                                                    // SL 0.5×ATR, dle replay 2. nejlepší). Paper-only: žádný
+                                                    // order, žádný balanc, jen TP/SL tracking v hot loopu a
+                                                    // zápis do JSONL (shadow_ prefix) při exitu.
+                                                    // Po 200+ RT offline srovnání živý SCALP vs stín TIGHT.
+                                                    {
+                                                        let shadow_tp = (atr.current_atr() * 0.5).clamp(10.0, 120.0);
+                                                        let shadow_sl = (atr.current_atr() * 0.5).clamp(30.0, 150.0);
+                                                        shadow_position_id = next_position_id();
+                                                        active_positions.write().push(ActivePosition {
+                                                            is_rebalance: false,
+                                                            is_shadow: true,
+                                                            position_id: shadow_position_id,
+                                                            entry_price: price,
+                                                            quantity: final_trade_size,
+                                                            side: Side::Buy,
+                                                            tp_price: price + shadow_tp,
+                                                            sl_price: price - shadow_sl,
+                                                            exposure_size: 0.0, // žádná reálná expozice
+                                                            is_paper: true,    // paper mechanika exitů
+                                                            highest_price_seen: price,
+                                                            lowest_price_seen: price,
+                                                            is_breakeven: false,
+                                                            trailing_active: false,
+                                                        });
+                                                        tracing::debug!(
+                                                            "SHADOW pozice otevřena @ {:.0} (TP +{:.0} / SL −{:.0}) — A/B proti živému SCALPu",
+                                                            price, shadow_tp, shadow_sl
+                                                        );
+                                                    }
 
                                                     // Update balances locally BEFORE async to prevent stale reads
                                                     *state.btc_balance.write() += final_trade_size;
@@ -1928,6 +1995,7 @@ async fn process_ws_message(
                                                     let slippage_telemetry_clone = slippage_telemetry.clone();
                                                     let exp_size = assessment.adjusted_position_size;
                                                     let tracked_position_id = tracked_position_id;
+                                                    let shadow_position_id = shadow_position_id;
 
                                                     tokio::spawn(async move {
                                                          // [CASLAV v5.1 / SLIPPAGE P1] IOC LIMIT místo MARKET:
@@ -1960,6 +2028,12 @@ async fn process_ws_message(
                                                                     let mut positions = active_positions_clone.write();
                                                                     if let Some(idx) = positions.iter().position(|p| p.position_id == tracked_position_id) {
                                                                         positions.remove(idx);
+                                                                    }
+                                                                    // [P1-1 FIX] Odstranit i sirotčí shadow pozici
+                                                                    if shadow_position_id > 0 {
+                                                                        if let Some(idx) = positions.iter().position(|p| p.position_id == shadow_position_id) {
+                                                                            positions.remove(idx);
+                                                                        }
                                                                     }
                                                                     *state_clone.btc_balance.write() -= final_trade_size;
                                                                     *state_clone.usd_balance.write() += required_usd;
@@ -2028,6 +2102,12 @@ async fn process_ws_message(
                                                                 let mut positions = active_positions_clone.write();
                                                                 if let Some(idx) = positions.iter().position(|p| p.position_id == tracked_position_id) {
                                                                     positions.remove(idx);
+                                                                }
+                                                                // [P1-1 FIX] Odstranit i sirotčí shadow pozici
+                                                                if shadow_position_id > 0 {
+                                                                    if let Some(idx) = positions.iter().position(|p| p.position_id == shadow_position_id) {
+                                                                        positions.remove(idx);
+                                                                    }
                                                                 }
                                                                 // Rollback balances
                                                                 *state_clone.btc_balance.write() -= final_trade_size;
@@ -2186,7 +2266,9 @@ async fn process_ws_message(
                                         let mut found_paper = false;
                                         {
                                             let mut positions = active_positions.write();
-                                            if let Some(idx) = positions.iter().position(|p| p.side == Side::Buy && p.is_paper) {
+                                            // [P1-4 OPONENTURA FIX] Vynechat shadow pozice — jejich
+                                            // výsledek nesmí ovlivnit Halted recovery čítač.
+                                            if let Some(idx) = positions.iter().position(|p| p.side == Side::Buy && p.is_paper && !p.is_shadow) {
                                                 let closed_pos = positions.remove(idx);
                                                 realized_pnl = (price - closed_pos.entry_price) * closed_pos.quantity;
                                                 final_trade_size = closed_pos.quantity;
@@ -2324,6 +2406,7 @@ async fn process_ws_message(
                                                             final_trade_size = excess_btc.min(final_trade_size.max(excess_btc)).max(MIN_ORDER_SIZE_BTC);
                                                             ActivePosition {
                                                                 is_rebalance: true,
+                                                                is_shadow: false,
                                                                 position_id: next_position_id(),
                                                                 entry_price: price,
                                                                 quantity: excess_btc,

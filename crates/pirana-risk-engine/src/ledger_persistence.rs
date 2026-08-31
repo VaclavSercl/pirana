@@ -112,6 +112,12 @@ pub fn load_all_trades() -> Result<Vec<ClosedTrade>, LedgerPersistError> {
         if line.is_empty() {
             continue;
         }
+        // [FÁZE B/2 — OPONENTURA P0-2] Shadow A/B záznamy (cid shadow_)
+        // NEPATŘÍ do kalibrační knihy — po restartu by otrávily
+        // sample_size, brzdy i Kellyho sizing.
+        if line.contains("shadow_") {
+            continue;
+        }
         // Slepené řádky: '{...}{...}' — zkusíme rozdělit na jednotlivé
         // JSON objekty. Serde stream decoder by byl čistší, ale
         // minimální robustní řešení: rozdělit před '{"pnl_sats"'.
