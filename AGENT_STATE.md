@@ -31,6 +31,23 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 3.9.2026
+
+- **07:00 (ranní audit — Hermes CLI)**: ⚠️ Služba nalezena NEAKTIVNÍ — v 07:00:53
+  CEST dostala SIGTERM (systemd stop, předchozí běh jen 21,5 s, start 06:53:23;
+  pravděpodobně kolize s restartem z daily_check/operátora). Podle protokolu
+  proveden `sudo systemctl restart pirana.service` → Active, uptime od 07:02.
+  Po restartu: Active, consec_losses 0/5, equity ~397,55 USD (start 397,55),
+  BTC 0,000739, OFI 0,0, VPIN 87,6 % (warming up 0/10 košů — nespolehlivé),
+  spread $16, markouty 0,0, slippage 0,0. Režim TOXIC. Lead-Lag disparity
+  −$94,28 (Leader discount, hluboko mimo práh ±$15 → DistributionExit SELL
+  DENIED). Z LEDGERU (persistuje přes restarty): dnes 93 RT, PnL −69,08 sats
+  (≈ −0,005 USD), WR 16,1 % (15/93). Kalibrace risk engine: SEED (n=0).
+  Sizing 1,0 % PONECHÁN — stále čeká na rozhodnutí operátora (20 %/1 %/5 %).
+  Žádná změna TOML (strategy.toml beze zásahu). Doporučeno operátorovi:
+  ověřit, kdo/co poslal SIGTERM v 07:00:53 (journalctl ukazuje čistý
+  systemd stop, nikoli crash).
+
 ### 2.9.2026
 
 - **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Služba Active,

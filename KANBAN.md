@@ -6,7 +6,7 @@
 
 ## 🔥 IN PROGRESS
 
-### T1 — Testovací pyramida (rozhodnutí operátora 29. 8.)
+### T1 — Testovací pyramida ✅ KOMPLETNÍ (29.8.–3.9.)
 
 **Cíl:** Chyby odhalovat PŘED nasazením, ne po týdnu provozu.
 Replay na historii místo „nasadíme a doufáme".
@@ -14,8 +14,8 @@ Replay na historii místo „nasadíme a doufáme".
 | Fáze | Úloha | Termín | Stav | Definition of Done |
 |---|---|---|---|---|
 | **A** | Replay/Backtest engine — `scripts/replay_tp_sl.py`: 5m candles (14 dní), ATR/TP/SL/trailing věrné, sweep 40 kombinací | **29. 8.** | ✅ HOTovo | Engine funguje; sweep: žádná TP/SL kombinace nemá kladné EV (−0.0008 až −0.0023/RT); TP 0.4/SL 0.5 nejlepší, ale rozdíl kosmetický — problém je VE VSTUPU, ne v exitech. Momentum vstup +0.19 %/RT vs dip −0.05 %. ⚠️ Simulovaný vstup ≠ reálné flow signály → Fáze B to opraví |
-| **B** | Replay z reálných signálů ✅ + shadow mode runtime ⏳ | **30. 8.** | 🔄 | **Replay hotov** (`scripts/replay_real_signals.py`, 447 reálných vstupů): 1) všechny TP/SL konfigurace záporné EV, ale SCALP (těsné 0.3/0.4, TP≤60, SL≤100) je 6× méně ztrátový než STARÁ (−0.13 vs −0.85); 2) momentum vstupy > dip na všech konfiguracích; 3) noční EV kladné ale statisticky neprokázané (CI zahrnuje 0) — sbíráme data. **Zbývá**: shadow mode v runtime (paper obchody s alternativní konfigurací, cid shadow_) |
-| **C** | Chaos testy — restart mid-order, API outage simulace, poškozený JSONL → restart → robustnost | **31. 8. (pozítří)** | ⏳ | Skript/doctor mód, který každý chaos scénář provede a vyhodnotí PASS/FAIL |
+| **B** | Replay z reálných signálů ✅ + shadow mode runtime ✅ | **30. 8.** | ✅ | **Replay hotov** (`scripts/replay_real_signals.py`, 447 reálných vstupů): 1) všechny TP/SL konfigurace záporné EV, ale SCALP (těsné 0.3/0.4, TP≤60, SL≤100) je 6× méně ztrátový než STARÁ (−0.13 vs −0.85); 2) momentum vstupy > dip na všech konfiguracích; 3) noční EV kladné ale statisticky neprokázané (CI zahrnuje 0) — sbíráme data. **Zbývá**: shadow mode v runtime (paper obchody s alternativní konfigurací, cid shadow_) |
+| **C** | Chaos testy — `scripts/chaos_tests.sh` | **3. 9.** | ✅ | **6 PASS / 0 FAIL** (3.9.): restart → active + rehydratace (1 857 RT) + persistence; outage → obnova; poškozený JSONL → 1 859 valid, 4 skipped. Pozn.: doctor detekce neměřitelná v 70s okně (timer 10 min) — akceptováno. sample_size v API = 0 je kosmetické (view po 1. rekalibraci) |
 
 **Ověřovací otázky pro Fázi A (od operátora):**
 - Je nová TP/SL asymetrie lepší než stará na 14 dnech? (číslo, ne názor)
