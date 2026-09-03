@@ -86,12 +86,16 @@ ticks_per_bar = 50
 #   29.8. 11:06: TP 0.8 / SL 1.5, min_sl 150 (omyl — breakeven WR 88 %)
 #   29.8. 13:00: TP 1.8 / SL 0.7, min_sl 30 (oponentská oprava)
 #   30.8. (nyní): TP 0.3 / SL 0.4, těsné stropy (SCALP — replay výběr)
-atr_tp_multiplier = 0.3
-atr_sl_multiplier = 0.4
-min_tp_usd = 8.0
-max_tp_usd = 60.0
-min_sl_usd = 25.0
-max_sl_usd = 100.0
+# [A/B ROZHODNUTÍ OPERÁTORA 3.9. 'Přepni na TIGHT']
+# Shadow A/B na 321 reálných vstupech: TIGHT EV +0.03 sats/RT (WR 34 %,
+# payoff 2.01) vs živá SCALP −0.27 sats/RT (WR 29.5 %, payoff 1.94).
+# Stín SCALP se mění na TIGHT; nový stín = momentum-only kandidát (backlog).
+atr_tp_multiplier = 0.5
+atr_sl_multiplier = 0.5
+min_tp_usd = 10.0
+max_tp_usd = 120.0
+min_sl_usd = 30.0
+max_sl_usd = 150.0
 
 [order_book]
 use_l2_depth_imbalance = true

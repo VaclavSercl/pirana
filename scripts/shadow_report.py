@@ -60,7 +60,7 @@ def stats(trades):
 
 def main():
     live = load("pirana")
-    shadow = load("shadow")
+    shadow = load("shadow")  # pokryje shadow_mom_ (prefix match)
 
     print("════════ SHADOW A/B REPORT ════════")
     print("(živá SCALP vs stínová TIGHT, stejné vstupy)\n")

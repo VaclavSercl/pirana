@@ -1099,7 +1099,7 @@ async fn process_ws_message(
                                             fill_price: price,
                                             qty: pos_clone.quantity,
                                             fee_sats: 0.0,
-                                            cid: format!("shadow_{}", chrono::Utc::now().timestamp()),
+                                            cid: format!("shadow_mom_{}", chrono::Utc::now().timestamp()),
                                             order_id: 0,
                                             trade_id: 0,
                                         };
@@ -1930,15 +1930,30 @@ async fn process_ws_message(
                                                          trailing_active: false,
                                                     });
 
-                                                    // [FÁZE B/2 — SHADOW MODE] Paralelní stínová pozice se
-                                                    // stejným vstupem, ale TIGHT konfigurací (TP 0.5×ATR /
-                                                    // SL 0.5×ATR, dle replay 2. nejlepší). Paper-only: žádný
-                                                    // order, žádný balanc, jen TP/SL tracking v hot loopu a
-                                                    // zápis do JSONL (shadow_ prefix) při exitu.
-                                                    // Po 200+ RT offline srovnání živý SCALP vs stín TIGHT.
+                                                    // [A/B v2 — 3.9. ROZHODNUTÍ OPERÁTORA] Živá strategie
+                                                    // je nyní TIGHT (A/B v1 vyhrála). Nový stín: MOMENTUM
+                                                    // filtr — stejná TIGHT TP/SL, ale pozice se stínuje jen
+                                                    // když je vstup momentum (cena > cena před 30 min);
+                                                    // dip vstupy nestínujeme. Hypotéza z replay: momentum
+                                                    // vstupy mají lepší EV (+0.19 %/RT vs −0.05 %).
+                                                    // Paper-only, JSONL cid shadow_mom_ prefix.
                                                     {
+                                                        // Momentum filtr: cena > cena před ≥30 min
+                                                        let price_30m_ago = {
+                                                            let hist = state.price_history.read();
+                                                            let cutoff = chrono::Utc::now() - chrono::Duration::minutes(30);
+                                                            hist.iter()
+                                                                .filter_map(|pp| chrono::DateTime::parse_from_rfc3339(&pp.timestamp).ok().map(|t| (t, pp.price)))
+                                                                .filter(|(t, _)| *t <= cutoff)
+                                                                .map(|(_, p)| p)
+                                                                .last()
+                                                        };
+                                                        let is_momentum_entry = price_30m_ago.map(|old_p| price > old_p).unwrap_or(false);
                                                         let shadow_tp = (atr.current_atr() * 0.5).clamp(10.0, 120.0);
                                                         let shadow_sl = (atr.current_atr() * 0.5).clamp(30.0, 150.0);
+                                                        if !is_momentum_entry {
+                                                            // dip vstup — nestínujeme (experiment: jen momentum)
+                                                        } else {
                                                         shadow_position_id = next_position_id();
                                                         active_positions.write().push(ActivePosition {
                                                             is_rebalance: false,
@@ -1957,9 +1972,10 @@ async fn process_ws_message(
                                                             trailing_active: false,
                                                         });
                                                         tracing::debug!(
-                                                            "SHADOW pozice otevřena @ {:.0} (TP +{:.0} / SL −{:.0}) — A/B proti živému SCALPu",
+                                                            "SHADOW MOM pozice otevřena @ {:.0} (TP +{:.0} / SL −{:.0}) — momentum filtr A/B v2",
                                                             price, shadow_tp, shadow_sl
                                                         );
+                                                        }
                                                     }
 
                                                     // Update balances locally BEFORE async to prevent stale reads

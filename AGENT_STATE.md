@@ -31,6 +31,38 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 2.9.2026
+
+- **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Služba Active,
+  uptime 2h08m (restart 04:52:20). Stav: Active, consec_losses 5/5 (práh dosažen
+  — 4. den opakovaný nález: FSM hlásí Active/Defensive, nikdy Halted), WR 0,0 %
+  (0/5 dnes), denní PnL −0,0069 USD (−0,0017 %), equity ~397,24 USD (start
+  397,24), BTC 0,000519, OFI 0,0, VPIN 83,5 % (🚨 EMERGENCY TOXICITY, 50/50
+  košů — flash crash riziko), spread $14, markout_1s 0,0 / markout_30s −21,5 bps
+  (výrazně negativní), slippage EWMA 0,70 bps (pod guard 5 bps). Lead-Lag
+  disparity −$66,73 (Leader discount, hluboko mimo práh ±$15 — SpreadCapture
+  signály conf 0,95 DENIED). Režim TOXIC. Sizing 1,0 % PONECHÁN — stále čeká
+  na rozhodnutí operátora (3 varianty 20 %/1 %/5 %). Žádná změna TOML
+  (strategy.toml: position_size_pct=1,0, ofi_trigger_threshold=0,90).
+  ⚠️ NÁLEZ: consec_losses=5 = seed práh, VPIN emergency, ale FSM stále
+  Active — potvrzeno 4. den v řadě, opakován doporučení ověřit
+  Defensive→Halted logiku u operátora.
+
+### 1.9.2026
+
+- **07:01 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Služba Active,
+  uptime 48 min (restart 06:12:28). Stav: Active, consec_losses 5/5 (seed práh
+  dosažen — pozor, FSM by měl přejít do Defensive), WR 7,1 % (1/14 dnes), denní
+  PnL −0,0121 USD (−0,003 %), equity ~398,10 USD (start 398,10), BTC 0,000562,
+  OFI 0,0, VPIN 13,0 % (warming up 4/10 košů), spread $8, markout_1s −7,2 bps /
+  markout_30s −11,2 bps (negativní — SELL pod signál, sledovat), slippage EWMA
+  1,73 bps. Lead-Lag disparity −$57,61 (BFX prémie, hluboko mimo prah ±$15 →
+  DistributionExit SELL signály DENIED od 05:00, poslední trade 04:59:15).
+  Režim RANGE. Sizing 1,0 % PONECHÁN — stále čeká na rozhodnutí operátora
+  (3 varianty 20 %/1 %/5 %). ⚠️ Série ztrát 5/5 dosáhla seed prahu — opakován
+  doporučení z 28.8.: ověřit u operátora prahovou logiku FSM Defensive→Halted.
+  Žádná změna TOML.
+
 ### 30.8.2026
 
 - **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Služba Active,

@@ -115,7 +115,7 @@ pub fn load_all_trades() -> Result<Vec<ClosedTrade>, LedgerPersistError> {
         // [FÁZE B/2 — OPONENTURA P0-2] Shadow A/B záznamy (cid shadow_)
         // NEPATŘÍ do kalibrační knihy — po restartu by otrávily
         // sample_size, brzdy i Kellyho sizing.
-        if line.contains("shadow_") {
+        if line.contains("shadow") {
             continue;
         }
         // Slepené řádky: '{...}{...}' — zkusíme rozdělit na jednotlivé
