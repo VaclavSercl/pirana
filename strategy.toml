@@ -68,8 +68,12 @@ max_position_size_pct = 25.0
 
 [volatility]
 use_dynamic_atr = true
+# [ATR FIX 4.9. — ROOT CAUSE 0 TP hits] ticks_per_bar 50 znamenal
+# mikrobár 50 s (ticker ~1 t/s) a ATR(14) ~ 9.7 HODINY okno — ATR ~210 USD,
+# TP +120 nedosžitelný (0 TP hitů za celou historii!). Nyní 6 ticků/bár
+# = ATR okno ~84 s — HFT škála, TP/SL ~15-40 USD reálně dosažitelné.
 atr_period = 14
-ticks_per_bar = 50
+ticks_per_bar = 6
 # [BOD 3 — 29. 8. vyrovnani TP/SL asymetrie] Puvodne TP 0.4×ATR vs SL 2.5×ATR
 # = asymetrie 6:1 ve prospech ztrat (SL floor 350 USD!). Mean-reverze s WR 33 %
 # vyzaduje payoff > 2, ne 0.18. Nove: TP 0.8×ATR (dvojnasobne vyhry),
