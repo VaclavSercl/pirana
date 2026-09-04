@@ -327,6 +327,11 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let pullback_detector = Arc::new(parking_lot::Mutex::new(
         pirana_risk_engine::trading_brakes::PullbackDetector::new(),
     ));
+    // [TICK RECORDER 4.9. — rozhodnutí operátora] Každý trade tick
+    // (te/tu) se perzistentně ukládá do /var/lib/pirana/tick_history.jsonl.
+    let tick_recorder = Arc::new(parking_lot::Mutex::new(
+        pirana_risk_engine::tick_recorder::TickRecorder::new(),
+    ));
     // [CASLAV v5.1 / SLIPPAGE P2] Telemetrie realizovaného slippage —
     // EWMA + P90 z rolling okna 500 fillů. Publikuje se do dashboardu,
     // později vstup pro kalibraci max_slippage_bps (§8.1).
@@ -811,7 +816,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
                             notify_systemd_watchdog();
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &markout_tracker, &slippage_telemetry, &mut order_book, &mut log_throttler, &router, &mut validator, &governance, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine, &pullback_detector).await;
+                                process_ws_message(&state, data, &mut ofi, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &markout_tracker, &slippage_telemetry, &mut order_book, &mut log_throttler, &router, &mut validator, &governance, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine, &pullback_detector, &tick_recorder).await;
                             }
                         }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
@@ -871,6 +876,7 @@ async fn process_ws_message(
     active_positions: &Arc<parking_lot::RwLock<Vec<ActivePosition>>>,
     lead_lag_engine: &Arc<parking_lot::RwLock<LeadLagEngine>>,
     pullback_detector: &Arc<parking_lot::Mutex<pirana_risk_engine::trading_brakes::PullbackDetector>>,
+    tick_recorder: &Arc<parking_lot::Mutex<pirana_risk_engine::tick_recorder::TickRecorder>>,
 ) {
     if let Some(array) = data.as_array() {
         if array.len() >= 2 {
@@ -1437,6 +1443,9 @@ async fn process_ws_message(
                                     trade_id: id as u64,
                                 };
                                 
+                                // [TICK RECORDER] perzistentní zápis každého ticku
+                                tick_recorder.lock().record(price, qty.abs(), qty > 0.0);
+
                                 ofi.process_tick(&tick, *last_price);
                                 
                                 let conf = strategy_config.read().clone();

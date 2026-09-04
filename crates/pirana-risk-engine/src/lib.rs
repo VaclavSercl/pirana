@@ -50,5 +50,6 @@ pub mod ledger_persistence;
 pub mod limits;
 pub mod persistence;
 pub mod self_calibration;
+pub mod tick_recorder;
 pub mod trade_ledger;
 pub mod trading_brakes;
