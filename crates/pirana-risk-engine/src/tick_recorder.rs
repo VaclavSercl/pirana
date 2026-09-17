@@ -26,7 +26,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 

@@ -89,8 +89,8 @@ fn append_trade_to_path(path: &Path, trade: &ClosedTrade) -> Result<(), LedgerPe
 /// JSONL = line-by-line, zadna deserializace celeho souboru.
 ///
 /// [Nález 26. 8.] Souběžné appendy z dvou vláken vytvořily slepený řádek
-/// '{...}{...}' — vždy jeden zámek na soubor. Atomicita jednoho write()
-/// na < PIPE_BUF (4096) je zaručena jádrem.
+/// '{...}{...}' — volající proto sdílejí jeden procesový zámek na soubor.
+/// PIPE_BUF se na běžné soubory nevztahuje; zápis se následně synchronizuje.
 pub fn append_trade(trade: &ClosedTrade) -> Result<(), LedgerPersistError> {
     append_trade_to_path(Path::new(TRADE_LEDGER_PATH), trade)
 }
@@ -120,8 +120,7 @@ fn extract_trades_from_bytes(
         let mut escaped = false;
         let mut end_pos = None;
 
-        for i in start..buf.len() {
-            let b = buf[i];
+        for (i, &b) in buf.iter().enumerate().skip(start) {
             if in_string {
                 if escaped {
                     escaped = false;

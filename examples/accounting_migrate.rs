@@ -31,7 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(evidence.join("wallets.json"), serde_json::to_vec_pretty(&wallets)?)?;
     let sync = accounting::AccountingSync::configured();
     for page_group in 0..100 {
-        let report = sync.sync(&client).await?;
+        let report = match sync.sync(&client).await {
+            Ok(report) => report,
+            Err(error) => {
+                sync.publish_error(&error).await;
+                return Err(error.into());
+            }
+        };
         std::fs::write(evidence.join("authenticated-report.json"), serde_json::to_vec(&report)?)?;
         println!("{}", json!({"page_group":page_group,"fill_count":report["fill_count"],
             "status":report["status"],"sync":report["sync"],

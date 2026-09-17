@@ -115,6 +115,8 @@ pub struct TradingBrakes {
     closed: VecDeque<(Instant, f64)>,
     /// Rolling brake aktivní (PnL okna pod prahem) — čeká na obrat.
     rolling_engaged: bool,
+    /// Invalid accounting blocks new entries until a clean explicit rehydration.
+    invalid_pnl: bool,
     /// Hodinové ceny pro 6h momentum (trend override VPIN brzdy).
     /// Posledních ~8 hodnot (ts_unix, price).
     price_history: VecDeque<(i64, f64)>,
@@ -134,6 +136,7 @@ impl TradingBrakes {
             vpin_blocked: false,
             closed: VecDeque::with_capacity(512),
             rolling_engaged: false,
+            invalid_pnl: false,
             price_history: VecDeque::with_capacity(16),
         }
     }
@@ -141,6 +144,10 @@ impl TradingBrakes {
     /// Záznam uzavřeného round-tripu (PnL v sats).
     /// Volá se z record_closed_trade.
     pub fn record_close(&mut self, pnl_sats: f64) {
+        if !pnl_sats.is_finite() {
+            self.invalid_pnl = true;
+            return;
+        }
         let now = Instant::now();
         if pnl_sats < 0.0 {
             self.last_loss_at = Some(now);
@@ -259,6 +266,10 @@ impl TradingBrakes {
     pub fn entry_allowed(&mut self) -> Option<&'static str> {
         self.tick();
 
+        if self.invalid_pnl {
+            return Some("invalid-pnl");
+        }
+
         // 1. Ztrátový cooldown
         if let Some(t) = self.last_loss_at {
             if t.elapsed() < Duration::from_secs(LOSS_COOLDOWN_SECS) {
@@ -294,6 +305,9 @@ impl TradingBrakes {
     pub fn entry_block_detail(&mut self) -> Option<String> {
         self.tick();
         let mut reasons = Vec::new();
+        if self.invalid_pnl {
+            reasons.push("invalid-pnl: neplatná historie PnL — nutná validní rehydratace".to_string());
+        }
         if let Some(t) = self.last_loss_at {
             let elapsed = t.elapsed();
             if elapsed < Duration::from_secs(LOSS_COOLDOWN_SECS) {
@@ -340,37 +354,38 @@ impl TradingBrakes {
     /// Bez toho by restart smazal veškerý stav brzd a systém by hned
     /// vletěl do ztrátového režimu, který brzdy měly právě blokovat.
     pub fn rehydrate(&mut self, closed: &[(i64, f64)]) {
-        let now_ts = chrono::Utc::now().timestamp();
-        let now_instant = Instant::now();
-        let cutoff = now_ts - ROLLING_WINDOW.as_secs() as i64;
+        self.rehydrate_at(closed, chrono::Utc::now().timestamp(), Instant::now());
+    }
 
+    fn rehydrate_at(&mut self, closed: &[(i64, f64)], now_ts: i64, now_instant: Instant) {
+        let cutoff = now_ts.saturating_sub(ROLLING_WINDOW.as_secs() as i64);
         self.closed.clear();
-        let mut last_loss_ts: Option<i64> = None;
-        // [OPONENTURA P0] Vstup řadíme podle času vzestupně — volající
-        // (recent_closed) vrací RT od nejnovějšího, bez řazení by
-        // konzistenční tail bral nejstarší obchody místo nejnovějších.
-        let mut sorted: Vec<(i64, f64)> =
-            closed.iter().filter(|(ts, _)| *ts >= cutoff).cloned().collect();
+        self.last_loss_at = None;
+        self.invalid_pnl = false;
+        let mut sorted: Vec<(i64, f64)> = closed
+            .iter()
+            .filter(|(ts, _)| *ts >= cutoff)
+            .copied()
+            .collect();
         sorted.sort_by_key(|(ts, _)| *ts);
-        for (ts, pnl) in sorted.into_iter() {
-            // převedeme absolutní ts na Instant (relativně k nynějšku)
-            let age = (now_ts - ts).max(0) as u64;
-            let at = now_instant - Duration::from_secs(age);
+        for (ts, pnl) in sorted {
+            if ts > now_ts || !pnl.is_finite() {
+                self.invalid_pnl = true;
+                continue;
+            }
+            let Some(age) = now_ts.checked_sub(ts) else {
+                self.invalid_pnl = true;
+                continue;
+            };
+            let Some(at) = now_instant.checked_sub(Duration::from_secs(age as u64)) else {
+                self.invalid_pnl = true;
+                continue;
+            };
             self.closed.push_back((at, pnl));
-            if pnl < 0.0 {
-                last_loss_ts = Some(ts);
+            if pnl < 0.0 && (age as u64) < LOSS_COOLDOWN_SECS {
+                self.last_loss_at = Some(at);
             }
         }
-
-        // loss-cooldown pokud poslední ztráta mladší než 60 s
-        if let Some(ts) = last_loss_ts {
-            let age = (now_ts - ts).max(0) as u64;
-            if age < LOSS_COOLDOWN_SECS {
-                self.last_loss_at =
-                    Some(now_instant - Duration::from_secs(LOSS_COOLDOWN_SECS - age));
-            }
-        }
-
         self.update_rolling();
     }
 
@@ -422,11 +437,9 @@ impl TradingBrakes {
     /// `−(avg_abs_loss × 60)` clampovaný do ⟨−600, −50⟩; fallback −150
     /// dokud v okně není ≥ 10 ztrát. Podrobnosti v dokumentaci konstant.
     pub fn rolling_floor_sats(&self) -> f64 {
-        // [OPONENTURA P0 — cliff fix] Fallback je vždy HORNÍ závorou:
-        // přechodem na adaptivní výpočet (10. ztráta) nesmí floor
-        // skokově ZPŘÍSNIT dolů (= uvolnit brzdu). max() na záporných
-        // číslech vybere mělčí hodnotu — proto porovnáváme "hloubku":
-        // vždy ta STRICTĚJŠÍ (hlubší, dál od nuly) z fallback a adaptive.
+        // Preserve the existing policy: use the deeper (more negative) of
+        // fallback and adaptive floors. A deeper floor tolerates larger losses
+        // before the depth brake engages; this does not change hysteresis.
         let losses: Vec<f64> = self
             .closed
             .iter()
@@ -438,15 +451,15 @@ impl TradingBrakes {
         } else {
             let avg = losses.iter().sum::<f64>() / losses.len() as f64;
             let raw = -(avg * ROLLING_TARGET_RT_COUNT);
-            raw.max(ROLLING_FLOOR_DEEP_CLAMP).min(ROLLING_FLOOR_SHALLOW_CLAMP)
+            // Positive loss magnitudes sum to a positive value or infinity,
+            // never NaN, so clamp preserves the previous max/min behavior.
+            raw.clamp(ROLLING_FLOOR_DEEP_CLAMP, ROLLING_FLOOR_SHALLOW_CLAMP)
         };
-        // strictější = hlubší (menší, dál od nuly)
-        let floor = if adaptive == f64::NEG_INFINITY {
+        if adaptive == f64::NEG_INFINITY {
             ROLLING_FLOOR_FALLBACK_SATS
         } else {
             adaptive.min(ROLLING_FLOOR_FALLBACK_SATS) // min = hlubší
-        };
-        floor
+        }
     }
 
     /// Přepočet rolling brzdy — DVA nezávislé důvody k engage:
@@ -460,6 +473,10 @@ impl TradingBrakes {
     /// ne jen vypršení špatné série.
     fn update_rolling(&mut self) {
         let window_pnl: f64 = self.closed.iter().map(|(_, p)| p).sum();
+        if !window_pnl.is_finite() {
+            self.invalid_pnl = true;
+            return;
+        }
 
         if !self.rolling_engaged {
             let depth_hit = window_pnl < self.rolling_floor_sats();
@@ -542,6 +559,8 @@ pub struct PullbackDetector {
     dip_valid: bool,
     /// Poslední výsledek update() — pullback signál aktivní?
     signal_active: bool,
+    /// Last accepted timestamp; out-of-order updates cannot refresh a signal.
+    last_ts: Option<i64>,
 }
 
 impl PullbackDetector {
@@ -555,16 +574,21 @@ impl PullbackDetector {
             max_age_secs: 90,
             dip_valid: false,
             signal_active: false,
+            last_ts: None,
         }
     }
 
     /// Update novou cenou (hot loop). Vrací true pokud je pullback
     /// signál AKTIVNÍ právě teď (dip splněn + odraz + neexpiroval).
     pub fn update(&mut self, price: f64, ts: i64) -> bool {
-        if !price.is_finite() || price <= 0.0 {
+        self.signal_active = false;
+        if !price.is_finite() || price <= 0.0 || ts <= 0 {
             return false;
         }
-        self.signal_active = false; // přepočítáme níže
+        if self.last_ts.is_some_and(|last| ts < last) {
+            return false;
+        }
+        self.last_ts = Some(ts);
         // HWM roste jen nahoru (high-water mark)
         if price > self.hwm {
             self.hwm = price;
@@ -592,10 +616,10 @@ impl PullbackDetector {
             self.bounce_at = Some(ts);
         }
         // aktivní signál = odraz potvrzen a neexpiroval
-        let active = match self.bounce_at {
-            Some(t) if ts - t <= self.max_age_secs => true,
-            _ => false,
-        };
+        let active = matches!(
+            self.bounce_at.and_then(|t| ts.checked_sub(t)),
+            Some(age) if (0..=self.max_age_secs).contains(&age)
+        );
         self.signal_active = active;
         active
     }
@@ -686,6 +710,109 @@ impl TradingBrakes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_pnl_blocks_entries_until_clean_rehydration() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut b = TradingBrakes::new();
+            b.record_close(bad);
+            b.record_close(10.0);
+            assert_eq!(b.entry_allowed(), Some("invalid-pnl"));
+            assert!(b.entry_block_detail().unwrap().contains("invalid-pnl"));
+            assert_eq!(b.rolling_pnl_sats(), 10.0);
+            b.tick();
+            assert_eq!(b.entry_allowed(), Some("invalid-pnl"));
+            b.rehydrate(&[]);
+            assert!(b.entry_allowed().is_none());
+        }
+    }
+
+    #[test]
+    fn overflowing_finite_pnl_blocks_entries() {
+        let mut b = TradingBrakes::new();
+        b.record_close(f64::MAX);
+        b.record_close(f64::MAX);
+        assert_eq!(b.entry_allowed(), Some("invalid-pnl"));
+        let now = Instant::now();
+        b.rehydrate_at(&[(100, f64::MAX), (100, f64::MAX)], 100, now);
+        assert_eq!(b.entry_allowed(), Some("invalid-pnl"));
+        b.rehydrate_at(&[(100, 1.0)], 100, now);
+        assert!(b.entry_allowed().is_none());
+    }
+
+    #[test]
+    fn invalid_rehydration_blocks_but_retains_valid_losses() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut b = TradingBrakes::new();
+            b.rehydrate_at(&[(100, bad), (100, -1000.0)], 100, Instant::now());
+            assert_eq!(b.entry_allowed(), Some("invalid-pnl"));
+            assert_eq!(b.rolling_pnl_sats(), -1000.0);
+            assert!(b.rolling_engaged());
+            b.rehydrate(&[]);
+            assert!(b.entry_allowed().is_none());
+        }
+        let mut b = TradingBrakes::new();
+        b.rehydrate_at(&[(101, 1.0)], 100, Instant::now());
+        assert_eq!(b.entry_allowed(), Some("invalid-pnl"));
+        b.rehydrate_at(&[(1, f64::NAN)], 20_000, Instant::now());
+        assert!(b.entry_allowed().is_none(), "out-of-window data is irrelevant");
+    }
+
+    #[test]
+    fn rehydration_restores_elapsed_loss_age_and_clears_previous_loss() {
+        let now = Instant::now();
+        let mut b = TradingBrakes::new();
+        for age in [10, 50] {
+            b.rehydrate_at(&[(100 - age, -1.0)], 100, now);
+            let elapsed = now.duration_since(b.last_loss_at.unwrap()).as_secs();
+            assert_eq!(elapsed, age as u64);
+            assert_eq!(LOSS_COOLDOWN_SECS - elapsed, 60 - age as u64);
+        }
+        b.rehydrate_at(&[(100, 1.0)], 100, now);
+        assert!(b.last_loss_at.is_none());
+        assert!(b.entry_allowed().is_none());
+    }
+
+    fn active_pullback() -> PullbackDetector {
+        let mut d = PullbackDetector::new();
+        assert!(!d.update(80_000.0, 100));
+        assert!(!d.update(79_840.0, 130));
+        assert!(d.update(79_888.0, 140));
+        d
+    }
+
+    #[test]
+    fn invalid_pullback_prices_clear_cached_permission() {
+        for price in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let mut d = active_pullback();
+            assert!(!d.update(price, 141));
+            assert!(!d.is_signal_active());
+        }
+    }
+
+    #[test]
+    fn pullback_rejects_invalid_and_backwards_time() {
+        for ts in [i64::MIN, -1, 0, 139] {
+            let mut d = active_pullback();
+            assert!(!d.update(79_890.0, ts));
+            assert!(!d.is_signal_active());
+        }
+        let mut d = active_pullback();
+        assert!(d.update(79_890.0, 230));
+        assert!(!d.update(79_890.0, 231));
+        assert!(!d.update(79_890.0, 200), "older time cannot revive expired signal");
+        assert!(!d.update(79_890.0, i64::MAX));
+        // Exercise checked subtraction even with a corrupted internal origin.
+        let mut d = active_pullback();
+        d.bounce_at = Some(i64::MIN);
+        assert!(!d.update(79_890.0, i64::MAX));
+        assert!(!d.is_signal_active());
+        for ts in [i64::MIN, -1, 0] {
+            let mut d = PullbackDetector::new();
+            assert!(!d.update(80_000.0, ts));
+            assert_eq!(d.hwm(), 0.0);
+        }
+    }
 
     #[test]
     fn fresh_state_allows_entry() {

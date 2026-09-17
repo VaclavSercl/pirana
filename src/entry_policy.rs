@@ -239,6 +239,7 @@ pub enum EntryRoutingDecision {
 /// In accordance with Point 4:
 /// - Only existing production `pullback_flow` confirmation is permitted for live BUY.
 /// - Legacy entry sources (Lead-Lag, Hawkes, Trend pullback, OFI) are isolated as shadow candidates.
+#[expect(clippy::too_many_arguments, reason = "Keep the established pure signal-routing interface stable during risk fixes.")]
 pub fn route_entry_signals(
     pullback_flow_signal: bool,
     is_lead_lag_buy: bool,

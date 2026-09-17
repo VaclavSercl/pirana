@@ -290,7 +290,7 @@ def build_yearly_report(time_label, stats, snapshot):
         "Roční čistý PnL, poplatky, equity a akumulace BTC: NEOVĚŘENO.\n"
         "Chybí kanonická projekce pro požadovaný roční interval.\n"
         "Následuje aktuální den a celá pokrytá historie účtu; nejde o roční výsledek.\n\n"
-        + format_telegram_html(generate_report_data(no_api=True))
+        + format_telegram_html(generate_report_data(no_api=False, include_runtime=True))
     )
 
 def send_telegram(token, chat_id, text):
@@ -315,7 +315,7 @@ def send_telegram(token, chat_id, text):
                     print(f"[OK] Annual Report successfully delivered to Telegram on attempt {attempt}.")
                     return True
         except Exception as e:
-            print(f"[WARN] Telegram delivery attempt {attempt} failed: {e}", file=sys.stderr)
+            print(f"[WARN] Telegram delivery attempt {attempt} failed: {type(e).__name__}", file=sys.stderr)
             time.sleep(3)
     return False
 

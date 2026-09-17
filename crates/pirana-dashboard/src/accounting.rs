@@ -64,7 +64,7 @@ fn validate_history(v: Value, now: i64) -> Value {
             if !v[period][field]
                 .as_str()
                 .and_then(|x| x.parse::<f64>().ok())
-                .map_or(false, f64::is_finite)
+                .is_some_and(f64::is_finite)
             {
                 return unavailable("invalid monetary field");
             }

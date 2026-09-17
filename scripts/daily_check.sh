@@ -54,34 +54,14 @@ Postupuj podle následujícího protokolu:
        o potvrzení. Operátor rozhoduje, agent navrhuje.
    - FSM VALIDACE: Pokud upravuješ '/home/wwwenda/workspace/pirana/strategy.toml', VŽDY před uložením ověř platnost syntaxe pomocí 'python3 scripts/strategy_versioning.py validate'.
 
-3. STRUKTURA VÝSTUPNÍ ZPRÁVY PRO TELEGRAM:
-   - Odpověď musí obsahovat VÝHRADNĚ samotnou zprávu připravenou pro Telegram v HTML formátu.
-   - Žádný úvodní ani závěrečný meta-text. Začni přímo hlavičkou.
-   - Povolené HTML tagy: <b>tučné</b>, <code>kód/hodnota</code>, <i>kurzíva</i>.
+3. STRUKTURA VÝSTUPNÍ ZPRÁVY:
+   - Vrať stručný kvalitativní komentář auditu jako prostý text, nejvýše 600 znaků.
+   - Finanční část doplní automaticky kanonický účetní report. Nevymýšlej ani
+     neopisuj PnL, equity, win rate, zůstatky nebo počty obchodů z runtime telemetrie.
+   - Uveď pouze doložený stav, provedené zásahy a nutné kontroly; chybějící důkaz
+     označ NEOVĚŘENO. Active není důkaz obchodování, stabilita není důkaz zisku.
+   - Komentář AI bude oddělen od finanční části jako neověřené kvalitativní hodnocení.
 
-Šablona zprávy:
-👑 <b>ČÁSLAV :: RANNÍ AUDIT SYSTÉMU PIRANA</b>
-📅 <code>[DATUM A ČAS]</code>
-──────────────────────────
-🤖 <b>Stav jádra:</b> <code>[Running / Stopped]</code> | Uptime: <code>[UPTIME]</code>
-⚙️ <b>Režim:</b> <code>[Active / Defensive / Halted]</code>
-💵 <b>Equity:</b> <code>[CURRENT] USD</code> (Start: <code>[START] USD</code>)
-📈 <b>Denní PnL:</b> <code>[+ / - PnL USD] ([+ / - %])</code>
-🎯 <b>Win Rate:</b> <code>[WIN_RATE]%</code> | Obchodů dnes: <code>[TRADES_COUNT]</code>
-⚠️ <b>Série ztrát:</b> <code>[CONSECUTIVE_LOSSES] / 3</code>
-🔒 <b>Trezor BTC:</b> <code>[LOCKED_BTC] BTC</code>
-
-📊 <b>TRŽNÍ METRIKY:</b>
-• BTC Cena: <code>$[BTC_PRICE]</code>
-• OFI Composite: <code>[OFI]</code>
-• VPIN Toxicita: <code>[VPIN]%</code>
-• Spread: <code>$[SPREAD]</code>
-
-🛠 <b>ADAPTIVNÍ ZÁSAH:</b>
-[Popis změn v strategy.toml (Stará hodnota ➔ Nová hodnota) NEBO "Parametry ponechány beze změny — systém je optimální."]
-
-🚦 <b>VERDIKT:</b>
-[🟢 Systém je 100% stabilní a ziskový / 🟡 Vyžaduje zvýšený dohled / 🔴 Nutný manuální zásah]
 EOF
 )
 
@@ -91,8 +71,11 @@ echo "[$(date -Iseconds)] Spouštím ranní audit agenta Čáslav (hermes)... " 
 # nikoli agy. agy zůstává pouze jako oponent/verifikátor na vyžádání.
 # Timeout 5 minut (hermes -z oneshot). -k 30s: SIGKILL po 30s po ignorování SIGTERM.
 AGENT_TIMEOUT=300
-REPORT_OUTPUT=$(timeout -k 30s "$AGENT_TIMEOUT" hermes -z "$PROMPT_CONTENT" --yolo 2>&1)
-AGENT_EXIT=$?
+if REPORT_OUTPUT=$(timeout -k 30s "$AGENT_TIMEOUT" hermes -z "$PROMPT_CONTENT" --yolo 2>&1); then
+    AGENT_EXIT=0
+else
+    AGENT_EXIT=$?
+fi
 
 # Timeout nebo chyba → fallback report, ne ticho
 if [ $AGENT_EXIT -ne 0 ]; then
@@ -106,33 +89,12 @@ fi
 # Uložení výstupu do logu
 echo "$REPORT_OUTPUT" >> "$LOG_FILE"
 
-# 3. Bezpečné odeslání na Telegram (HTML parse mode)
-# Sanitizace: Telegram HTML nesnasi bare '<' '>' (napr. "win rate <50 %" ->
-# "Unsupported start tag"). Povolene tagy b/i/code/pre zachovame, vsechen jiny
-# obsah s < > & escapujeme.
-sanitize_for_telegram() {
-    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
-        -e 's/&lt;b&gt;/<b>/g' -e 's/&lt;\/b&gt;/<\/b>/g' \
-        -e 's/&lt;i&gt;/<i>/g' -e 's/&lt;\/i&gt;/<\/i>/g' \
-        -e 's/&lt;code&gt;/<code>/g' -e 's/&lt;\/code&gt;/<\/code>/g' \
-        -e 's/&lt;pre&gt;/<pre>/g' -e 's/&lt;\/pre&gt;/<\/pre>/g'
-}
-
-REPORT_SANITIZED=$(sanitize_for_telegram "$REPORT_OUTPUT")
-
-HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-    -d "chat_id=${CHAT_ID}" \
-    -d "parse_mode=HTML" \
-    --data-urlencode "text=${REPORT_SANITIZED}")
-
-HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n1)
-
-if [ "$HTTP_STATUS" -eq 200 ]; then
-    echo "[$(date -Iseconds)] Ranní report byl úspěšně odeslán do Telegramu." >> "$LOG_FILE"
-else
-    echo "[$(date -Iseconds)] CHYBA při odesílání na Telegram (HTTP $HTTP_STATUS)! Zkouším fallback..." >> "$LOG_FILE"
-    # Fallback odeslání čistého textu bez formátování při syntaktické chybě HTML
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-        -d "chat_id=${CHAT_ID}" \
-        --data-urlencode "text=⚠️ Čáslav: Ranní report (čistý text): ${REPORT_OUTPUT}" > /dev/null || true
-fi
+# Finanční čísla sestavuje výhradně kanonický reporter, nikoli AI komentář.
+FINANCIAL_REPORT=$(python3 "${WORKSPACE_DIR}/scripts/pirana_report.py")
+export CASLAV_TELEGRAM_TOKEN="$TELEGRAM_TOKEN"
+export CASLAV_ALLOWED_USER_ID="$CHAT_ID"
+export PYTHONPATH="${WORKSPACE_DIR}/scripts${PYTHONPATH:+:$PYTHONPATH}"
+# Escapování probíhá až po omezení prostého textu, nikdy uvnitř HTML entity.
+printf '%s\n\nAI AUDIT — NEOVĚŘENÉ KVALITATIVNÍ HODNOCENÍ\n%s' "$FINANCIAL_REPORT" "$REPORT_OUTPUT" |
+    python3 -c 'import html, sys; from send_scheduled_report import send_telegram; text = sys.stdin.read(); head, marker, audit = text.partition("AI AUDIT — NEOVĚŘENÉ KVALITATIVNÍ HODNOCENÍ\n"); text = head + marker + audit[:600]; sys.exit(0 if send_telegram(html.escape(text[:3900])) else 1)'
+echo "[$(date -Iseconds)] Ranní report byl odeslán do Telegramu." >> "$LOG_FILE"

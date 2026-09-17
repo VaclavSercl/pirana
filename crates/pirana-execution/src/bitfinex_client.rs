@@ -674,9 +674,9 @@ impl BitfinexClient {
     ///
     /// * `Ok(Some((vwap, qty)))` — order reálně vyplněn (může být částečně).
     /// * `Ok(None)`              — order bez fillu (IOC vypršel) — potvrzeno
-    ///                             dotazem na burzu, není to chyba.
+    ///   dotazem na burzu, není to chyba.
     /// * `Err(_)`                — API nedostupné; volající by měl použít
-    ///                             fallback (ACK odhad) a ZALOGOVAT varování.
+    ///   fallback (ACK odhad) a ZALOGOVAT varování.
     pub async fn resolve_fill(
         &self,
         symbol: &str,

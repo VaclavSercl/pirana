@@ -320,18 +320,6 @@ fn mark_recovery_halted(state: &DashboardState) {
     *state.system_mode.write() = pirana_core::types::SystemMode::Halted;
 }
 
-#[cfg(test)]
-mod recovery_mode_tests {
-    #[test]
-    fn failure_is_halted_and_cannot_enable_orders() {
-        let state = pirana_dashboard::state::DashboardState::new();
-        super::mark_recovery_halted(&state);
-        assert_eq!(*state.system_mode.read(), pirana_core::types::SystemMode::Halted);
-        assert!(!super::POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!super::ACCOUNTING_CAPTURE_READY.load(std::sync::atomic::Ordering::Acquire));
-    }
-}
-
 /// Send periodic heartbeat ping to systemd watchdog if configured
 fn notify_systemd_watchdog() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
@@ -3152,4 +3140,16 @@ async fn check_exchange_status() -> PiranaResult<i32> {
     })?;
 
     Ok(json[0].as_i64().unwrap_or(0) as i32)
+}
+
+#[cfg(test)]
+mod recovery_mode_tests {
+    #[test]
+    fn failure_is_halted_and_cannot_enable_orders() {
+        let state = pirana_dashboard::state::DashboardState::new();
+        super::mark_recovery_halted(&state);
+        assert_eq!(*state.system_mode.read(), pirana_core::types::SystemMode::Halted);
+        assert!(!super::POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!super::ACCOUNTING_CAPTURE_READY.load(std::sync::atomic::Ordering::Acquire));
+    }
 }

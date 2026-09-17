@@ -71,7 +71,7 @@ def get_snapshot():
 
 def handle_status(chat_id):
     """Handles /status with canonical account accounting."""
-    send_telegram(chat_id, format_telegram_html(generate_report_data(no_api=True)))
+    send_telegram(chat_id, format_telegram_html(generate_report_data(no_api=False, include_runtime=True)))
 
 def handle_scale(chat_id, args):
     """Handles /scale <pct> command."""

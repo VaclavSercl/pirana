@@ -102,8 +102,8 @@ impl SignalExitDecision {
 ///    - `worst_case_price >= entry_price + 0.01`
 ///    - `worst_case_price > entry_price`
 ///    - `net_proceeds_usd > 0.0`
-///    At exact breakeven, loss, or sub-cent positive profit where exchange 2-decimal rounding
-///    cannot guarantee profit, the exit is rejected.
+///      At exact breakeven, loss, or sub-cent positive profit where exchange 2-decimal rounding
+///      cannot guarantee profit, the exit is rejected.
 pub fn evaluate_signal_exit(
     entry_price: f64,
     quantity: f64,

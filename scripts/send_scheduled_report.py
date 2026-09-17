@@ -93,12 +93,12 @@ def send_telegram(text: str):
             print(f"Telegram response: {resp.status}")
             return True
     except Exception as e:
-        print(f"Failed to send Telegram message: {e}", file=sys.stderr)
+        print(f"Failed to send Telegram message: {type(e).__name__}", file=sys.stderr)
         return False
 
 def build_report():
     """Report only validated account-scoped accounting, with unknowns preserved."""
-    return format_telegram_html(generate_report_data(no_api=True))
+    return format_telegram_html(generate_report_data(no_api=False, include_runtime=True))
 
 def main():
     report_text = build_report()
@@ -110,5 +110,7 @@ def main():
         f.write(report_text)
         f.write(f"\nSent status: {success}\n")
 
+    return 0 if success else 1
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

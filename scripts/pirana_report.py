@@ -974,46 +974,113 @@ def _validate_historical_projection(value: Any, now_ms: int) -> dict:
 
 def generate_report_data(ledger_path=DEFAULT_LEDGER_PATH, snapshot_file=None,
                          api_url=None, no_api=False, now_arg=None,
-                         timezone_name=DEFAULT_TIMEZONE, legacy=False):
+                         timezone_name=DEFAULT_TIMEZONE, legacy=False,
+                         include_runtime=False, runtime_snapshot_file=None):
     if legacy:
         return generate_legacy_report_data(ledger_path, snapshot_file, api_url,
                                            no_api, now_arg, timezone_name)
     now = parse_timestamp_or_now(now_arg, zoneinfo.ZoneInfo(DEFAULT_TIMEZONE))
     path = snapshot_file or os.environ.get("PIRANA_ACCOUNTING_SNAPSHOT_PATH", DEFAULT_ACCOUNTING_PATH)
+    source_metadata = {}
     try:
         with open(path, encoding="utf-8") as stream:
             value = json.load(stream)
         accounting = validate_accounting_projection(value, int(now.timestamp() * 1000))
+        if (isinstance(value, dict) and type(value.get("schema_version")) is int
+                and value["schema_version"] == 1 and value.get("source") == "authenticated_bitfinex_fills"
+                and value.get("scope") == "account:tBTCUSD"):
+            sync = value.get("sync")
+            for key, timestamp in (("generated_at_ms", value.get("generated_at_ms")),
+                                   ("cursor_ms", sync.get("cursor_ms") if isinstance(sync, dict) else None)):
+                if type(timestamp) is int and 0 <= timestamp <= int(now.timestamp() * 1000):
+                    source_metadata[key] = timestamp
+
     except (OSError, ValueError, TypeError, OverflowError):
         accounting = canonical_unavailable("missing or corrupt canonical projection")
+    runtime, runtime_source = None, "NEOVĚŘENO"
+    if include_runtime:
+        runtime, runtime_source, _ = fetch_snapshot(
+            snapshot_file=runtime_snapshot_file, no_api=no_api)
+        if not isinstance(runtime, dict):
+            runtime = None
     # Legacy summaries are diagnostic counts only; never add their estimates to PnL.
     _, integrity = load_ledger_data(ledger_path)
-    return dict(accounting=accounting, snapshot_source=path,
-                legacy_unverified_diagnostics=asdict(integrity))
+    return dict(accounting=accounting, snapshot_source=path, report_generated_at_ms=int(now.timestamp() * 1000),
+                legacy_unverified_diagnostics=asdict(integrity), runtime=runtime, runtime_source=runtime_source,
+                source_metadata=source_metadata)
+
+
+def _runtime_balance(value, multiplier=1):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return "NEOVĚŘENO"
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite() or number < 0 or number.adjusted() > 18:
+            return "NEOVĚŘENO"
+        return format(number * multiplier, ".0f" if multiplier != 1 else ".2f")
+    except (InvalidOperation, ValueError):
+        return "NEOVĚŘENO"
+
+
+def _report_timestamp(value):
+    if type(value) is not int:
+        return "NEOVĚŘENO"
+    try:
+        return datetime.fromtimestamp(value / 1000, zoneinfo.ZoneInfo(DEFAULT_TIMEZONE)).isoformat(sep=" ")
+    except (ValueError, OverflowError, OSError):
+        return "NEOVĚŘENO"
 
 
 def format_text_report(data) -> str:
     if not isinstance(data, dict):
         return "LEGACY — NEOVĚŘENÉ ODHADY, NIKOLI POTVRZENÝ ZISK\n" + format_legacy_text_report(data)
     a = data["accounting"]
-    lines = ["Účet Bitfinex BTC/USD — všechny obchody účtu (nikoli pouze Pirana)",
-             "Zdroj: " + data["snapshot_source"], "Stav: " + a["status"]]
+    runtime = data.get("runtime") or {}
+    sats = _runtime_balance(runtime.get("btc_balance"), 100_000_000)
+    vault = _runtime_balance(runtime.get("locked_btc_reserve"), 100_000_000)
+    usd = _runtime_balance(runtime.get("usd_balance"))
+    lines = [f"₿ BTC podle bota: {sats} sats | chráněno: {vault} sats",
+             f"USD podle bota: {usd} USD | Δsats: NEOVĚŘENO",
+             "Rozsah: všechny obchody účtu Bitfinex BTC/USD (nikoli pouze Pirana)",
+             "Režim podle bota: " + str(runtime.get("system_mode", "NEOVĚŘENO"))[:40]
+             + "; Active samo nepotvrzuje uskutečněný obchod."]
     periods = []
     active = a.get("active_period")
     if active:
-        start = datetime.fromtimestamp(active["start_ms"] / 1000, zoneinfo.ZoneInfo(DEFAULT_TIMEZONE))
-        periods.append((active, "Nové období od " + start.isoformat(sep=" ") + " Europe/Prague"))
+        periods.append((active, "Nové období od " + _report_timestamp(active.get("start_ms")) + " Europe/Prague"))
     else:
-        lines.append("Nové období: NEOVĚŘENO / není dostupné")
+        lines.append("Nové období: NEOVĚŘENO")
     periods.extend(((a["daily"], "Dnes Europe/Prague"), (a["lifetime"], "Celá pokrytá historie")))
     for period, label in periods:
-        lines.append(label)
-        for key, title in (("gross_pnl_usd", "Hrubý realizovaný PnL"),
-                           ("fees_usd", "Poplatky"), ("net_pnl_usd", "Čistý realizovaný PnL")):
-            value = period.get(key)
-            lines.append(f"  {title}: " + ("NEOVĚŘENO" if value is None else str(value) + " USD"))
-    lines.extend("NEOVĚŘENO: " + str(issue) for issue in a.get("issues", []))
-    lines.append("Legacy záznamy jsou pouze neověřená diagnostika a nejsou zahrnuty v PnL.")
+        net, fees, count = period.get("net_pnl_usd"), period.get("fees_usd"), period.get("closed_count")
+        if net is None or fees is None:
+            lines.append(label + ": NEOVĚŘENO")
+            continue
+        count_text = str(count) if type(count) is int and 0 <= count <= 10**12 else "NEOVĚŘENO"
+        lines.append(label + f": čistý PnL {str(net)[:60]} USD | poplatky {str(fees)[:60]} USD | prodejní plnění {count_text}")
+    if active and active.get("closed_count") == 0:
+        lines.append("Nula prodejních plnění nevylučuje BUY filly.")
+    issues = a.get("upstream_issues", [])
+    missing = set()
+    if isinstance(issues, list):
+        for issue in issues:
+            if isinstance(issue, str) and issue.startswith("unmatched_sell_cost:"):
+                trade_id = issue.partition(":")[2]
+                if trade_id.isascii() and trade_id.isdecimal() and len(trade_id) <= 20:
+                    missing.add(trade_id)
+    if missing:
+        lines.append(f"KONTROLA: U {len(missing)} prodejních plnění chybí pořizovací cena; doplnit nákupní historii.")
+    elif a["status"] != "complete" or not active or active.get("status") != "complete":
+        lines.append("KONTROLA: prověřit dostupnost a úplnost účetního snímku.")
+    metadata = data.get("source_metadata") or {}
+    generated = metadata.get("generated_at_ms", a.get("generated_at_ms"))
+    cursor = metadata.get("cursor_ms", a.get("sync", {}).get("cursor_ms"))
+    lines.extend(("PŮVOD DAT",
+        "PnL: autentizované filly → FIFO; " + str(data["snapshot_source"])[:160],
+        "Snímek: " + _report_timestamp(generated) + " | sync do: " + _report_timestamp(cursor)
+        + "; časy nepotvrzují úplnost PnL.",
+        "Zůstatky: " + str(data.get("runtime_source", "NEOVĚŘENO"))[:120]
+        + "; čas ověření peněženky burzou není doložen. Δsats ani legacy odhady nejsou PnL."))
     return "\n".join(lines)
 
 
@@ -1021,7 +1088,7 @@ def format_telegram_html(data) -> str:
     # Formatting only; this module does not send messages.
     if not isinstance(data, dict):
         return "<b>LEGACY — NEOVĚŘENÉ ODHADY</b>\n" + format_legacy_telegram_html(data)
-    return "<pre>" + html.escape(format_text_report(data)) + "</pre>"
+    return html.escape(format_text_report(data))
 
 
 def main() -> int:
@@ -1088,6 +1155,7 @@ def main() -> int:
     try:
         report_data = generate_report_data(
             legacy=args.legacy,
+            include_runtime=True,
             ledger_path=args.ledger_path,
             snapshot_file=args.snapshot_file,
             api_url=args.api_url,
