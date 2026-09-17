@@ -114,3 +114,56 @@ API zveřejňuje `accounting.active_period` (samostatně též `/api/accounting`
 snapshot navíc `period_pnl` a `period_start_ms`. `total_pnl` nadále znamená
 historii, nikoli nové období. Exporter má samostatné metriky
 `pirana_period_net_pnl_usd` a `pirana_period_complete`.
+
+
+## New trading with an unknown historical opening balance
+
+A reporting period resets the displayed period result; it does not establish a
+cost basis for previously held BTC. An optional immutable `trading_epoch` in the
+same SQLite database separates subsequent execution legs from the old inventory.
+The opening BTC balance is quarantined, never inserted as a zero-cost FIFO lot or
+recovered as a strategy position. Sell submission checks retain that reserve.
+Historical PnL remains unknown where original purchase evidence is missing.
+
+Establish an epoch only while the bot is stopped and automatic starts are inhibited.
+Use the read-only `accounting_migrate` example to capture authenticated exchange
+wallets before and after a complete history sync and verify there are no active
+orders. It must run in the production working directory with the service's actual
+credentials. The exact sync cursor is the epoch boundary; both wallet observations
+must agree. Back up the database with SQLite's backup API first. Then run:
+
+```text
+python3 scripts/pirana_accounting.py --db /var/lib/pirana/accounting.sqlite3 start-trading-epoch --id <unique-id> --start-ms <exact-sync-cursor> --reserved-btc <authenticated-opening-BTC>
+```
+
+The command rejects stale/partial sync, an occupied boundary, and conflicting
+parameters. Repeating the same established epoch is idempotent. Do not delete or
+reset the epoch to bypass recovery failures. New orders require fresh complete
+operational accounting and durable strategy metadata. Restart recovery verifies
+`exchange BTC = opening reserve + operational inventory`; an unexplained change
+halts trading. Wallet observations that overlap an in-flight execution are retried,
+so a bot's own fill is not classified as an external balance change.
+
+The reporting period keeps its original boundary. Its totals may use operational
+accounting only when no fills occur between that boundary and the trading epoch;
+a subsequently discovered fill in that gap invalidates the shortcut. SQLite history,
+position intents and metadata must be retained through rollback. Never restore an
+older database over newly captured executions.
+
+The doctor classifies an explicit `Halted` mode before testing price/feed health.
+It reports the reconciliation requirement instead of restarting the bot for the
+zero price associated with an intentionally stopped feed. `Active` with zero price
+continues to follow the existing feed-recovery behavior.
+
+
+Trading in this operational mode additionally requires authenticated zero spot
+maker/taker fees. The current published policy is zero trading fees
+(https://support.bitfinex.com/hc/en-us/articles/213919589-What-fees-does-Bitfinex-charge).
+The authenticated summary endpoint documents account rates
+(https://docs.bitfinex.com/reference/rest-auth-summary). The bot validates the three
+maker rates and crypto-to-fiat taker rate at startup and every 30 seconds, outside
+the order path. Every submission rejects absent, future, or older-than-60-second
+confirmation. Nonzero or malformed rates revoke permission. This is a supported
+fee-policy constraint, not an invented maximum fee: the exchange must honor its
+reported rates. Nonzero-fee trading is unsupported until a fee-inclusive inventory
+reservation design is implemented; historical actual fees remain fully accounted.

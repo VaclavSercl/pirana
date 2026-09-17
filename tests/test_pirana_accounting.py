@@ -32,6 +32,144 @@ class LedgerTests(unittest.TestCase):
         self.tmp.cleanup()
     def report(self): return a.snapshot(self.con,NOW)
     def ingest(self,fills): a.ingest(self.con,batch(fills))
+    def establish_epoch(self, old_fills=None, reserve='0.5', period_start=None):
+        a.ingest(self.con,batch(old_fills or [],end=T-50))
+        if period_start is not None:
+            a.start_period(self.con,'reporting',period_start)
+        a.start_trading_epoch(self.con,'operating',T-50,reserve,now=NOW)
+
+    def test_epoch_historical_unknown_then_real_new_profit_and_fees(self):
+        self.establish_epoch([fill(1,'-1','100',mts=T-100)],period_start=T-75)
+        initial=self.report()
+        self.assertEqual(initial['status'],'incomplete')
+        self.assertIsNone(initial['lifetime']['net_pnl_usd'])
+        self.assertEqual(initial['operational']['status'],'complete')
+        self.assertEqual(initial['operational']['lifetime']['net_pnl_usd'],'0')
+        self.assertEqual(initial['operational']['open_lots'],[])
+        self.ingest([dict(fill(2,'1','100','-1',mts=T-40),cid='new-buy'),dict(fill(3,'-1','120','-2',mts=T-30),cid='new-sell')])
+        report=self.report();op=report['operational']
+        self.assertEqual(op['status'],'complete')
+        self.assertEqual((op['lifetime']['gross_pnl_usd'],op['lifetime']['net_pnl_usd'],op['lifetime']['fees_usd']),('20','17','3'))
+        self.assertEqual(op['fill_count'],2)
+        self.assertEqual(op['reserved_btc'],'0.5')
+        self.assertEqual(op['scope'],'operational:tBTCUSD:excludes_opening_reserve')
+        self.assertEqual(op['orders'][0]['cid'],'new-buy')
+        self.assertIsNone(report['lifetime']['net_pnl_usd'])
+        self.assertEqual(report['active_period']['start_ms'],T-75)
+        self.assertEqual(report['active_period']['net_pnl_usd'],'17')
+
+    def test_epoch_reserve_is_never_cost_basis(self):
+        self.establish_epoch([fill(1,'1','100',mts=T-100)],reserve='1')
+        self.ingest([fill(2,'-0.5','120',mts=T-40)])
+        op=self.report()['operational']
+        self.assertEqual(op['status'],'incomplete')
+        self.assertIn('unmatched_sell_cost:2',op['issues'])
+        self.assertIsNone(op['lifetime']['net_pnl_usd'])
+        self.assertEqual(op['open_lots'],[])
+        self.assertEqual(op['reserved_btc'],'1')
+
+    def test_epoch_base_fees_and_partial_new_lot(self):
+        self.establish_epoch(reserve='2')
+        self.ingest([fill(1,'1','100','-0.1','BTC',mts=T-40),fill(2,'-0.4','200','-0.05','BTC',mts=T-30)])
+        op=self.report()['operational']
+        self.assertEqual(op['status'],'complete')
+        self.assertEqual(op['open_lots'][0]['remaining_btc'],'0.45')
+        self.assertEqual(op['open_lots'][0]['cost_basis_usd'],'50')
+        self.assertEqual(op['lifetime']['net_pnl_usd'],'30')
+        self.assertEqual(op['reserved_btc'],'2')
+
+    def test_epoch_replay_immutable_restart_backup_preserves_old_state(self):
+        self.establish_epoch([fill(1,'-1','100',mts=T-100)])
+        before=self.report()
+        saved={table:self.con.execute('SELECT * FROM '+table).fetchall() for table in ('fills','sync','legacy','scan')}
+        a.start_trading_epoch(self.con,'operating',T-50,'0.500',now=NOW+dt.timedelta(days=2))
+        for name,start,reserve in [('other',T-50,'0.5'),('operating',T-49,'0.5'),('operating',T-50,'0.6')]:
+            with self.assertRaisesRegex(ValueError,'already established'):
+                a.start_trading_epoch(self.con,name,start,reserve,now=NOW)
+        for table,rows in saved.items():
+            self.assertEqual(self.con.execute('SELECT * FROM '+table).fetchall(),rows)
+        target=Path(self.tmp.name)/'epoch-backup.sqlite3'
+        a.backup(self.con,target)
+        self.con.close();self.con=a.connect(self.path)
+        self.assertEqual(self.report(),before)
+        restored=a.connect(target)
+        self.assertEqual(a.snapshot(restored,NOW),before)
+        restored.close()
+
+    def test_epoch_rejects_unsynced_stale_future_boundary_and_existing_execution(self):
+        with self.assertRaisesRegex(ValueError,'fresh complete sync'):
+            a.start_trading_epoch(self.con,'new',T,'0',now=NOW)
+        a.ingest(self.con,batch([],start=1))
+        with self.assertRaisesRegex(ValueError,'fresh complete sync'):
+            a.start_trading_epoch(self.con,'new',T,'0',now=NOW)
+        a.ingest(self.con,batch([]))
+        for boundary,now in [(T-1,NOW),(T,NOW+dt.timedelta(minutes=3)),(T,NOW-dt.timedelta(milliseconds=1))]:
+            with self.assertRaisesRegex(ValueError,'fresh complete sync'):
+                a.start_trading_epoch(self.con,'new',boundary,'0',now=now)
+        self.ingest([fill(1,'1','100',mts=T)])
+        with self.assertRaisesRegex(ValueError,'already contains executions'):
+            a.start_trading_epoch(self.con,'new',T,'0',now=NOW)
+        self.assertIsNone(self.report()['operational'])
+        self.assertIsNone(self.con.execute("SELECT name FROM sqlite_master WHERE name='trading_epoch'").fetchone())
+
+    def test_epoch_reporting_gap_is_not_bridged_and_delayed_fill_rechecks(self):
+        self.establish_epoch([fill(1,'-1','100',mts=T-100)],period_start=T-75)
+        self.ingest([fill(2,'1','100',mts=T-40),fill(3,'-1','120',mts=T-30)])
+        self.assertEqual(self.report()['active_period']['net_pnl_usd'],'20')
+        self.ingest([fill(4,'-1','100',mts=T-60)])
+        report=self.report()
+        self.assertEqual(report['operational']['lifetime']['net_pnl_usd'],'20')
+        self.assertEqual(report['active_period']['status'],'incomplete')
+        self.assertIsNone(report['active_period']['net_pnl_usd'])
+
+    def test_epoch_reporting_later_boundary_uses_new_buy_basis(self):
+        self.establish_epoch([fill(1,'-1','100',mts=T-100)],period_start=T-35)
+        self.ingest([fill(2,'1','100',mts=T-40),fill(3,'-1','120',mts=T-30)])
+        self.assertEqual(self.report()['active_period']['net_pnl_usd'],'20')
+        self.assertEqual(self.report()['active_period']['start_ms'],T-35)
+
+    def test_epoch_stale_sync_and_new_unknown_fee_fail_closed(self):
+        self.establish_epoch(period_start=T-50)
+        self.assertEqual(a.snapshot(self.con,NOW+dt.timedelta(minutes=3))['operational']['status'],'incomplete')
+        self.ingest([fill(1,'1','100','-1','ETH',mts=T-40)])
+        report=self.report()
+        self.assertEqual(report['operational']['status'],'incomplete')
+        self.assertIsNone(report['active_period']['net_pnl_usd'])
+        self.assertIn('unresolved_fee:1',report['operational']['issues'])
+
+    def test_epoch_cli_creation_replay_and_invalid_reserve(self):
+        stamp=int(dt.datetime.now(dt.timezone.utc).timestamp()*1000)-1000
+        a.ingest(self.con,batch([],end=stamp))
+        cmd=[sys.executable,str(SCRIPT),'--db',str(self.path),'start-trading-epoch','--start-ms',str(stamp),'--id','cli','--reserved-btc']
+        for reserve in ('-1','NaN','Infinity'):
+            result=subprocess.run(cmd+[reserve],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIsNone(a.trading_epoch(self.con))
+        for reserve in ('0.2500','0.25'):
+            result=subprocess.run(cmd+[reserve],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            op=json.loads(result.stdout)['operational']
+            self.assertEqual(op['reserved_btc'],'0.25')
+            self.assertEqual(op['status'],'complete')
+        result=subprocess.run(cmd+['0.26'],capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0)
+
+    def test_epoch_incomplete_scan_rejected_and_later_capture_fail_closed(self):
+        a.ingest(self.con,batch([],end=T-50,complete=False))
+        with self.assertRaisesRegex(ValueError,'fresh complete sync'):
+            a.start_trading_epoch(self.con,'new',T-50,'0',now=NOW)
+        a.ingest(self.con,batch([],end=T-50))
+        a.start_trading_epoch(self.con,'new',T-50,'0',now=NOW)
+        a.ingest(self.con,batch([],start=T-50,end=T,complete=False))
+        self.assertEqual(self.report()['operational']['status'],'incomplete')
+        self.assertIsNone(self.report()['operational']['lifetime']['net_pnl_usd'])
+
+    def test_epoch_invalid_persisted_reserve_rejected(self):
+        self.establish_epoch()
+        self.con.execute("UPDATE trading_epoch SET opening_reserved_btc='-1'")
+        with self.assertRaisesRegex(ValueError,'opening BTC reserve'):
+            a.connect(self.path)
+
     def test_period_zero_preserves_historical_unknown_and_delayed_old_fill(self):
         self.ingest([fill(1,'-1','100',mts=T-1000)])
         old=self.report()

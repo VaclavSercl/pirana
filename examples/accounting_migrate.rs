@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = PiranaConfig::from_env()?;
     let client = BitfinexClient::new(config.exchange.api_key, config.exchange.api_secret);
+    client.verify_zero_spot_fees().await?;
     let orders = client.get_active_orders("tBTCUSD").await?;
     if !orders.is_empty() {
         return Err(format!("{} active orders require reconciliation; none were canceled", orders.len()).into());
@@ -39,6 +40,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if report["sync"]["complete"] == true {
             if !client.get_active_orders("tBTCUSD").await?.is_empty() {
                 return Err("Orders changed during read-only migration".into());
+            }
+            let after = client.get_wallets().await?;
+            std::fs::write(evidence.join("wallets-after.json"), serde_json::to_vec_pretty(&after)?)?;
+            for asset in ["BTC", "USD"] {
+                let before_balance = wallets.iter().find(|w| w.asset == asset).ok_or("missing opening wallet")?;
+                let after_balance = after.iter().find(|w| w.asset == asset).ok_or("missing closing wallet")?;
+                if before_balance.total != after_balance.total {
+                    return Err("Wallet changed during read-only migration".into());
+                }
             }
             return Ok(());
         }

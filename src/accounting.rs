@@ -165,8 +165,14 @@ fn public_projection(report: &Value) -> Result<Value, String> {
         object
             .iter()
             .filter(|(key, _)| key.as_str() != "orders" && key.as_str() != "open_lots")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
+            .map(|(key, value)| {
+                if key == "operational" && value.is_object() {
+                    public_projection(value).map(|summary| (key.clone(), summary))
+                } else {
+                    Ok((key.clone(), value.clone()))
+                }
+            })
+            .collect::<Result<serde_json::Map<String, Value>, String>>()?,
     ))
 }
 
@@ -312,5 +318,18 @@ mod tests {
         assert!(public.get("orders").is_none());
         assert!(public.get("open_lots").is_none());
         assert!(report.get("orders").is_some());
+    }
+}
+
+#[cfg(test)]
+mod operational_projection_tests {
+    #[test]
+    fn nested_recovery_history_is_not_published() {
+        let report = serde_json::json!({"operational":{"status":"complete","reserved_btc":"0.1","orders":[1],"open_lots":[2]}});
+        let p = super::public_projection(&report).unwrap();
+        assert!(p["operational"].get("orders").is_none());
+        assert!(p["operational"].get("open_lots").is_none());
+        assert_eq!(p["operational"]["reserved_btc"], "0.1");
+        assert_eq!(report["operational"]["orders"], serde_json::json!([1]));
     }
 }

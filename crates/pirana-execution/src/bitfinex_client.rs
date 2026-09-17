@@ -39,6 +39,8 @@ pub struct BitfinexClient {
     /// nonce → A odmítnuto jako „nonce: small" (naměřeno 40 % ztracených
     /// close orderů). Mutex drží alokaci nonce i odeslání pohromadě.
     submit_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Revalidate runtime authorization after all submission queue waits.
+    order_guard: Option<fn() -> bool>,
 }
 
 /// Result of a successfully submitted order, parsed from the exchange response
@@ -141,6 +143,7 @@ impl BitfinexClient {
             rate_limiter: shared.map(|o| o.rate_limiter.clone()).unwrap_or_else(RateLimiter::with_default),
             nonce_counter: shared.map(|o| Arc::clone(&o.nonce_counter)).unwrap_or_else(|| Arc::new(AtomicI64::new(chrono::Utc::now().timestamp_micros()))),
             submit_mutex: shared.map(|o| Arc::clone(&o.submit_mutex)).unwrap_or_default(),
+            order_guard: None,
         }
     }
 
@@ -158,7 +161,14 @@ impl BitfinexClient {
                 chrono::Utc::now().timestamp_micros(),
             )),
             submit_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            order_guard: None,
         }
+    }
+
+    /// Apply the current runtime guard immediately before sending every new order.
+    pub fn with_order_guard(mut self, guard: fn() -> bool) -> Self {
+        self.order_guard = Some(guard);
+        self
     }
 
     /// Dalsi striktne rostouci nonce.
@@ -208,6 +218,7 @@ impl BitfinexClient {
             rate_limiter: other.rate_limiter.clone(),
             nonce_counter: Arc::clone(&other.nonce_counter),
             submit_mutex: Arc::clone(&other.submit_mutex),
+            order_guard: None,
         }
     }
 
@@ -252,6 +263,15 @@ impl BitfinexClient {
 
         // Rate limit: pockat na token, nez zatizime burzu.
         self.rate_limiter.acquire().await;
+
+        if endpoint == "/api/v2/auth/w/order/submit"
+            && self.order_guard.map(|guard| !guard()).unwrap_or(false)
+        {
+            return Err(PiranaError::ExchangeApi {
+                code: -1,
+                message: "Order submission authorization is not current".into(),
+            });
+        }
 
         let response = self.client
             .post(&url)
@@ -437,35 +457,95 @@ impl BitfinexClient {
         Ok(text)
     }
 
-    /// Get wallet balances
-    pub async fn get_wallets(&self) -> PiranaResult<Vec<Balance>> {
-        let (_status, text) = self.post_auth("/api/v2/auth/r/wallets", "{}").await?;
-        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            PiranaError::ExchangeApi {
-                code: -1,
-                message: format!("Wallets parse failed: {}", e),
-            }
-        })?;
+    /// Authenticate the supported zero-fee spot policy before enabling new orders.
+    pub async fn verify_zero_spot_fees(&self) -> PiranaResult<()> {
+        let (status, text) = self.post_auth("/api/v2/auth/r/summary", "{}").await?;
+        if !status.is_success() {
+            return Err(PiranaError::ExchangeApi {
+                code: status.as_u16() as i32,
+                message: "Fee policy request failed".into(),
+            });
+        }
+        Self::parse_zero_spot_fees(&text)
+    }
 
-        let mut balances = Vec::new();
-        if let Some(arr) = json.as_array() {
-            for item in arr {
-                if let Some(arr) = item.as_array() {
-                    if arr.len() >= 5 {
-                        let total = arr[2].as_f64().unwrap_or(0.0);
-                        let free = arr[4].as_f64().unwrap_or(0.0);
-                        let locked = (total - free).max(0.0);
-                        balances.push(Balance {
-                            asset: arr[1].as_str().unwrap_or("").to_string(),
-                            free,
-                            locked,
-                            total,
-                        });
-                    }
-                }
+    /// Summary fee table: all three maker categories and crypto/fiat taker.
+    /// Any unsupported fee or missing evidence disables the zero-fee policy.
+    pub fn parse_zero_spot_fees(text: &str) -> PiranaResult<()> {
+        let invalid = || PiranaError::ExchangeApi {
+            code: -1,
+            message: "Zero spot fee policy could not be verified".into(),
+        };
+        let json: serde_json::Value = serde_json::from_str(text).map_err(|_| invalid())?;
+        let summary = json.as_array().ok_or_else(invalid)?;
+        let fees = summary.get(4).and_then(serde_json::Value::as_array).ok_or_else(invalid)?;
+        let maker = fees.first().and_then(serde_json::Value::as_array).ok_or_else(invalid)?;
+        let taker = fees.get(1).and_then(serde_json::Value::as_array).ok_or_else(invalid)?;
+        for value in [maker.first(), maker.get(1), maker.get(2), taker.get(2)] {
+            let token = value.ok_or_else(invalid)?;
+            let value = token.as_f64().ok_or_else(invalid)?;
+            // Preserve exact zero semantics even if a tiny decimal underflows f64.
+            let text = token.to_string();
+            let mantissa = text.split(['e', 'E']).next().ok_or_else(invalid)?;
+            if !value.is_finite() || value != 0.0 || mantissa.chars().any(|c| matches!(c, '1'..='9')) {
+                return Err(invalid());
             }
         }
+        Ok(())
+    }
 
+    /// Get validated exchange BTC/USD balances; other wallet pools are not spendable here.
+    pub async fn get_wallets(&self) -> PiranaResult<Vec<Balance>> {
+        let (status, text) = self.post_auth("/api/v2/auth/r/wallets", "{}").await?;
+        if !status.is_success() {
+            return Err(PiranaError::ExchangeApi {
+                code: status.as_u16() as i32,
+                message: "Wallet request failed".into(),
+            });
+        }
+        Self::parse_wallets(&text)
+    }
+
+    /// Pure parser: missing available balance never authorizes spending the total.
+    pub fn parse_wallets(text: &str) -> PiranaResult<Vec<Balance>> {
+        let invalid = || PiranaError::ExchangeApi {
+            code: -1,
+            message: "Invalid exchange wallet response".into(),
+        };
+        let json: serde_json::Value = serde_json::from_str(text).map_err(|_| invalid())?;
+        let rows = json.as_array().ok_or_else(invalid)?;
+        let mut balances = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for item in rows {
+            let row = item.as_array().ok_or_else(invalid)?;
+            if row.len() < 5 {
+                return Err(invalid());
+            }
+            let wallet = row[0].as_str().ok_or_else(invalid)?;
+            let asset = row[1].as_str().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+            if !matches!(wallet, "exchange" | "margin" | "funding") {
+                return Err(invalid());
+            }
+            if wallet != "exchange" || !matches!(asset, "BTC" | "USD") {
+                continue;
+            }
+            if !seen.insert(asset) {
+                return Err(invalid());
+            }
+            let total = row[2].as_f64().filter(|v| v.is_finite() && *v >= 0.0).ok_or_else(invalid)?;
+            let free = if row[4].is_null() {
+                // Bitfinex may omit availability; quarantine the entire total.
+                0.0
+            } else {
+                row[4].as_f64().filter(|v| v.is_finite() && *v >= 0.0 && *v <= total).ok_or_else(invalid)?
+            };
+            balances.push(Balance {
+                asset: asset.to_string(),
+                free,
+                locked: total - free,
+                total,
+            });
+        }
         Ok(balances)
     }
 
@@ -1070,5 +1150,140 @@ mod accounting_history_tests {
         let rows = client.get_trades_hist_page("tBTCUSD",1700000000123,1700000000123,1).await.unwrap();
         assert_eq!(rows[0].trade_id,123);
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod wallet_response_tests {
+    use super::*;
+
+    #[test]
+    fn only_exchange_btc_usd_contribute_to_trading_wallets() {
+        let wallets = BitfinexClient::parse_wallets(r#"[
+            ["funding","BTC",9,0,9], ["margin","USD",700,0,700],
+            ["exchange","BTC",0.25,0,0.2], ["exchange","USD",100,0,80],
+            ["exchange","ETH",3,0,3]
+        ]"#).unwrap();
+        assert_eq!(wallets.len(), 2);
+        assert_eq!(wallets[0].asset, "BTC");
+        assert_eq!(wallets[0].total, 0.25);
+        assert_eq!(wallets[0].free, 0.2);
+        assert!((wallets[0].locked - 0.05).abs() < 1e-15);
+        assert_eq!(wallets[1].asset, "USD");
+        assert_eq!(wallets[1].total, 100.0);
+        assert_eq!(wallets[1].locked, 20.0);
+    }
+
+    #[test]
+    fn unavailable_balance_is_locked_without_losing_authenticated_total() {
+        let wallets = BitfinexClient::parse_wallets(r#"[["exchange","BTC",0.25,0,null]]"#).unwrap();
+        assert_eq!(wallets[0].total, 0.25);
+        assert_eq!(wallets[0].free, 0.0);
+        assert_eq!(wallets[0].locked, 0.25);
+        assert!(BitfinexClient::parse_wallets("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn errors_malformed_rows_and_duplicate_assets_fail_closed() {
+        for text in [
+            "{}", "null", "[null]", "[1]", r#"["error",10000,"bad"]"#,
+            r#"[["exchange","BTC",1]]"#, r#"[[null,"BTC",1,0,1]]"#,
+            r#"[["exchange",null,1,0,1]]"#, r#"[["unknown","BTC",1,0,1]]"#,
+            r#"[["exchange","BTC",1,0,1],["exchange","BTC",1,0,1]]"#,
+            r#"[["exchange","USD",1,0,1],["exchange","USD",2,0,2]]"#,
+        ] {
+            assert!(BitfinexClient::parse_wallets(text).is_err(), "accepted {text}");
+        }
+    }
+
+    #[test]
+    fn totals_and_available_must_be_finite_nonnegative_numbers() {
+        for total in ["null", "true", r#""1""#, "-1", "1e999", r#""NaN""#] {
+            let text = format!(r#"[["exchange","BTC",{total},0,0]]"#);
+            assert!(BitfinexClient::parse_wallets(&text).is_err(), "accepted {text}");
+        }
+        for available in ["true", r#""0""#, "-1", "2", "1e999", r#""Infinity""#] {
+            let text = format!(r#"[["exchange","USD",1,0,{available}]]"#);
+            assert!(BitfinexClient::parse_wallets(&text).is_err(), "accepted {text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod spot_fee_policy_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_authenticated_zero_maker_and_fiat_taker_categories() {
+        assert!(BitfinexClient::parse_zero_spot_fees(
+            "[null,null,null,null,[[0,0.0,0],[0.2,0.2,0.0]]]"
+        ).is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_malformed_or_error_fee_evidence() {
+        for text in [
+            "{}", "null", "[]", r#"["error",10000,"private error"]"#,
+            "[null,null,null,null,null]",
+            "[null,null,null,null,[[],[]]]",
+            "[null,null,null,null,[[0,0],[0,0,0]]]",
+            "[null,null,null,null,[[0,0,0],[0,0]]]",
+            r#"[null,null,null,null,[["0",0,0],[0,0,0]]]"#,
+            "[null,null,null,null,[[0,0,null],[0,0,0]]]",
+            "[null,null,null,null,[[0,0,0],[0,0,true]]]",
+            "[null,null,null,null,[[0,0,0],[0,0,1e999]]]",
+            "[null,null,null,null,[[0,0,0],[0,0,1e-999]]]",
+        ] {
+            assert!(BitfinexClient::parse_zero_spot_fees(text).is_err(), "accepted {text}");
+        }
+    }
+
+    #[test]
+    fn rejects_nonzero_fees_and_rebates_in_each_required_category() {
+        for (category, index) in [(0,0), (0,1), (0,2), (1,2)] {
+            for rate in [0.1, -0.1] {
+                let mut summary = serde_json::json!([null,null,null,null,[[0,0,0],[0,0,0]]]);
+                summary[4][category][index] = serde_json::json!(rate);
+                assert!(BitfinexClient::parse_zero_spot_fees(&summary.to_string()).is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod queued_order_guard_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_order_rechecks_revoked_guard_before_network() {
+        // This static belongs exclusively to this test, avoiding shared test state.
+        static AUTHORIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        fn authorized() -> bool { AUTHORIZED.load(Ordering::SeqCst) }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = BitfinexClient::new_for_test(
+            format!("http://{}", listener.local_addr().unwrap()), "test".into(), "test".into(), None,
+        ).with_order_guard(authorized);
+        let held = client.submit_mutex.lock().await;
+        assert!(authorized());
+        let pending = client.post_auth("/api/v2/auth/w/order/submit", "{}");
+        tokio::pin!(pending);
+        // Biased polling first reaches the held mutex, then yields deterministically.
+        tokio::select! {
+            biased;
+            result = &mut pending => panic!("submission bypassed held mutex: {result:?}"),
+            _ = std::future::ready(()) => {},
+        }
+        AUTHORIZED.store(false, Ordering::SeqCst);
+        drop(held);
+        let error = pending.await.unwrap_err();
+        match error {
+            PiranaError::ExchangeApi { code, message } => {
+                assert_eq!(code, -1);
+                assert_eq!(message, "Order submission authorization is not current");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 }

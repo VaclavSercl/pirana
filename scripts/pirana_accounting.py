@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 SCHEMA = 1  # Public projection contract.
 DB_SCHEMA = 2
+EPOCH_DDL = 'CREATE TABLE IF NOT EXISTS trading_epoch(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT NOT NULL, start_ms INTEGER NOT NULL, opening_reserved_btc TEXT NOT NULL)'
 PERIOD_DDL = 'CREATE TABLE IF NOT EXISTS reporting_period(id INTEGER PRIMARY KEY CHECK(id=1), period_id TEXT NOT NULL, start_ms INTEGER NOT NULL)'
 SCAN_DDL = 'CREATE TABLE IF NOT EXISTS scan(id INTEGER PRIMARY KEY CHECK(id=1), start_ms INTEGER NOT NULL, next_ms INTEGER NOT NULL, target_ms INTEGER NOT NULL)'
 DDL = '''
@@ -55,6 +56,7 @@ def validate_schema(con, version):
             raise ValueError('invalid scan schema')
     state(con)
     reporting_period(con)
+    trading_epoch(con)
 
 
 def reporting_period(con):
@@ -90,6 +92,60 @@ def start_period(con,period_id,start_ms):
         con.execute(PERIOD_DDL)
         if old is None:
             con.execute('INSERT INTO reporting_period VALUES(1,?,?)',(period_id,start_ms))
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+
+
+def trading_epoch(con):
+    if con is None or not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trading_epoch'").fetchone():
+        return None
+    info=list(con.execute('PRAGMA table_info(trading_epoch)'))
+    if [r[1] for r in info]!=['id','name','start_ms','opening_reserved_btc'] or [r[5] for r in info]!=[1,0,0,0]:
+        raise ValueError('invalid trading epoch schema')
+    rows=con.execute('SELECT id,name,start_ms,opening_reserved_btc FROM trading_epoch').fetchall()
+    if not rows:
+        return None
+    if len(rows)!=1 or rows[0][0]!=1:
+        raise ValueError('invalid trading epoch state')
+    _,name,start_ms,reserve=rows[0]
+    validate_period(name,start_ms)
+    if decimal(reserve)<0 or number(decimal(reserve))!=reserve:
+        raise ValueError('invalid opening BTC reserve')
+    return dict(id=name,start_ms=start_ms,reserved_btc=reserve)
+
+
+def start_trading_epoch(con,name,start_ms,reserved_btc,now=None):
+    """Caller must quiesce trading and authenticate wallets/no open orders first.
+
+    Opening reserve has unknown basis and is never operational FIFO inventory.
+    A synchronized exact boundary prevents reclassifying known executions.
+    """
+    validate_period(name,start_ms)
+    reserve=decimal(reserved_btc)
+    if reserve<0:
+        raise ValueError('negative opening BTC reserve')
+    requested=dict(id=name,start_ms=start_ms,reserved_btc=number(reserve))
+    now=now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError('epoch time needs timezone')
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        old=trading_epoch(con)
+        if old is not None:
+            if old!=requested:
+                raise ValueError('trading epoch already established with different parameters')
+        else:
+            sync=state(con)
+            now_ms=int(now.timestamp()*1000)
+            if (not sync['complete'] or sync['coverage_start_ms']!=0 or sync['scan'] is not None
+                    or sync['cursor_ms']!=start_ms or not 0<=now_ms-start_ms<=120000):
+                raise ValueError('trading epoch requires fresh complete sync at exact boundary')
+            if any(json.loads(r[0])['mts']>=start_ms for r in con.execute('SELECT payload FROM fills')):
+                raise ValueError('trading epoch boundary already contains executions')
+            con.execute(EPOCH_DDL)
+            con.execute('INSERT INTO trading_epoch VALUES(1,?,?,?)',(name,start_ms,requested['reserved_btc']))
         con.commit()
     except BaseException:
         con.rollback()
@@ -249,8 +305,41 @@ def snapshot(con, now=None):
         return _snapshot(con, now)
 
 def _snapshot(con, now):
+    fills = [] if con is None else [json.loads(r[0]) for r in con.execute('SELECT payload FROM fills')]
+    fills.sort(key=lambda f:(f['mts'],f['trade_id'],decimal(f['exec_amount']) < 0,f['order_id']))
+    period=reporting_period(con)
+    result=_projection(con,now,fills,period)
+    epoch=trading_epoch(con)
+    result['operational']=None
+    if epoch:
+        operational_fills=[f for f in fills if f['mts']>=epoch['start_ms']]
+        scoped=_projection(con,now,operational_fills,dict(period) if period else None)
+        if scoped['sync']['cursor_ms']<epoch['start_ms']:
+            scoped['issues'].append('epoch_history_coverage_incomplete')
+            scoped['status']='incomplete'
+            for total in (scoped['daily'],scoped['lifetime']):
+                for key in ('gross_pnl_usd','net_pnl_usd','fees_usd'):
+                    total[key]=None
+        operational={key:scoped[key] for key in ('status','issues','sync','daily','lifetime','open_lots','orders','fill_count')}
+        operational.update(epoch,scope='operational:tBTCUSD:excludes_opening_reserve')
+        result['operational']=operational
+        # Reporting may adopt this basis only if no executions fall into the
+        # gap excluded by the operational epoch. The original boundary persists.
+        if period and not any(period['start_ms']<=f['mts']<epoch['start_ms'] for f in fills):
+            candidate=scoped['active_period']
+            if operational['status']!='complete':
+                candidate['issues']=sorted(set(candidate['issues']+operational['issues']))
+                candidate['status']='incomplete'
+                for key in ('gross_pnl_usd','net_pnl_usd','fees_usd','closed_count','win_count','loss_count'):
+                    candidate[key]=None
+            result['active_period']=candidate
+    return result
+
+
+def _projection(con, now, fills, period):
+    # Both scopes use the same FIFO implementation with explicitly selected fills.
     sync = state(con)
-    period = reporting_period(con)
+    period = dict(period) if period else None
     period_issues = []
     issues = [] if sync['complete'] else ['history_sync_incomplete']
     if sync['coverage_start_ms'] != 0:
@@ -259,8 +348,6 @@ def _snapshot(con, now):
         issues.append('history_sync_future')
     if int(now.timestamp()*1000)-sync['cursor_ms']>120000:
         issues.append('history_sync_stale')
-    fills = [] if con is None else [json.loads(r[0]) for r in con.execute('SELECT payload FROM fills')]
-    fills.sort(key=lambda f:(f['mts'],f['trade_id'],decimal(f['exec_amount']) < 0,f['order_id']))
     period_orders = {f['order_id'] for f in fills if period and f['mts']>=period['start_ms']}
     orders = {}
     for f in fills:
@@ -437,6 +524,10 @@ def main():
     period=commands.add_parser('start-period')
     period.add_argument('--start-ms',type=int,required=True)
     period.add_argument('--id',required=True)
+    epoch=commands.add_parser('start-trading-epoch')
+    epoch.add_argument('--start-ms',type=int,required=True)
+    epoch.add_argument('--id',required=True)
+    epoch.add_argument('--reserved-btc',required=True)
     commands.add_parser('import-legacy').add_argument('path')
     commands.add_parser('backup').add_argument('path')
     args=parser.parse_args()
@@ -446,10 +537,11 @@ def main():
             validate_period(args.id,args.start_ms)
             if args.start_ms>int(dt.datetime.now(dt.timezone.utc).timestamp()*1000):
                 raise ValueError('reporting period cannot start in the future')
-        con=connect(args.db,args.command in ('ingest','import-legacy','start-period'))
+        con=connect(args.db,args.command in ('ingest','import-legacy','start-period','start-trading-epoch'))
         if args.command=='ingest': ingest(con,json.load(sys.stdin))
         elif args.command=='import-legacy': import_legacy(con,args.path)
         elif args.command=='start-period': start_period(con,args.id,args.start_ms)
+        elif args.command=='start-trading-epoch': start_trading_epoch(con,args.id,args.start_ms,args.reserved_btc)
         elif args.command=='backup': backup(con,args.path)
         if con: con.execute('BEGIN')  # coherent projection across concurrent writers
         result=state(con) if args.command=='state' else snapshot(con,dt.datetime.fromisoformat(args.now.replace('Z','+00:00')) if getattr(args,'now',None) else None)

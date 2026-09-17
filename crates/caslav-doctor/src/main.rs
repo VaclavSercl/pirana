@@ -86,6 +86,25 @@ struct Snapshot {
     uptime_secs: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FeedAssessment {
+    ReconciliationRequired,
+    RestartRequired,
+    Live,
+}
+
+fn assess_feed(mode: &str, btc_price: f64) -> FeedAssessment {
+    // Recovery halts intentionally precede feed startup. Restarting cannot
+    // reconcile the ledger and would obscure the reason for the safe halt.
+    if mode == "Halted" {
+        FeedAssessment::ReconciliationRequired
+    } else if btc_price <= 0.0 {
+        FeedAssessment::RestartRequired
+    } else {
+        FeedAssessment::Live
+    }
+}
+
 fn trading_check() {
     println!("🔍 CASLAV DOCTOR — kontrola obchodování");
     println!("{}", "─".repeat(50));
@@ -111,13 +130,22 @@ fn trading_check() {
     };
     println!("✅ [2/9] API odpovídá (uptime {} min)", snap.uptime_secs / 60);
 
-    // 3. WS feed živý?
-    if snap.btc_price <= 0.0 {
-        println!("🔴 [3/9] btc_price = 0 — WS feed mrtvý");
-        auto_fix_restart("WS feed mrtvý", state);
-        return;
+    // 3. Respect an explicit safety halt before diagnosing a missing feed.
+    match assess_feed(&snap.mode, snap.btc_price) {
+        FeedAssessment::ReconciliationRequired => {
+            println!("🔴 [3/9] Režim HALTED — vyžaduje kontrolu a reconciliaci");
+            alert_operator("HALTED", "systém v Halted — kontrola a reconciliace nutná");
+            return;
+        }
+        FeedAssessment::RestartRequired => {
+            println!("🔴 [3/9] btc_price <= 0 — WS feed mrtvý");
+            auto_fix_restart("WS feed mrtvý", state);
+            return;
+        }
+        FeedAssessment::Live => {
+            println!("✅ [3/9] WS feed živý (BTC {:.0} USD)", snap.btc_price);
+        }
     }
-    println!("✅ [3/9] WS feed živý (BTC {:.0} USD)", snap.btc_price);
 
     // 4. Obchody — poslední z recent_trades (ne indikátor, reálná data)
     let now = chrono::Utc::now().timestamp();
@@ -163,11 +191,6 @@ fn trading_check() {
                 return;
             }
             println!("   → legitimní ochrana po ztrátové sérii (cooldown ~15 min)");
-        }
-        "Halted" => {
-            println!("🔴 [5/9] Režim HALTED — vyžaduje zásah");
-            alert_operator("HALTED", "systém v Halted — kontrola nutná");
-            return;
         }
         other => println!("⚠️ [5/9] Neznámý režim: {other}"),
     }
@@ -662,4 +685,37 @@ fn test_snapshot_schema_parity() -> Result<(), String> {
         return Err(format!("API postrádá pole: {missing:?} — doctor by tiše padl na výchozí hodnoty"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod feed_assessment_tests {
+    use super::{assess_feed, FeedAssessment};
+
+    #[test]
+    fn halted_requires_reconciliation_even_without_price() {
+        for price in [0.0, -1.0, 60_000.0] {
+            assert_eq!(
+                assess_feed("Halted", price),
+                FeedAssessment::ReconciliationRequired
+            );
+        }
+    }
+
+    #[test]
+    fn active_dead_feed_still_requires_restart() {
+        assert_eq!(assess_feed("Active", 0.0), FeedAssessment::RestartRequired);
+    }
+
+    #[test]
+    fn initializing_dead_feed_preserves_existing_restart_policy() {
+        assert_eq!(
+            assess_feed("Initializing", 0.0),
+            FeedAssessment::RestartRequired
+        );
+    }
+
+    #[test]
+    fn active_positive_price_is_live() {
+        assert_eq!(assess_feed("Active", 60_000.0), FeedAssessment::Live);
+    }
 }

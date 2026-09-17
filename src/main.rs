@@ -35,6 +35,7 @@ mod config;
 use config::StrategyConfig;
 
 mod accounting;
+mod operational_recovery;
 mod position_persistence;
 mod entry_policy;
 use entry_policy::{
@@ -87,12 +88,25 @@ static POSITION_PERSISTENCE_OK: std::sync::atomic::AtomicBool = std::sync::atomi
 
 static ACCOUNTING_CAPTURE_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+static OPENING_BTC_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn quarantined_btc() -> f64 { f64::from_bits(OPENING_BTC_RESERVE.load(std::sync::atomic::Ordering::Acquire)) }
+
+static EXECUTION_ACTIVITY: operational_recovery::Activity = operational_recovery::Activity::new();
+static ZERO_FEE_POLICY: operational_recovery::ZeroFeePolicy = operational_recovery::ZeroFeePolicy::new();
+
 static NEXT_POSITION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn order_submission_ready() -> bool {
+    POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire) && ZERO_FEE_POLICY.ready()
+}
 
 async fn durable_order_submission<F, Fut, T>(submit: F) -> PiranaResult<T>
 where F: FnOnce() -> Fut, Fut: std::future::Future<Output = PiranaResult<T>> {
     if !POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire) {
         return Err(pirana_core::errors::PiranaError::Config("position persistence failed".into()));
+    }
+    if !ZERO_FEE_POLICY.ready() {
+        return Err(pirana_core::errors::PiranaError::Config("fresh authenticated zero-fee policy required for trading".into()));
     }
     submit().await
 }
@@ -334,7 +348,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     use tokio_tungstenite::connect_async;
     use futures::{SinkExt, StreamExt};
 
-    let client = BitfinexClient::new(api_key.clone(), api_secret.clone());
+    let client = BitfinexClient::new(api_key.clone(), api_secret.clone())
+        .with_order_guard(order_submission_ready);
     if let Ok(wallets) = client.get_wallets().await {
         for w in wallets {
             if w.asset == "BTC" { *state.btc_balance.write() = w.total; }
@@ -389,7 +404,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 match accounting_sync.sync(&accounting_client).await {
-                    Ok(report) => ACCOUNTING_CAPTURE_READY.store(report["status"] == "complete" && report["sync"]["complete"] == true, std::sync::atomic::Ordering::Release),
+                    Ok(report) => ACCOUNTING_CAPTURE_READY.store(operational_recovery::projection(&report).is_ok(), std::sync::atomic::Ordering::Release),
                     Err(e) => {
                         ACCOUNTING_CAPTURE_READY.store(false, std::sync::atomic::Ordering::Release);
                         error!("Accounting synchronization failed; new BUY entries paused: {}", e);
@@ -404,11 +419,44 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     if !client.get_active_orders("tBTCUSD").await?.is_empty() {
         return Err(pirana_core::errors::PiranaError::Config("exchange orders changed during recovery".into()));
     }
+    let fee_request_at = chrono::Utc::now().timestamp_millis();
+    client.verify_zero_spot_fees().await?;
+    ZERO_FEE_POLICY.confirm(fee_request_at);
+    info!("Authenticated spot maker/taker fees verified zero");
+    {
+        let fee_client = client.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let requested_at = chrono::Utc::now().timestamp_millis();
+                match fee_client.verify_zero_spot_fees().await {
+                    Ok(()) => ZERO_FEE_POLICY.confirm(requested_at),
+                    Err(e) => {
+                        ZERO_FEE_POLICY.revoke();
+                        error!("Order submission paused: zero-fee policy not verified: {}", e);
+                    }
+                }
+            }
+        });
+    }
+    let fresh_wallets = client.get_wallets().await?;
+    let actual_btc = fresh_wallets.iter().find(|w|w.asset == "BTC").map(|w|w.total)
+        .ok_or_else(|| pirana_core::errors::PiranaError::Config("BTC wallet missing during recovery".into()))?;
+    let opening_btc_reserve = operational_recovery::verify_wallet(&initial_accounting, actual_btc)
+        .map_err(pirana_core::errors::PiranaError::Config)?;
+    let actual_usd = fresh_wallets.iter().find(|w|w.asset == "USD").map(|w|w.total)
+        .filter(|n| n.is_finite() && *n >= 0.)
+        .ok_or_else(|| pirana_core::errors::PiranaError::Config("USD wallet missing or invalid during recovery".into()))?;
+    *state.btc_balance.write() = actual_btc;
+    *state.usd_balance.write() = actual_usd;
+    OPENING_BTC_RESERVE.store(opening_btc_reserve.to_bits(), std::sync::atomic::Ordering::Release);
+    { let mut locked=state.locked_btc_reserve.write(); *locked=locked.max(opening_btc_reserve); }
+    info!("Operational recovery: quarantined opening BTC {:.8}; historical PnL status {}", opening_btc_reserve, initial_accounting["status"]);
     // Recover metadata before any exchange order mutation; never invent missing cost basis or stops.
     let position_path = std::env::var_os("PIRANA_POSITION_SNAPSHOT_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "/var/lib/pirana/positions.json".into());
-    let active_positions = Arc::new(position_persistence::PositionBook::open(position_path, &initial_accounting)
+    let active_positions = Arc::new(position_persistence::PositionBook::open(position_path, operational_recovery::projection(&initial_accounting).map_err(pirana_core::errors::PiranaError::Config)?)
         .map_err(pirana_core::errors::PiranaError::Config)?);
 
     // Strop otevrenych orderu ze strategy.toml (drive mrtvy klic — router
@@ -571,6 +619,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     );
 
     risk_engine.update_exposure(active_positions.read().iter().map(|p| p.exposure_size).sum());
+    *state.system_mode.write() = risk_engine.mode();
 
     // [CASLAV v5.1 / P0-1 START RECONCILIATION — revize po oponentuře agy]
     // PRVNI VERZE (zamitnuta oponentem): registrovat cely btc_total jako synteticke
@@ -701,7 +750,9 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             tick = tick.wrapping_add(1);
+            let Some(observation) = EXECUTION_ACTIVITY.idle_generation() else { continue; };
             if let Ok(wallets) = client_for_reconciliation.get_wallets().await {
+                if !EXECUTION_ACTIVITY.unchanged(observation) { continue; }
                 let mut btc_total = None;
                 let mut usd_total = None;
                 for w in wallets {
@@ -710,6 +761,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                 }
 
                 if let (Some(new_btc), Some(new_usd)) = (btc_total, usd_total) {
+                    let Some(wallet_guard) = EXECUTION_ACTIVITY.idle_guard(observation) else { continue; };
                     let old_btc = *state_for_reconciliation.btc_balance.read();
                     let old_usd = *state_for_reconciliation.usd_balance.read();
                     let btc_price = *state_for_reconciliation.btc_price.read();
@@ -717,6 +769,11 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     let delta_btc = new_btc - old_btc;
                     let delta_usd = new_usd - old_usd;
 
+                    if delta_btc.abs() > 1e-10 || new_btc + 1e-10 < opening_btc_reserve {
+                        mark_recovery_halted(&state_for_reconciliation);
+                        risk_engine_for_reconciliation.halt();
+                        tracing::error!("Unattributed BTC balance change; operational positions and opening reserve require reconciliation");
+                    }
                     // 1. Vault Auto-Reconciliation & Invariant Enforcement
                     {
                         let mut active_locked = state_for_reconciliation.locked_btc_reserve.write();
@@ -756,6 +813,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                     *state_for_reconciliation.usd_balance.write() = new_usd;
 
                     tracing::debug!("Wallet balances auto-reconciled with Bitfinex: BTC={:.8}, USD={:.2}", new_btc, new_usd);
+
+                    drop(wallet_guard);
 
                     // [CASLAV v5.1] Periodicka rekalibrace rizika (1x za 15 min).
                     // Az ZDE, po rekonciliaci — equity i cena jsou cerstve.
@@ -1030,11 +1089,11 @@ async fn process_ws_message(
                             as_model.dt = conf.avellaneda_stoikov.time_horizon_dt;
                         }
                         let total_btc = *state.btc_balance.read();
-                        let locked_btc = if conf.profit_skimmer.exclude_from_trading_margin {
+                        let locked_btc = quarantined_btc().max(if conf.profit_skimmer.exclude_from_trading_margin {
                             *state.locked_btc_reserve.read()
                         } else {
                             0.0
-                        };
+                        });
                         // Cilovy inventar jako PODIL equity, ne pevna konstanta.
                         // Pevnych 0,01 BTC bylo pri cene 78k = 196 % kapitalu, takze
                         // q zustavalo trvale zaporne a bot nakupoval, dokud 24. 8.
@@ -1233,6 +1292,7 @@ async fn process_ws_message(
                                 });
                             } else {
                                 tokio::spawn(async move {
+                                let _execution_activity = EXECUTION_ACTIVITY.begin();
                                     let close_side = match pos_clone.side {
                                         Side::Buy => Side::Sell,
                                         Side::Sell => Side::Buy,
@@ -1246,7 +1306,8 @@ async fn process_ws_message(
 
                                     let exit_cid = next_entry_cid();
                                     let exit_result = match active_positions_clone.stage_exit(exit_cid.to_string(), pos_clone.clone()) {
-                                        Ok(()) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", close_side, pirana_core::types::OrderType::Market, sign * pos_clone.quantity, price, exit_cid)).await,
+                                        Ok(()) if close_side != Side::Sell || operational_recovery::sale_allowed(*state_clone.btc_balance.read(), quarantined_btc(), pos_clone.quantity) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", close_side, pirana_core::types::OrderType::Market, sign * pos_clone.quantity, price, exit_cid)).await,
+                                        Ok(()) => Err(pirana_core::errors::PiranaError::Config("sale would consume quarantined BTC".into())),
                                         Err(e) => Err(pirana_core::errors::PiranaError::Config(e)),
                                     };
                                     match exit_result {
@@ -1515,11 +1576,11 @@ async fn process_ws_message(
 
                             if mid > 0.0 {
                                 let total_btc = *state.btc_balance.read();
-                                let locked_btc = if conf.profit_skimmer.exclude_from_trading_margin {
+                                let locked_btc = quarantined_btc().max(if conf.profit_skimmer.exclude_from_trading_margin {
                                     *state.locked_btc_reserve.read()
                                 } else {
                                     0.0
-                                };
+                                });
                                 // Cilovy inventar jako PODIL equity, ne pevna konstanta.
                                 // Pevnych 0,01 BTC bylo pri cene 78k = 196 % kapitalu, takze
                                 // q zustavalo trvale zaporne a bot nakupoval, dokud 24. 8.
@@ -1613,11 +1674,11 @@ async fn process_ws_message(
                                 }
                                 
                                 let total_btc = *state.btc_balance.read();
-                                let locked_btc = if conf.profit_skimmer.exclude_from_trading_margin {
+                                let locked_btc = quarantined_btc().max(if conf.profit_skimmer.exclude_from_trading_margin {
                                     *state.locked_btc_reserve.read()
                                 } else {
                                     0.0
-                                };
+                                });
                                 let current_btc = pirana_core::reconciliation::BalanceReconciliation::calculate_tradable_margin(total_btc, locked_btc);
                                 // Cilovy inventar jako PODIL equity, ne pevna konstanta.
                                 // Pevnych 0,01 BTC bylo pri cene 78k = 196 % kapitalu, takze
@@ -1867,7 +1928,7 @@ async fn process_ws_message(
                                 };
 
                                 if is_buying {
-                                    if !ACCOUNTING_CAPTURE_READY.load(std::sync::atomic::Ordering::Acquire) || !POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire) {
+                                    if !ZERO_FEE_POLICY.ready() || !ACCOUNTING_CAPTURE_READY.load(std::sync::atomic::Ordering::Acquire) || !POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire) {
                                         if log_throttler.should_log("accounting_unavailable") {
                                             tracing::error!("BUY paused: authenticated execution history not durably synchronized");
                                         }
@@ -2211,6 +2272,8 @@ async fn process_ws_message(
                                                          return;
                                                      }
 
+                                                     // Cover optimistic balances as well as exchange execution.
+                                                     let execution_activity = EXECUTION_ACTIVITY.begin();
                                                      // Update balances locally BEFORE async to prevent stale reads
                                                      *state.btc_balance.write() += final_trade_size;
                                                      *state.usd_balance.write() -= required_usd;
@@ -2246,6 +2309,7 @@ async fn process_ws_message(
                                                      let entry_gate_clone = entry_gate.clone();
 
                                                      tokio::spawn(async move {
+                                                         let _execution_activity = execution_activity;
                                                          // [CASLAV v5.1 / SLIPPAGE P1] IOC LIMIT místo MARKET:
                                                          // limit = signál + max_slippage → fill nikdy horší než práh,
                                                          // price improvement (71 % měřených orderů) se zachytí.
@@ -2818,13 +2882,15 @@ async fn process_ws_message(
                                                 let entry_price_closed = closed_pos.entry_price;
 
                                                 tokio::spawn(async move {
+                                let _execution_activity = EXECUTION_ACTIVITY.begin();
                                                     // Bitfinex sells require negative quantity
                                                     // [CASLAV v5.1 / SLIPPAGE P1] IOC LIMIT místo MARKET:
                                                     // limit = signál − max_slippage → nikdy neprodáme pod práh,
                                                     // price improvement se zachytí, neplněná část se ruší.
                                                     let exit_cid = next_entry_cid();
                                                     let exit_result = match active_positions_clone.stage_exit(exit_cid.to_string(), pos_to_restore.clone()) {
-                                                        Ok(()) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", Side::Sell, pirana_core::types::OrderType::IOC, -final_trade_size, sell_ioc_limit, exit_cid)).await,
+                                                        Ok(()) if operational_recovery::sale_allowed(*state_clone.btc_balance.read(), quarantined_btc(), final_trade_size) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", Side::Sell, pirana_core::types::OrderType::IOC, -final_trade_size, sell_ioc_limit, exit_cid)).await,
+                                                        Ok(()) => Err(pirana_core::errors::PiranaError::Config("sale would consume quarantined BTC".into())),
                                                         Err(e) => Err(pirana_core::errors::PiranaError::Config(e)),
                                                     };
                                                     match exit_result {
