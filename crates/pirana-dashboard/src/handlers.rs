@@ -1,15 +1,17 @@
+use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{State, WebSocketUpgrade},
-    response::{IntoResponse, Html},
+    response::{Html, IntoResponse},
     routing::get,
     Json, Router,
 };
-use axum::extract::ws::{Message, WebSocket};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 use tracing::info;
 
 use crate::state::DashboardState;
+#[path = "accounting.rs"]
+mod accounting;
 
 /// Landing page HTML — served at /
 const LANDING_HTML: &str = include_str!("../static/landing.html");
@@ -23,6 +25,7 @@ pub fn create_router(state: Arc<DashboardState>) -> Router {
         .route("/", get(landing_handler))
         .route("/trading", get(trading_handler))
         .route("/api/snapshot", get(snapshot_handler))
+        .route("/api/accounting", get(accounting_handler))
         .route("/api/risk_state", get(risk_state_handler))
         .route("/ws", get(ws_handler))
         .route("/api/health", get(health_handler))
@@ -41,17 +44,13 @@ async fn trading_handler() -> impl IntoResponse {
 }
 
 /// GET /api/snapshot — returns full dashboard state as JSON
-async fn snapshot_handler(
-    State(state): State<Arc<DashboardState>>,
-) -> impl IntoResponse {
-    let snapshot = state.snapshot();
+async fn snapshot_handler(State(state): State<Arc<DashboardState>>) -> impl IntoResponse {
+    let snapshot = accounting::merge(serde_json::to_value(state.snapshot()).unwrap_or_default());
     Json(snapshot)
 }
 
 /// GET /api/risk_state — kalibrovany rizikovy stav (ČÁSLAV v5.1)
-async fn risk_state_handler(
-    State(state): State<Arc<DashboardState>>,
-) -> impl IntoResponse {
+async fn risk_state_handler(State(state): State<Arc<DashboardState>>) -> impl IntoResponse {
     // [CASLAV v5.1] Kalibrovany rizikovy stav vcetne vzorcu a vstupu.
     // Bez `formula`/`inputs` nikdo nepozna, PROC se limit zmenil —
     // proto se vraci cely DerivedParamView, ne jen holá čísla.
@@ -84,7 +83,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<DashboardState>) {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let snapshot = state.snapshot();
+                let snapshot = accounting::merge(serde_json::to_value(state.snapshot()).unwrap_or_default());
                 let json = match serde_json::to_string(&snapshot) {
                     Ok(j) => j,
                     Err(e) => {
@@ -114,4 +113,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<DashboardState>) {
             }
         }
     }
+}
+
+async fn accounting_handler() -> impl IntoResponse {
+    Json(accounting::read())
 }

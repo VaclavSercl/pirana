@@ -6,6 +6,11 @@ performance, capital accumulation in BTC vault, exchange volume, and system stab
 """
 
 import sys
+try:
+    from .pirana_report import generate_report_data, format_telegram_html
+except ImportError:  # Direct script invocation
+    from pirana_report import generate_report_data, format_telegram_html
+
 import os
 import time
 import json
@@ -277,69 +282,16 @@ def get_git_commit_count():
         return 50
 
 def build_yearly_report(time_label, stats, snapshot):
-    btc_price = snapshot.get("btc_price", 64400.0) if snapshot else 64400.0
-    total_locked_btc = snapshot.get("locked_btc_reserve", 0.0) if snapshot else 0.0
-    total_locked_sats = int(total_locked_btc * 100_000_000)
-    total_locked_usd = total_locked_btc * btc_price
-
-    year_locked_btc = stats["year_locked_btc"]
-    year_locked_sats = int(year_locked_btc * 100_000_000)
-
-    current_equity = snapshot.get("starting_equity", 393.56) + stats["net_pnl"] if snapshot else 393.56 + stats["net_pnl"]
-    start_equity = max(current_equity - stats["net_pnl"], 1.0)
-    pnl_pct = (stats["net_pnl"] / start_equity * 100.0) if start_equity > 0 else 0.0
-
-    pnl_val = stats["net_pnl"]
-    pnl_sign = "+" if pnl_val >= 0 else "-"
-    pnl_str = f"{pnl_sign}${abs(pnl_val):.4f} USD ({pnl_sign}{abs(pnl_pct):.2f}%)"
-
-    best_m_pnl = stats["best_month_pnl"]
-    best_m_sign = "+" if best_m_pnl >= 0 else "-"
-    best_m_str = f"{stats['best_month_label']} ({best_m_sign}${abs(best_m_pnl):.4f} USD)"
-
-    pf_str = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] < 100 else "∞"
-    payoff_str = f"{stats['payoff_ratio']:.2f}" if stats['payoff_ratio'] < 100 else "∞"
-    commit_count = get_git_commit_count()
-
-    if stats["net_pnl"] > 0 and stats["win_rate"] >= 50.0:
-        verdict = "👑 Vynikající institucionální zhodnocení (Strategie a BTC akumulace v plném souladu)"
-    elif stats["net_pnl"] >= 0:
-        verdict = "🟢 Stabilní organický růst a ochrana celkového kapitálu"
-    else:
-        verdict = "🟡 Vyžadována optimalizace parametrů pro nadcházející rok"
-
-    msg = (
-        f"👑 <b>ČÁSLAV :: VÝROČNÍ INSTITUCIONÁLNÍ AUDIT PIRANA</b>\n"
-        f"📅 <b>Období:</b> <code>[{time_label}]</code>\n"
-        f"──────────────────────────\n"
-        f"💰 <b>ROČNÍ ZTRÁTY &amp; ZISKY (FINANČNÍ VÝSLEDKY):</b>\n"
-        f"• Počáteční equity (1. ledna): <code>${start_equity:,.2f} USD</code>\n"
-        f"• Konečná equity (31. prosince): <code>${current_equity:,.2f} USD</code>\n"
-        f"• <b>Čistý roční zisk (Net Annual PnL):</b> <code>{pnl_str}</code>\n"
-        f"• Maximální roční Drawdown (MDD): <code>{stats['max_drawdown_pct']:.2f}%</code>\n"
-        f"• Sharpe Ratio (odhad): <code>{stats['sharpe_ratio']:.2f}</code>\n\n"
-        f"🏦 <b>BTC TREZOR &amp; STRATEGICKÁ AKUMULACE (Profit Skimmer):</b>\n"
-        f"• Za rok uloženo do trezoru: <code>+{year_locked_btc:.8f} BTC (+{year_locked_sats:,} sat)</code>\n"
-        f"• Celkový historický trezor: <code>{total_locked_btc:.8f} BTC ({total_locked_sats:,} sat / ~${total_locked_usd:.2f} USD)</code>\n"
-        f"• <b>Naplnění pravidla č. 2:</b> <code>100% Satoshis chráněno před odprodejem</code> 🛡️\n\n"
-        f"🎯 <b>ROČNÍ STATISTIKA EXEKUCÍ &amp; STRATEGIE:</b>\n"
-        f"• Celkem uzavřených obchodů: <code>{stats['total_roundtrips']}</code> (Průměr: <code>{stats['avg_trades_per_day']:.1f} / den</code>)\n"
-        f"• Celoroční Win Rate: <code>{stats['win_rate']:.1f}%</code> (🟢 {stats['wins']}W / 🔴 {stats['losses']}L / ⚪ {stats['be_trades']}BE)\n"
-        f"• Celoroční Profit Factor: <code>{pf_str}</code> | Payoff Ratio: <code>{payoff_str}</code>\n"
-        f"• Nejvýnosnější měsíc: <code>{best_m_str}</code>\n"
-        f"• Nejlepší jednotlivý záchyt trendu: <code>+${stats['max_win_usd']:.4f} USD (+{stats['max_win_roi']:.2f}%)</code>\n\n"
-        f"📊 <b>ROČNÍ OBRAT &amp; BENEFIT ZERO-FEE:</b>\n"
-        f"• Celkový roční objem: <code>{stats['total_vol_btc']:.4f} BTC (~${stats['total_vol_usd']:,.2f} USD)</code>\n"
-        f"• <b>Ušetřeno na poplatcích (Zero Fee):</b> <code>~${stats['saved_fees_usd']:.2f} USD</code> (přímá přidaná hodnota)\n\n"
-        f"⚙️ <b>SRE INFRASTRUKTURA &amp; SERVEROVÁ STABILITA:</b>\n"
-        f"• Celková roční dostupnost (Uptime): <code>99.99%</code>\n"
-        f"• Počet neplánovaných výpadků / restartů: <code>0</code>\n"
-        f"• Zásahů Watchdogu: <code>0</code>\n"
-        f"• Bezpečnostní Git commity: <code>{commit_count} verzí na origin/main</code>\n\n"
-        f"🚦 <b>CELKOVÝ VÝROČNÍ VERDIKT:</b>\n"
-        f"{verdict}"
+    """Daily/lifetime projections cannot establish a calendar-year result."""
+    import html
+    return (
+        "<b>PIRANA — ROČNÍ REPORT</b>\n"
+        f"Období: {html.escape(str(time_label))}\n"
+        "Roční čistý PnL, poplatky, equity a akumulace BTC: NEOVĚŘENO.\n"
+        "Chybí kanonická projekce pro požadovaný roční interval.\n"
+        "Následuje aktuální den a celá pokrytá historie účtu; nejde o roční výsledek.\n\n"
+        + format_telegram_html(generate_report_data(no_api=True))
     )
-    return msg
 
 def send_telegram(token, chat_id, text):
     if not token or not chat_id:
@@ -376,15 +328,8 @@ def main():
     env = load_env()
     tg_token = env.get("TELEGRAM_BOT_TOKEN") or env.get("CASLAV_TELEGRAM_TOKEN")
     tg_chat_id = env.get("TELEGRAM_CHAT_ID") or env.get("CASLAV_ALLOWED_USER_ID")
-    bfx_key = env.get("BITFINEX_API_KEY")
-    bfx_secret = env.get("BITFINEX_API_SECRET")
-
-    start_dt, end_dt, start_ms, end_ms, time_label, total_days = calculate_time_window(force_now=args.force_now)
-    snapshot = get_snapshot()
-
-    raw_trades = fetch_bitfinex_trades_paginated(bfx_key, bfx_secret, start_ms, end_ms)
-    stats = analyze_yearly_trades(raw_trades, total_days)
-    report_text = build_yearly_report(time_label, stats, snapshot)
+    _, _, _, _, time_label, _ = calculate_time_window(force_now=args.force_now)
+    report_text = build_yearly_report(time_label, None, None)
 
     if args.dry_run:
         print("\n==================== [ANNUAL REPORT DRY RUN] ====================")

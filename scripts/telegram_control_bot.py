@@ -6,6 +6,11 @@ Provides bidirectional Telegram commands (/status, /scale, /pause, /resume, /rec
 
 import os
 import sys
+try:
+    from .pirana_report import generate_report_data, format_telegram_html
+except ImportError:  # Direct script invocation
+    from pirana_report import generate_report_data, format_telegram_html
+
 import json
 import time
 import urllib.request
@@ -65,48 +70,8 @@ def get_snapshot():
     return None
 
 def handle_status(chat_id):
-    """Handles /status command."""
-    snap = get_snapshot()
-    if not snap:
-        send_telegram(chat_id, "⚠️ <b>Chyba:</b> API Pirana neodpovídá na snapshot endpoint.")
-        return
-
-    mode = snap.get("system_mode", "Unknown")
-    btc_price = snap.get("btc_price", 0.0)
-    btc_bal = snap.get("btc_balance", 0.0)
-    usd_bal = snap.get("usd_balance", 0.0)
-    locked_btc = snap.get("locked_btc_reserve", 0.0)
-    daily_pnl = snap.get("daily_pnl", 0.0)
-    daily_pnl_pct = snap.get("daily_pnl_pct", 0.0)
-    total_pnl = snap.get("total_pnl", 0.0)
-    trades_today = snap.get("trades_today", 0)
-    losses = snap.get("consecutive_losses", 0)
-    uptime_s = snap.get("uptime_seconds", 0)
-
-    total_equity = btc_bal * btc_price + usd_bal
-    uptime_str = f"{uptime_s // 3600}h {(uptime_s % 3600) // 60}m {uptime_s % 60}s"
-
-    pnl_sign = "+" if daily_pnl >= 0 else ""
-    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
-    mode_icon = "🟢" if mode == "Active" else "🟡" if mode == "Initializing" else "🔴"
-
-    msg = (
-        f"👑 <b>ČÁSLAV :: PIRANA LIVE STATUS</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Stav jádra:</b> {mode_icon} <code>{mode}</code>\n"
-        f"• <b>Cena BTC:</b> <code>${btc_price:,.2f} USD</code>\n"
-        f"• <b>Celková equity:</b> <code>${total_equity:,.2f} USD</code>\n"
-        f"• <b>Zůstatek USD:</b> <code>${usd_bal:,.2f}</code>\n"
-        f"• <b>Zůstatek BTC:</b> <code>{btc_bal:.6f} BTC</code>\n"
-        f"• 🔒 <b>Trezor (Skimmer):</b> <code>{locked_btc:.8f} BTC</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Denní PnL:</b> {pnl_icon} <code>{pnl_sign}{daily_pnl:.4f} USD ({pnl_sign}{daily_pnl_pct:.3f}%)</code>\n"
-        f"• <b>Celkový PnL:</b> <code>{total_pnl:+.4f} USD</code>\n"
-        f"• <b>Dnešní obchody:</b> <code>{trades_today}</code>\n"
-        f"• <b>Ztráty v řadě:</b> <code>{losses}/3</code>\n"
-        f"• <b>Uptime:</b> <code>{uptime_str}</code>\n"
-    )
-    send_telegram(chat_id, msg)
+    """Handles /status with canonical account accounting."""
+    send_telegram(chat_id, format_telegram_html(generate_report_data(no_api=True)))
 
 def handle_scale(chat_id, args):
     """Handles /scale <pct> command."""

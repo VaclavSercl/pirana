@@ -1,7 +1,6 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Environment — NEVER commit secrets
 .env
@@ -31,6 +30,9 @@ config.toml
 # Logs
 *.log
 logs/
+
+# Gauntlet durable state — machine-generated, never commit
+.gauntlet/
 
 # Data
 /data

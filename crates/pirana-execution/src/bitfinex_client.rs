@@ -50,6 +50,8 @@ pub struct OrderExecutionResult {
     pub avg_fill_price: f64,
     /// Real executed quantity (absolute value)
     pub filled_qty: f64,
+    pub is_terminal: bool,
+    pub price_confirmed: bool,
     /// Raw response body for auditing
     pub raw: String,
 }
@@ -57,6 +59,12 @@ pub struct OrderExecutionResult {
 /// Zaznam jednoho obchodu z Bitfinex API (pro gap reconstruction).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeRecord {
+    pub trade_id: i64,
+    pub symbol: String,
+    /// Exact exchange decimal tokens for durable accounting; floats below are legacy views.
+    pub exec_amount_decimal: String,
+    pub exec_price_decimal: String,
+    pub fee_decimal: String,
     /// Execution timestamp (milisekundy).
     pub mts: i64,
     /// Executed amount (kladne = buy, zaporne = sell).
@@ -74,6 +82,15 @@ pub struct TradeRecord {
 }
 
 impl TradeRecord {
+    pub fn to_accounting_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "trade_id": self.trade_id, "order_id": self.order_id, "symbol": self.symbol,
+            "mts": self.mts, "exec_amount": self.exec_amount_decimal,
+            "exec_price": self.exec_price_decimal, "fee": self.fee_decimal,
+            "fee_currency": self.fee_currency, "cid": self.cid
+        })
+    }
+
     /// Je to nas obchod? Filtruje podle cid prefixu.
     pub fn is_ours(&self) -> bool {
         self.cid
@@ -202,7 +219,7 @@ impl BitfinexClient {
     /// Submit a new order to Bitfinex
     ///
     /// Returns a parsed `OrderExecutionResult` containing the REAL average
-    /// execution price reported by the exchange (index 16 of the order array
+    /// execution price reported by the exchange (index 17 of the order array
     /// in the `on-req` notification payload). Callers MUST use
     /// Jediná cesta pro autentizované POST požadavky [DRY — oponentura P0].
     ///
@@ -279,6 +296,26 @@ impl BitfinexClient {
         quantity: f64,
         price: f64,
     ) -> PiranaResult<OrderExecutionResult> {
+        self.submit_order_inner(symbol, side, order_type, quantity, price, None).await
+    }
+
+    /// Submit with a durable caller-assigned Bitfinex client ID (positive 45-bit integer).
+    pub async fn submit_order_with_cid(
+        &self, symbol: &str, side: Side, order_type: OrderType,
+        quantity: f64, price: f64, cid: i64,
+    ) -> PiranaResult<OrderExecutionResult> {
+        if !(1..=(1_i64 << 45) - 1).contains(&cid) {
+            return Err(PiranaError::ExchangeApi {
+                code: 10001, message: "Client order ID must be a positive 45-bit integer".into(),
+            });
+        }
+        self.submit_order_inner(symbol, side, order_type, quantity, price, Some(cid)).await
+    }
+
+    async fn submit_order_inner(
+        &self, symbol: &str, side: Side, order_type: OrderType,
+        quantity: f64, price: f64, cid: Option<i64>,
+    ) -> PiranaResult<OrderExecutionResult> {
         if quantity.abs() < MIN_ORDER_SIZE_BTC {
             return Err(PiranaError::ExchangeApi {
                 code: 10001,
@@ -295,10 +332,15 @@ impl BitfinexClient {
             OrderType::FOK => "EXCHANGE FOK",
         };
 
-        let body_str = format!(
+        let mut body_str = format!(
             r#"{{"type":"{}","symbol":"{}","amount":"{:.6}","price":"{:.2}"}}"#,
             type_str, symbol, quantity, price
         );
+
+        if let Some(cid) = cid {
+            body_str.pop();
+            body_str.push_str(&format!(",\"cid\":{cid}}}"));
+        }
 
         debug!("Submitting order: {} {} {} @ {}", side_str(side), quantity, symbol, price);
 
@@ -324,7 +366,7 @@ impl BitfinexClient {
     ///   [6]  = amount (signed, ZBÝVAJÍCÍ po fillu)
     ///   [7]  = amount_orig (signed, původní požadavek)
     ///   [13] = status ("ACTIVE", "CANCELED", "EXECUTED", ...)
-    ///   [16] = price_avg (f64, 0.0 if not filled yet)
+    ///   [16] = order price; [17] = price_avg (f64, 0.0 if not filled yet)
     ///
     /// [CASLAV v5.1 / OPONENTURA FIX — IOC 0-fill]
     /// Dříve: zrušený IOC order (CANCELED, price_avg = 0, amount = amount_orig)
@@ -335,67 +377,45 @@ impl BitfinexClient {
     fn parse_order_execution(text: &str, requested_price: f64, requested_qty: f64) -> OrderExecutionResult {
         let mut exchange_order_id: i64 = 0;
         let mut avg_fill_price: f64 = 0.0;
-        let mut filled_qty: f64 = requested_qty.abs();
-
+        let mut filled_qty: f64 = 0.0;
+        let mut is_terminal = false;
+        let mut price_confirmed = false;
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-            // Navigate to the innermost order array at json[4][0]
-            if let Some(order_arr) = json
-                .get(4)
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_array())
-            {
-                if let Some(id) = order_arr.first().and_then(|v| v.as_i64()) {
-                    exchange_order_id = id;
-                }
-                if let Some(p) = order_arr.get(16).and_then(|v| v.as_f64()) {
-                    avg_fill_price = p;
-                }
-                // Reálný fill: rozlišit tři případy ACK:
-                // 1. price_avg > 0 → fill proběhl okamžitě (market/IOC naplněný);
-                //    amount v ACK často zůstává == amount_orig, ale cena je reálná.
-                // 2. status CANCELED (IOC bez fillu) → filled_qty = 0.
-                // 3. amount < amount_orig → částečný fill, spočítat reálně.
-                let amount_now = order_arr.get(6).and_then(|v| v.as_f64());
-                let amount_orig = order_arr.get(7).and_then(|v| v.as_f64());
-                let status = order_arr.get(13).and_then(|v| v.as_str()).unwrap_or("");
-                if let (Some(now), Some(orig)) = (amount_now, amount_orig) {
-                    let executed = (orig.abs() - now.abs()).max(0.0);
-                    if status == "CANCELED" || status.starts_with("EXECUTED @ 0") {
-                        // Zrušený IOC: NEPROVÁDĚNÉ množství je nula bez ohledu
-                        // na price_avg — Bitfinex tam vrací limit cenu orderu,
-                        // což dřívější podmínka `avg_fill_price <= 0.0` nechytila
-                        // (nález oponentury: ghost pozice z 0-fill orderů).
-                        filled_qty = if executed > 0.0 { executed.min(requested_qty.abs()) } else { 0.0 };
-                        if executed <= 0.0 {
-                            // 0-fill: ani cena není reálná — limit, ne fill.
-                            avg_fill_price = 0.0;
+            // Notification SUCCESS acknowledges an order, not a fill. Only an
+            // actual reduction of its remaining amount establishes quantity.
+            if json.get(6).and_then(|v| v.as_str()) == Some("SUCCESS") {
+                if let Some(order) = json.get(4).and_then(|v| v.get(0)).and_then(|v| v.as_array()) {
+                    exchange_order_id = order.first().and_then(|v| v.as_i64()).filter(|id| *id > 0).unwrap_or(0);
+                    let remaining = order.get(6).and_then(|v| v.as_f64());
+                    let original = order.get(7).and_then(|v| v.as_f64());
+                    if let (Some(remaining), Some(original)) = (remaining, original) {
+                        if exchange_order_id > 0 && remaining.is_finite() && original.is_finite()
+                            && requested_qty.is_finite() && original != 0.0
+                            && (remaining == 0.0 || remaining.signum() == original.signum())
+                            && remaining.abs() <= original.abs()
+                        {
+                            filled_qty = (original.abs() - remaining.abs()).min(requested_qty.abs());
                         }
-                    } else if executed > 0.0 {
-                        // Částečný nebo úplný fill — reálné vyplněné množství.
-                        filled_qty = executed.min(requested_qty.abs());
                     }
-                    // Jinak: ACK před registrací fillu (market order) —
-                    // držíme optimistic odhad, fill dorazí vzápětí.
-                } else if let Some(a) = amount_now {
-                    if a.abs() > 0.0 {
-                        filled_qty = a.abs();
+                    is_terminal = order.get(13).and_then(|v| v.as_str())
+                        .map(|s| s.starts_with("EXECUTED") || s.starts_with("CANCELED")).unwrap_or(false);
+                    price_confirmed = order.get(17).and_then(|v| v.as_f64()).map(|p| p.is_finite() && p>0.0).unwrap_or(false);
+                    if filled_qty > 0.0 {
+                        // Bitfinex order schema: PRICE=16, PRICE_AVG=17.
+                        avg_fill_price = order.get(17).and_then(|v| v.as_f64())
+                            .filter(|p| p.is_finite() && *p > 0.0)
+                            .unwrap_or(requested_price);
                     }
                 }
             }
         }
 
-        // Fallback pro market order ACK, který dorazí před registrací fillu:
-        // nikdy nevracet fill za cenu 0 — ale jen když něco reálně vyplněno bylo.
-        if filled_qty > 0.0 && (!avg_fill_price.is_finite() || avg_fill_price <= 0.0) {
-            avg_fill_price = requested_price;
-        }
-        // 0-fill: avg_fill_price zůstává 0.0 — volající pozná neúspěch.
-
         OrderExecutionResult {
             exchange_order_id,
             avg_fill_price,
             filled_qty,
+            is_terminal,
+            price_confirmed,
             raw: text.to_string(),
         }
     }
@@ -462,8 +482,40 @@ impl BitfinexClient {
         start: i64,
         limit: i32,
     ) -> PiranaResult<Vec<TradeRecord>> {
+        self.trades_hist_request(symbol, start, None, limit, -1).await
+    }
+
+    /// An inclusive timestamp window, ordered ascending for durable history ingestion.
+    pub async fn get_trades_hist_page(
+        &self, symbol: &str, start: i64, end: i64, limit: i32,
+    ) -> PiranaResult<Vec<TradeRecord>> {
+        self.trades_hist_request(symbol, start, Some(end), limit, 1).await
+    }
+
+    fn history_error(message: impl Into<String>) -> PiranaError {
+        PiranaError::ExchangeApi { code: -1, message: message.into() }
+    }
+
+    fn history_body(symbol: &str, start: i64, end: Option<i64>, limit: i32, sort: i32)
+        -> PiranaResult<String>
+    {
+        if !symbol.starts_with('t') || symbol.len() < 2
+            || !symbol.bytes().all(|b| b.is_ascii_alphanumeric() || b == b':')
+            || start < 0 || end.is_some_and(|e| e < start)
+            || !(1..=2500).contains(&limit)
+        {
+            return Err(Self::history_error("Invalid trades history symbol, timestamp window or limit"));
+        }
+        let mut body = serde_json::json!({"start": start, "limit": limit, "sort": sort});
+        if let Some(end) = end { body["end"] = end.into(); }
+        Ok(body.to_string())
+    }
+
+    async fn trades_hist_request(
+        &self, symbol: &str, start: i64, end: Option<i64>, limit: i32, sort: i32,
+    ) -> PiranaResult<Vec<TradeRecord>> {
+        let body = Self::history_body(symbol, start, end, limit, sort)?;
         let endpoint = format!("/api/v2/auth/r/trades/{}/hist", symbol);
-        let body = format!(r#"{{"start":{},"limit":{}}}"#, start, limit);
         let (status, text) = self.post_auth(&endpoint, &body).await?;
         if !status.is_success() {
             return Err(PiranaError::ExchangeApi {
@@ -471,35 +523,57 @@ impl BitfinexClient {
                 message: format!("Trades history failed: {}", text),
             });
         }
+        let records = Self::parse_trades_history(&text, symbol)?;
+        if records.len() > limit as usize || records.iter().any(|r|
+            r.mts < start || end.is_some_and(|e| r.mts > e))
+            || (sort == 1 && records.windows(2).any(|r| r[0].mts > r[1].mts))
+        {
+            return Err(Self::history_error("Trades history response violates requested window, ordering or limit"));
+        }
+        self.rate_limiter.record_success();
+        Ok(records)
+    }
 
-        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            PiranaError::ExchangeApi {
-                code: -1,
-                message: format!("Trades history parse failed: {}", e),
-            }
-        })?;
-
-        let mut records = Vec::new();
-        if let Some(arr) = json.as_array() {
-            for item in arr {
-                if let Some(t) = item.as_array() {
-                    if t.len() >= 12 {
-                        let record = TradeRecord {
-                            mts: t[2].as_i64().unwrap_or(0),
-                            exec_amount: t[4].as_f64().unwrap_or(0.0),
-                            exec_price: t[5].as_f64().unwrap_or(0.0),
-                            order_id: t[3].as_i64().unwrap_or(0),
-                            cid: t[11].as_i64().map(|c| c.to_string()),
-                            fee: t[9].as_f64().unwrap_or(0.0),
-                            fee_currency: t[10].as_str().unwrap_or("").to_string(),
-                        };
-                        records.push(record);
-                    }
+    /// Fail the entire page on malformed data; never silently omit an execution.
+    pub fn parse_trades_history(text: &str, symbol: &str) -> PiranaResult<Vec<TradeRecord>> {
+        let json: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| Self::history_error(format!("Trades history parse failed: {e}")))?;
+        let rows = json.as_array().ok_or_else(|| Self::history_error("Expected trades array"))?;
+        let records: Vec<TradeRecord> = rows.iter().enumerate().map(|(index, row)| {
+            let bad = || Self::history_error(format!("Malformed trades history row {index}"));
+            let t = row.as_array().filter(|t| t.len() >= 12).ok_or_else(bad)?;
+            let positive_id = |i: usize| t[i].as_i64().filter(|id| *id > 0).ok_or_else(bad);
+            let decimal = |i: usize| -> PiranaResult<(String, f64)> {
+                let n = t[i].as_number().ok_or_else(bad)?;
+                let value = n.as_f64().filter(|v| v.is_finite()).ok_or_else(bad)?;
+                Ok((n.to_string(), value))
+            };
+            let (exec_amount_decimal, exec_amount) = decimal(4)?;
+            let (exec_price_decimal, exec_price) = decimal(5)?;
+            let (fee_decimal, fee) = decimal(9)?;
+            if exec_amount == 0.0 || exec_price <= 0.0 { return Err(bad()); }
+            let row_symbol = t[1].as_str().filter(|s| *s == symbol).ok_or_else(bad)?;
+            let fee_currency = t[10].as_str().filter(|s| !s.trim().is_empty()).ok_or_else(bad)?;
+            let cid = if t[11].is_null() { None } else {
+                Some(t[11].as_i64().filter(|id| *id > 0).ok_or_else(bad)?.to_string())
+            };
+            Ok(TradeRecord {
+                trade_id: positive_id(0)?, symbol: row_symbol.to_owned(),
+                mts: t[2].as_i64().filter(|mts| *mts >= 0).ok_or_else(bad)?,
+                order_id: positive_id(3)?, cid, exec_amount, exec_price, fee,
+                exec_amount_decimal, exec_price_decimal, fee_decimal,
+                fee_currency: fee_currency.to_owned(),
+            })
+        }).collect::<PiranaResult<_>>()?;
+        let mut seen = std::collections::HashMap::new();
+        for record in &records {
+            let canonical = record.to_accounting_json();
+            if let Some(previous) = seen.insert((record.trade_id, record.order_id), canonical.clone()) {
+                if previous != canonical {
+                    return Err(Self::history_error("Conflicting duplicate execution identity in history page"));
                 }
             }
         }
-
-        self.rate_limiter.record_success();
         Ok(records)
     }
 
@@ -508,8 +582,8 @@ impl BitfinexClient {
     ///
     /// ## Proč to existuje
     ///
-    /// ACK `on-req` pro okamžitě naplněný IOC vrací v `price_avg` (index 16)
-    /// LIMITNÍ cenu orderu, nikoliv reálnou fill cenu (naměřeno 26. 8. 2026:
+    /// ACK `on-req` contains limit PRICE at index 16 and PRICE_AVG at 17.
+    /// The former parser read the limit as the fill price (26. 8. 2026:
     /// ACK 78 959 vs reálný fill 78 926 — rozdíl přesně roven 5 bps prahu).
     /// Účetnictví postavené na ACK ceně vykazovalo 100 % orderů se „slippage
     /// +39 USD" a falešný win rate 1,9 %.
@@ -527,7 +601,7 @@ impl BitfinexClient {
         &self,
         symbol: &str,
         order_id: i64,
-    ) -> PiranaResult<Option<(f64, f64)>> {
+    ) -> PiranaResult<Option<(f64, f64, f64)>> {
         // Filly orderu musí mít MTS >= odeslání orderu. Bez start parametru
         // by dotaz vracel celou historii; vezmeme posledních 60 s a
         // matchneme přes order_id — což je exaktní klíč.
@@ -554,10 +628,14 @@ impl BitfinexClient {
             }
         }
 
+        let mut total_base_fee = 0.0_f64;
+        let mut seen = std::collections::HashSet::new();
         let mut total_cost = 0.0_f64;
         let mut total_qty = 0.0_f64;
         for t in &trades {
-            if t.order_id == order_id {
+            if t.order_id == order_id && seen.insert(t.trade_id) {
+                if t.fee_currency == "BTC" { total_base_fee += t.fee; }
+                else if t.fee_currency != "USD" && t.fee != 0.0 { return Err(PiranaError::ExchangeApi { code:-1,message:"Unresolved execution fee currency".into() }); }
                 let qty = t.qty();
                 if qty > 0.0 && t.exec_price > 0.0 {
                     total_cost += qty * t.exec_price;
@@ -567,17 +645,18 @@ impl BitfinexClient {
         }
 
         if total_qty <= 0.0 {
-            // Žádný fill tohoto order_id v poslední minutě → potvrzený 0-fill.
+            // No indexed execution found; this does NOT establish a confirmed zero fill.
             Ok(None)
         } else {
-            Ok(Some((total_cost / total_qty, total_qty)))
+            Ok(Some((total_cost / total_qty, total_qty, total_base_fee)))
         }
     }
 
     /// Get active open order IDs for a symbol (for orphan reconciliation)
     pub async fn get_active_orders(&self, symbol: &str) -> PiranaResult<Vec<i64>> {
         let endpoint = format!("/api/v2/auth/r/orders/{}", symbol);
-        let (_status, text) = self.post_auth(&endpoint, "{}").await?;
+        let (status, text) = self.post_auth(&endpoint, "{}").await?;
+        if !status.is_success() { return Err(PiranaError::ExchangeApi { code:status.as_u16() as i32,message:"Active orders request failed".into() }); }
         let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             PiranaError::ExchangeApi {
                 code: -1,
@@ -585,17 +664,12 @@ impl BitfinexClient {
             }
         })?;
 
+        let arr = json.as_array().ok_or_else(|| PiranaError::ExchangeApi { code:-1,message:"Invalid active orders response".into() })?;
         let mut order_ids = Vec::new();
-        if let Some(arr) = json.as_array() {
-            for item in arr {
-                if let Some(order_arr) = item.as_array() {
-                    if let Some(id_val) = order_arr.first() {
-                        if let Some(id) = id_val.as_i64() {
-                            order_ids.push(id);
-                        }
-                    }
-                }
-            }
+        for item in arr {
+            let id = item.as_array().and_then(|a| a.first()).and_then(|v| v.as_i64()).filter(|v| *v>0)
+                .ok_or_else(|| PiranaError::ExchangeApi { code:-1,message:"Invalid active order ID".into() })?;
+            order_ids.push(id);
         }
 
         Ok(order_ids)
@@ -634,7 +708,6 @@ mod tests {
         // v pořadí DORUČENÍ na server musí být striktně rostoucí —
         // přesně co Bitfinex vyžaduje. Bez submit_mutex by dvě úlohy
         // vydaly nonce A<B, ale doručily B dřív → 10114 "nonce: small".
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -707,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_parse_order_execution_extracts_avg_price() {
-        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,-0.000052,-0.000052,"EXCHANGE MARKET",null,null,null,0,"ACTIVE",null,null,76285,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{"source":"api"}]],null,"SUCCESS","Submitting 1 orders."]"#;
+        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,0,-0.000052,"EXCHANGE MARKET",null,null,null,0,"EXECUTED",null,null,76288,76285,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{"source":"api"}]],null,"SUCCESS","Submitting 1 orders."]"#;
         let r = BitfinexClient::parse_order_execution(sample, 76288.0, -0.000052);
         assert_eq!(r.exchange_order_id, 242489181632);
         assert!((r.avg_fill_price - 76285.0).abs() < 1e-9);
@@ -715,23 +788,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_order_execution_fallback_on_zero_price() {
-        // ACK received before fill registration: price_avg == 0 -> fallback to requested price
+    fn test_parse_order_execution_active_is_not_a_fill() {
+        // An ACTIVE order with unchanged remaining amount has no confirmed fill.
         let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,-0.000052,-0.000052,"EXCHANGE MARKET",null,null,null,0,"ACTIVE",null,null,0,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
         let r = BitfinexClient::parse_order_execution(sample, 76288.0, -0.000052);
-        assert_eq!(r.avg_fill_price, 76288.0);
+        assert_eq!(r.avg_fill_price, 0.0);
+        assert_eq!(r.filled_qty, 0.0);
     }
 
     /// [CASLAV v5.1 / OPONENTURA REGRESNÍ TEST 2] CANCELED IOC s NEGENULOVÝM
-    /// price_avg (Bitfinex tam vrací limit cenu orderu!): dřívější podmínka
-    /// `avg_fill_price <= 0.0` tuto variantu nechytila a 0-fill order prošel
+    /// PRICE (index 16, limit price): dřívější podmínka
+    /// reading PRICE as average allowed a 0-fill order to pass
     /// jako 100% fill → ghost pozice.
     #[test]
     fn test_parse_order_execution_canceled_with_limit_price() {
-        // status CANCELED, price_avg = 78959 (LIMIT cena, ne fill!), amount == amount_orig.
+        // status CANCELED, PRICE = 78959, PRICE_AVG = 0, amount == amount_orig.
         let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,0.000052,0.000052,"EXCHANGE IOC",null,null,null,0,"CANCELED",null,null,78959,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
         let r = BitfinexClient::parse_order_execution(sample, 78920.0, 0.000052);
-        assert_eq!(r.filled_qty, 0.0, "CANCELED s limit price_avg musí být 0-fill, ne 100% fill");
+        assert_eq!(r.filled_qty, 0.0, "CANCELED s limit PRICE musí být 0-fill, ne 100% fill");
         assert_eq!(r.avg_fill_price, 0.0, "limit cena není fill cena — musí být vynulovaná");
     }
 
@@ -750,17 +824,33 @@ mod tests {
     #[test]
     fn test_parse_order_execution_partial_fill() {
         // amount = 0.000020 (zbývá), amount_orig = 0.000052 → vyplněno 0.000032.
-        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,0.000020,0.000052,"EXCHANGE IOC",null,null,null,0,"CANCELED",null,null,76280,0,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
+        let sample = r#"[1787467505,"on-req",null,null,[[242489181632,null,1787467505671,"tBTCUSD",1787467505671,1787467505671,0.000020,0.000052,"EXCHANGE IOC",null,null,null,0,"CANCELED",null,null,76288,76280,0,0,null,null,null,0,0,null,null,null,"API>BFX",null,null,{}]],null,"SUCCESS","Submitting 1 orders."]"#;
         let r = BitfinexClient::parse_order_execution(sample, 76288.0, 0.000052);
         assert!((r.filled_qty - 0.000032).abs() < 1e-12, "filled = {}", r.filled_qty);
         assert!((r.avg_fill_price - 76_280.0).abs() < 1e-9);
     }
 
     #[test]
-    fn test_parse_order_execution_garbage_falls_back() {
+    fn test_parse_order_execution_partial_sell_uses_average_and_remaining() {
+        let mut order = serde_json::json!([123,null,null,"tBTCUSD",0,0,-0.002,-0.005,
+            "EXCHANGE IOC",null,null,null,0,"CANCELED",null,null,100,98.5]);
+        let notification = |order: serde_json::Value, status: &str|
+            serde_json::json!([0,"on-req",null,null,[order],null,status,""]).to_string();
+        let r = BitfinexClient::parse_order_execution(&notification(order.clone(), "SUCCESS"), 100.0, -0.005);
+        assert!((r.filled_qty - 0.003).abs() < 1e-15);
+        assert_eq!(r.avg_fill_price, 98.5);
+        let failed = BitfinexClient::parse_order_execution(&notification(order.clone(), "ERROR"), 100.0, -0.005);
+        assert_eq!(failed.filled_qty, 0.0);
+        order[6] = serde_json::json!(0.002); // impossible sign reversal
+        let malformed = BitfinexClient::parse_order_execution(&notification(order, "SUCCESS"), 100.0, -0.005);
+        assert_eq!(malformed.filled_qty, 0.0);
+    }
+
+    #[test]
+    fn test_parse_order_execution_garbage_never_manufactures_fill() {
         let r = BitfinexClient::parse_order_execution("not json", 76288.0, 0.001);
-        assert_eq!(r.avg_fill_price, 76288.0);
-        assert_eq!(r.filled_qty, 0.001);
+        assert_eq!(r.avg_fill_price, 0.0);
+        assert_eq!(r.filled_qty, 0.0);
         assert_eq!(r.exchange_order_id, 0);
     }
 }
@@ -837,5 +927,148 @@ mod nonce_tests {
             diff < 5_000_000,
             "nonce {n} je {diff} us od aktualniho casu {now}"
         );
+    }
+}
+
+#[cfg(test)]
+mod accounting_history_tests {
+    use super::*;
+    const ROW: &str = r#"[123,"tBTCUSD",1700000000123,456,0.000123456789012345678901,12345.67890123456789,"EXCHANGE LIMIT",0,1,-0.0000001234567890123456789,"BTC",null]"#;
+
+    #[test]
+    fn exact_decimals_and_accounting_schema() {
+        let records = BitfinexClient::parse_trades_history(&format!("[{ROW}]"), "tBTCUSD").unwrap();
+        let value = records[0].to_accounting_json();
+        assert_eq!(value["exec_amount"], "0.000123456789012345678901");
+        assert_eq!(value["exec_price"], "12345.67890123456789");
+        assert_eq!(value["fee"], "-0.0000001234567890123456789");
+        assert_eq!(value["trade_id"], 123);
+        assert_eq!(value["order_id"], 456);
+        assert_eq!(value["symbol"], "tBTCUSD");
+        assert!(value["cid"].is_null());
+        assert_eq!(value.as_object().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn rejects_malformed_fields_and_keeps_unknown_currency() {
+        let original: serde_json::Value = serde_json::from_str(ROW).unwrap();
+        for (index, value) in [(0, serde_json::json!(0)), (0, serde_json::json!(-1)),
+            (0, serde_json::json!(1.5)), (3, serde_json::json!(null)),
+            (9, serde_json::json!(null)), (9, serde_json::json!("0")),
+            (5, serde_json::json!(0)), (4, serde_json::json!(0)),
+            (2, serde_json::json!(-1)), (1, serde_json::json!("tETHUSD"))]
+        {
+            let mut row = original.clone(); row[index] = value;
+            assert!(BitfinexClient::parse_trades_history(&format!("[{row}]"), "tBTCUSD").is_err());
+        }
+        for text in ["{}", "[null]", "[[1,2]]", "[\"error\",10000,\"bad\"]"] {
+            assert!(BitfinexClient::parse_trades_history(text, "tBTCUSD").is_err());
+        }
+        let text = format!("[{}]", ROW.replace("\"BTC\"", "\"UNKNOWN\""));
+        assert_eq!(BitfinexClient::parse_trades_history(&text, "tBTCUSD").unwrap()[0].fee_currency, "UNKNOWN");
+    }
+
+    #[test]
+    fn distinct_trade_ids_same_order_and_duplicate_evidence_are_preserved() {
+        let second = ROW.replacen("123,", "124,", 1);
+        let rows = BitfinexClient::parse_trades_history(&format!("[{ROW},{second},{ROW}]"), "tBTCUSD").unwrap();
+        assert_eq!(rows.iter().map(|r| r.trade_id).collect::<Vec<_>>(), vec![123,124,123]);
+        assert!(rows.iter().all(|r| r.order_id == 456));
+        let conflicting = ROW.replace("12345.67890123456789", "23456.789");
+        assert!(BitfinexClient::parse_trades_history(&format!("[{ROW},{conflicting}]"), "tBTCUSD").is_err());
+    }
+
+    #[test]
+    fn same_match_id_preserves_both_account_order_legs() {
+        let second = ROW.replacen(",456,", ",457,", 1).replacen("0.000123456789012345", "-0.000123456789012345", 1);
+        let records = BitfinexClient::parse_trades_history(&format!("[{ROW},{second},{ROW}]"), "tBTCUSD").unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].trade_id, records[1].trade_id);
+        assert_ne!(records[0].order_id, records[1].order_id);
+        assert!(records[0].exec_amount > 0.0 && records[1].exec_amount < 0.0);
+        let conflict = ROW.replace("12345.67890123456789", "23456.789");
+        assert!(BitfinexClient::parse_trades_history(&format!("[{ROW},{conflict}]"), "tBTCUSD").is_err());
+    }
+
+    #[test]
+    fn validates_inclusive_window_and_limit() {
+        for (start,end,limit) in [(-1,1,1),(2,1,1),(0,1,0),(0,1,2501)] {
+            assert!(BitfinexClient::history_body("tBTCUSD",start,Some(end),limit,1).is_err());
+        }
+        let body: serde_json::Value = serde_json::from_str(&BitfinexClient::history_body("tBTCUSD",1,Some(1),2500,1).unwrap()).unwrap();
+        assert_eq!(body,serde_json::json!({"start":1,"end":1,"limit":2500,"sort":1}));
+        assert!(BitfinexClient::history_body("tBTCUSD/other",0,Some(1),1,1).is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_cid_bounds_and_submission() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = BitfinexClient::new_for_test(format!("http://{address}"), "test".into(), "test".into(), None);
+        for cid in [-1, 0, 1_i64 << 45, i64::MAX] {
+            assert!(client.submit_order_with_cid("tBTCUSD", Side::Buy, OrderType::IOC, 0.001, 100.0, cid).await.is_err());
+        }
+        let server = tokio::spawn(async move {
+            for cid in [1, (1_i64 << 45) - 1] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0;4096];
+                let request = loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0); bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]);
+                        let len: usize = headers.lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+                        if bytes.len() >= pos+4+len { break String::from_utf8(bytes).unwrap(); }
+                    }
+                };
+                assert!(request.starts_with("POST /v2/auth/w/order/submit "));
+                let body: serde_json::Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                assert_eq!(body["cid"], cid);
+                assert_eq!(body["amount"], "0.001000");
+                assert_eq!(body["type"], "EXCHANGE IOC");
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").await.unwrap();
+            }
+        });
+        for cid in [1, (1_i64 << 45) - 1] {
+            client.submit_order_with_cid("tBTCUSD", Side::Buy, OrderType::IOC, 0.001, 100.0, cid).await.unwrap();
+            let row = ROW.replace("null]", &format!("{cid}]"));
+            let records = BitfinexClient::parse_trades_history(&format!("[{row}]"), "tBTCUSD").unwrap();
+            assert_eq!(records[0].cid, Some(cid.to_string()));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_page_posts_ascending_inclusive_request_to_local_mock() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0;4096];
+            loop {
+                let n = socket.read(&mut buffer).unwrap();
+                assert!(n > 0); bytes.extend_from_slice(&buffer[..n]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..pos]);
+                    let len: usize = headers.lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+                    if bytes.len() >= pos+4+len { break; }
+                }
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            assert!(request.starts_with("POST /v2/auth/r/trades/tBTCUSD/hist "));
+            let body: serde_json::Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body, serde_json::json!({"start":1700000000123i64,"end":1700000000123i64,"limit":1,"sort":1}));
+            let body = format!("[{ROW}]");
+            write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let client = BitfinexClient::new_for_test(format!("http://{address}"), "test".into(), "test".into(), None);
+        let rows = client.get_trades_hist_page("tBTCUSD",1700000000123,1700000000123,1).await.unwrap();
+        assert_eq!(rows[0].trade_id,123);
+        server.join().unwrap();
     }
 }
