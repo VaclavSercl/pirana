@@ -533,8 +533,8 @@ def test_new_period_zero_preserves_unknown_history():
     text = format_text_report(dict(accounting=result, snapshot_source='fixture'))
     assert 'Nové období od ' in text and '+02:00 Europe/Prague' in text
     assert 'Celá pokrytá historie' in text
-    assert 'Čistý realizovaný PnL: 0 USD' in text
-    assert 'Čistý realizovaný PnL: NEOVĚŘENO' in text
+    assert 'čistý PnL 0 USD' in text
+    assert 'Celá pokrytá historie: NEOVĚŘENO' in text
 
 
 @pytest.mark.parametrize('field,bad', [
