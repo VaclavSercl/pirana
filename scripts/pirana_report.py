@@ -1044,6 +1044,8 @@ def format_text_report(data) -> str:
              "Rozsah: všechny obchody účtu Bitfinex BTC/USD (nikoli pouze Pirana)",
              "Režim podle bota: " + str(runtime.get("system_mode", "NEOVĚŘENO"))[:40]
              + "; Active samo nepotvrzuje uskutečněný obchod."]
+    if runtime.get("execution_block_reason"):
+        lines.append("Blokace obchodování: " + str(runtime["execution_block_reason"])[:180])
     periods = []
     active = a.get("active_period")
     if active:

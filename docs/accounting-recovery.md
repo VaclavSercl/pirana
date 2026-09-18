@@ -167,3 +167,26 @@ confirmation. Nonzero or malformed rates revoke permission. This is a supported
 fee-policy constraint, not an invented maximum fee: the exchange must honor its
 reported rates. Nonzero-fee trading is unsupported until a fee-inclusive inventory
 reservation design is implemented; historical actual fees remain fully accounted.
+
+## Obnova potvrzení objednávek za běhu
+
+ACK `ACTIVE` s nulovým dosud vyplněným množstvím není konečný výsledek.
+Exekutor ověří konečný stav objednávky a kompletní součet jednotlivých plnění;
+částečně naplněná zrušená IOC objednávka zachová skutečné plnění. Identita CID,
+ID objednávky, směr, původní množství a přesný součet se musejí shodovat.
+Při nejistotě se další objednávky zablokují a obnova se opakuje za běhu.
+Odblokování vyžaduje kompletní účetnictví, shodu peněženky, žádné aktivní
+objednávky a atomický zápis obnovených pozic. Dvousekundové zpoždění ingestu
+se neobchází; obnova počká na další synchronizaci.
+
+`positions.json` navíc uchovává přiřazení výstupů k pozicím, skutečně požadované
+množství výstupu, čas a množinu dokončených CID. Dokončené výstupy se nesmějí
+vymazat: brání opětovnému vytvoření již prodaného inventáře při restartu.
+Dashboard i Telegram uvádějí `execution_block_reason` a při blokaci stav Halted.
+Zbytek pod minimem burzy zůstává evidovaný; neposílá se neplatná objednávka.
+Neidentifikovaný inventář se neprodává přes uměle vytvořenou pořizovací cenu.
+
+Před nasazením zálohovat konzistentní stav při zastavené službě. Starší binárka
+nemusí přijmout nová metadata positions.json. Po nových plněních nevracet starou
+účetní databázi ani starý stav pozic; tím by se ztratila historie. Případnou
+obnovu starší verze provést až po nezávislé rekonciliaci aktuálních plnění.

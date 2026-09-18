@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 pub struct DashboardState {
     /// Current system mode
     pub system_mode: Arc<parking_lot::RwLock<SystemMode>>,
+    pub execution_block_reason: Arc<parking_lot::RwLock<Option<String>>>,
     /// Current BTC price
     pub btc_price: Arc<parking_lot::RwLock<f64>>,
     /// Account balance in BTC
@@ -241,6 +242,7 @@ pub struct CalibrationView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
     pub system_mode: String,
+    pub execution_block_reason: Option<String>,
     pub btc_price: f64,
     pub btc_balance: f64,
     pub usd_balance: f64,
@@ -304,6 +306,7 @@ impl DashboardState {
     pub fn new() -> Self {
         Self {
             system_mode: Arc::new(parking_lot::RwLock::new(SystemMode::Initializing)),
+            execution_block_reason: Arc::new(parking_lot::RwLock::new(Some("startup recovery".into()))),
             btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
             btc_balance: Arc::new(parking_lot::RwLock::new(0.0)),
             usd_balance: Arc::new(parking_lot::RwLock::new(0.0)),
@@ -367,9 +370,11 @@ impl DashboardState {
     /// Build a full snapshot for sending to dashboard clients
     pub fn snapshot(&self) -> DashboardSnapshot {
         let uptime = (Utc::now() - self.start_time).num_seconds().max(0) as u64;
+        let execution_block_reason = self.execution_block_reason.read().clone();
 
         DashboardSnapshot {
-            system_mode: format!("{:?}", *self.system_mode.read()),
+            system_mode: if execution_block_reason.is_some() { "Halted".into() } else { format!("{:?}", *self.system_mode.read()) },
+            execution_block_reason,
             btc_price: *self.btc_price.read(),
             btc_balance: *self.btc_balance.read(),
             usd_balance: *self.usd_balance.read(),
@@ -463,5 +468,23 @@ impl DashboardState {
         if history.len() > 500 {
             history.remove(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_status_tests {
+    use super::*;
+    #[test]
+    fn execution_block_cannot_be_hidden_by_active_risk_mode() {
+        let state = DashboardState::new();
+        *state.system_mode.write() = SystemMode::Active;
+        *state.execution_block_reason.write() = Some("unconfirmed order".into());
+        let blocked = state.snapshot();
+        assert_eq!(blocked.system_mode, "Halted");
+        assert_eq!(blocked.execution_block_reason.as_deref(), Some("unconfirmed order"));
+        *state.execution_block_reason.write() = None;
+        assert_eq!(state.snapshot().system_mode, "Active");
+        *state.system_mode.write() = SystemMode::Halted;
+        assert_eq!(state.snapshot().system_mode, "Halted");
     }
 }

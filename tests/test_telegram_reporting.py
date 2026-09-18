@@ -228,3 +228,10 @@ def test_failure_does_not_publish_subprocess_stderr():
     messages = run_handler(1, 'private traceback')
     assert len(messages) == 1
     assert 'private' not in messages[0]
+
+
+def test_execution_block_is_reported_and_html_escaped():
+    data = fixture()
+    data['runtime'] = dict(system_mode='Halted', execution_block_reason='<unconfirmed order>')
+    assert 'Blokace obchodování: <unconfirmed order>' in report.format_text_report(data)
+    assert '&lt;unconfirmed order&gt;' in report.format_telegram_html(data)
