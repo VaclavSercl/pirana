@@ -26,6 +26,7 @@ WORKDIR /app
 COPY --from=builder /build/target/release/pirana /app/pirana
 COPY --from=builder /build/strategy.toml /app/strategy.toml
 COPY --from=builder /build/scripts/pirana_accounting.py /app/scripts/pirana_accounting.py
+COPY --from=builder /build/crates/pirana-dashboard/static /app/crates/pirana-dashboard/static
 
 USER pirana
 EXPOSE 8080 9100
