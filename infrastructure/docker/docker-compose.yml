@@ -1,9 +1,4 @@
-# PIRANA — Docker Compose Configuration
-
-version: "3.9"
-
 services:
-  # Main trading engine
   pirana-engine:
     build:
       context: ../..
@@ -11,17 +6,24 @@ services:
     container_name: pirana-engine
     restart: unless-stopped
     environment:
-      - BITFINEX_API_KEY=${BITFINEX_API_KEY}
-      - BITFINEX_API_SECRET=${BITFINEX_API_SECRET}
-      - PIRANA_ENV=production
-      - LOG_LEVEL=info
-      - METRICS_PORT=9090
-      - HEALTH_CHECK_PORT=8080
+      BITFINEX_API_KEY: ${BITFINEX_API_KEY:?BITFINEX_API_KEY is required}
+      BITFINEX_API_SECRET: ${BITFINEX_API_SECRET:?BITFINEX_API_SECRET is required}
+      PIRANA_ENV: production
+      LOG_LEVEL: info
+      HEALTH_CHECK_PORT: "8080"
+      PIRANA_RUST_METRICS_PORT: "9100"
+      PIRANA_DASHBOARD_BIND: "0.0.0.0"
+      PIRANA_METRICS_BIND: "0.0.0.0"
+      PIRANA_ACCOUNTING_DB: /var/lib/pirana/accounting.sqlite3
+      PIRANA_ACCOUNTING_SNAPSHOT_PATH: /var/lib/pirana/accounting_snapshot.json
+      PIRANA_POSITION_SNAPSHOT_PATH: /var/lib/pirana/positions.json
+      CASLAV_RISK_STATE_PATH: /opt/caslav/risk/risk_state.json
     ports:
-      - "9090:9090"  # Prometheus metrics
-      - "8080:8080"  # Health check
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9100:9100"
     volumes:
-      - pirana-data:/data
+      - pirana-data:/var/lib/pirana
+      - pirana-risk:/opt/caslav/risk
     networks:
       - pirana-net
     deploy:
@@ -38,51 +40,36 @@ services:
     tmpfs:
       - /tmp
 
-  # Prometheus metrics collection
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.5.0
     container_name: pirana-prometheus
     restart: unless-stopped
     volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     networks:
       - pirana-net
 
-  # Grafana dashboards
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:12.1.1
     container_name: pirana-grafana
     restart: unless-stopped
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-pirana}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD is required}
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
     ports:
-      - "3000:3000"
-    networks:
-      - pirana-net
-
-  # Loki log aggregation
-  loki:
-    image: grafana/loki:latest
-    container_name: pirana-loki
-    restart: unless-stopped
-    volumes:
-      - loki-data:/loki
-    ports:
-      - "3100:3100"
+      - "127.0.0.1:3000:3000"
     networks:
       - pirana-net
 
 volumes:
   pirana-data:
+  pirana-risk:
   prometheus-data:
   grafana-data:
-  loki-data:
 
 networks:
   pirana-net:
