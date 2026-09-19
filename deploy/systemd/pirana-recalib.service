@@ -1,0 +1,17 @@
+[Unit]
+Description=Pirana daily calibration audit report
+After=network-online.target pirana.service
+Wants=network-online.target
+OnFailure=notify-telegram-failure@%n.service
+
+[Service]
+Type=oneshot
+User=wwwenda
+Group=wwwenda
+WorkingDirectory=/home/wwwenda/workspace/pirana
+EnvironmentFile=/home/wwwenda/workspace/pirana/.env
+ExecStart=/usr/bin/python3 /home/wwwenda/workspace/pirana/scripts/send_recalibration_report.py
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+UMask=0077

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Pirana daily audit at 07:00 local time
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+AccuracySec=1min
+Unit=pirana-daily-check.service
+
+[Install]
+WantedBy=timers.target

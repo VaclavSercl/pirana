@@ -29,6 +29,21 @@ Back up canonical accounting through the SQLite backup helper in
 `docs/accounting-recovery.md`, and preserve `positions.json`. Never replace a
 newer accounting DB with an older copy after new exchange executions.
 
+## Tracked systemd schedules
+
+The repository now contains the base units required by the existing resource
+drop-ins. Canonical schedules that are explicitly documented in source/history:
+
+- `pirana-recalib.timer`: daily 06:00 local time
+- `pirana-daily-check.timer`: daily 07:00 local time
+- `pirana-weekly-audit.timer`: Monday 06:00 local time
+- `pirana-monthly-proposal.timer`: first day of month 10:00 local time
+- `pirana-yearly-report.timer`: January 1 at 09:00 local time
+
+`pirana-monthly-report.service` is tracked, but no timer is invented here:
+the repository does not establish its historical clock time. Capture/verify the
+live host timer before codifying or replacing it.
+
 ## Post-deploy gates
 
 ```sh
