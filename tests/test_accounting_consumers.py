@@ -29,7 +29,7 @@ def test_exporter_verified_zero_is_zero():
 
 
 def test_scheduled_unknown():
-    with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test"}):
+    with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test", "TELEGRAM_CHAT_ID": "123"}):
         module = importlib.import_module("scripts.send_scheduled_report")
     with patch.object(module, "generate_report_data", return_value=unavailable()):
         text = module.build_report()

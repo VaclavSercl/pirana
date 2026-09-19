@@ -155,7 +155,7 @@ def test_safe_config_guard_never_rolls_back_or_restarts_automatically():
     auto = script.split("auto-guard)", 1)[1].split(";;", 1)[0]
     assert "rollback" not in auto
     assert "systemctl restart" not in auto
-    assert "127.0.0.1:8080/api/snapshot" in auto
+    assert 'SNAPSHOT_URL="http://127.0.0.1:8080/api/snapshot"' in script
     manual = script.split("rollback)", 1)[1].split(";;", 1)[0]
     assert "strategy_versioning.py" not in manual or "VERSIONER" in manual
     assert "systemctl restart" not in manual
