@@ -44,6 +44,28 @@ A restart is not proof of reconciliation. Do not declare recovery successful
 while canonical accounting is incomplete, an execution block remains, or the
 runtime is unexpectedly Halted.
 
+## Least-privilege control plane
+
+Automated components (Hermes daily audit, Caslav doctor, Telegram control bot)
+must never receive blanket passwordless sudo. The repository contains
+`deploy/sudoers/pirana-ops`, which permits only:
+
+- `systemctl start pirana.service`
+- `systemctl stop pirana.service`
+- `systemctl restart pirana.service`
+
+Validate and install it explicitly on the host:
+
+```sh
+sudo visudo -cf deploy/sudoers/pirana-ops
+sudo install -m 0440 deploy/sudoers/pirana-ops /etc/sudoers.d/pirana-ops
+```
+
+All unattended callers use `sudo -n` so a missing/incorrect sudo rule fails
+immediately instead of hanging on a password prompt. Installing this file does
+not remove any older broad sudo rules; audit `/etc/sudoers` and
+`/etc/sudoers.d/` separately on the live host.
+
 ## Network and secrets
 
 Dashboard/API, Rust metrics and the Python exporter bind to loopback by default.

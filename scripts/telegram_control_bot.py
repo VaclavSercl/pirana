@@ -131,7 +131,7 @@ def handle_scale(chat_id, args):
             check=True,
         )
         # Restart pirana to apply immediately
-        subprocess.run(["sudo", "systemctl", "restart", "pirana.service"], check=True)
+        subprocess.run(["sudo", "-n", "systemctl", "restart", "pirana.service"], check=True)
 
         send_telegram(chat_id, f"✅ <b>Velikost pozice úspěšně upravena:</b>\n• <code>position_size_pct</code> nastaven na <b>{val:.1f} %</b>.\n• Konfigurace uložena a verzována v Gitu.\n• Služba <code>pirana.service</code> restartována.")
     except Exception as e:
@@ -140,7 +140,7 @@ def handle_scale(chat_id, args):
 def handle_pause(chat_id):
     """Handles /pause command."""
     try:
-        subprocess.run(["sudo", "systemctl", "stop", "pirana.service"], check=True)
+        subprocess.run(["sudo", "-n", "systemctl", "stop", "pirana.service"], check=True)
         send_telegram(chat_id, "⏸️ <b>Trading pozastaven.</b>\nSlužba <code>pirana.service</code> byla bezpečně zastavena.")
     except Exception as e:
         send_telegram(chat_id, f"❌ <b>Chyba při zastavení:</b> <code>{e}</code>")

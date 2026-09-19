@@ -169,7 +169,7 @@ Real-time web dashboard with:
 ## SECURITY
 
 - Exchange keys: withdrawals DISABLED, IP whitelisting, periodic rotation
-- Hermes must not receive secret-reading OS permissions. Repository structure alone is not a security boundary.
+- Hermes must not receive secret-reading OS permissions or blanket sudo. Automated control-plane actions are limited to non-interactive start/stop/restart of `pirana.service` by the tracked sudoers policy.
 - API secrets use `zeroize` for memory safety
 - `#[serde(skip_serializing)]` prevents key leakage in logs
 - Containers are configured read-only where practical; host-level isolation and log retention must be verified operationally.
