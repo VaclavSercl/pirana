@@ -5,3 +5,4 @@ pub mod dynamic_sizing;
 pub mod cross_exchange;
 pub mod hawkes;
 pub mod vpin;
+pub mod flow;

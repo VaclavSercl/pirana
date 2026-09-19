@@ -458,7 +458,6 @@ impl RiskEngine {
     /// (každých 15 min). Všechna zábradlí řeší `AdaptiveBaseline::update`;
     /// tady jen dodáme runtime kontext (defensive režim, P(ruin), podlahy).
     fn update_adaptive_baseline(&self, stats: &TradingStats, equity_usd: f64, price_usd: f64) {
-        use crate::adaptive_baseline::AdaptiveBaseline;
 
         let current = self.calibrated.read().clone();
         let baseline = match &current.adaptive_baseline {

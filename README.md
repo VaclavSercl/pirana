@@ -81,10 +81,10 @@ The threshold is **configurable** via `strategy.toml` and is properly passed to 
 
 ### Order Execution
 
-- **LIMIT orders** (EXCHANGE LIMIT) — qualifies for **maker fee** (0.10% on Bitfinex Tier 0)
-- Orders are submitted asynchronously via `tokio::spawn` for non-blocking execution
-- Position tracking, balance updates, and risk engine updates happen **synchronously before** the async order submission to prevent race conditions
-- Rollback logic on order failure: position, balance, and exposure are reverted
+- Live BUY/SELL execution uses **EXCHANGE IOC** with a slippage-bounded limit price.
+- An ACK is not treated as a fill; terminal order state plus authenticated trade history are reconciled before accounting the execution.
+- Entry/exit intents are persisted by CID so restart recovery can distinguish pending, partial and completed executions.
+- Uncertain execution outcomes fail closed and block further orders pending reconciliation.
 
 ### Position Management
 
@@ -96,8 +96,8 @@ The threshold is **configurable** via `strategy.toml` and is properly passed to 
 ### Risk Management
 
 > ⚠️ Konkrétní čísla NEUVÁDĚT zde — jediným zdrojem pravdy je
-> `crates/pirana-core/src/constants.rs` (hard stropy) a po zapojení
-> samokalibrace `/opt/caslav/risk/risk_state.toml` (odvozené hodnoty).
+> `crates/pirana-core/src/constants.rs` (hard stropy) a
+> `/opt/caslav/risk/risk_state.json` (persistované odvozené hodnoty).
 > Duplikace limitů v dokumentaci = TRUTH_DIVERGENCE (viz master prompt §8.4).
 
 - Maximum Aggregate Exposure: viz `MAX_AGGREGATE_EXPOSURE` v constants.rs
@@ -121,22 +121,13 @@ If 5 consecutive losses occur, abnormal volatility appears, exchange instability
 
 ### strategy.toml
 
-```toml
-[strategy]
-take_profit_distance_usd = 15.0      # TP distance from entry
-stop_loss_distance_usd = 25.0        # SL distance from entry
-ofi_trigger_threshold = 0.85         # OFI threshold (higher = fewer trades)
-ofi_window_size = 100                # Rolling window for OFI calculation
-trade_cooldown_ms = 10000            # Min time between trades (10s)
-min_confidence_score = 0.95          # Minimum signal confidence
+The tracked `strategy.toml` is the active configuration contract. Do not copy
+historical numeric examples from this README into production: runtime validation,
+hard caps and the persisted calibrated risk state are the authoritative sources.
 
-[risk_management]
-position_size_pct = 2.0              # % of portfolio per trade
-daily_loss_limit_usd = 1000.0
-max_slippage_bps = 5
-```
-
-The `strategy.toml` is **hot-reloadable** — changes take effect within `reload_interval_seconds` without restart.
+The file is **hot-reloadable**. Invalid reloads are rejected and the
+last-known-good configuration stays active; invalid/missing strategy at process
+startup fails closed.
 
 ### Environment Variables (.env)
 
@@ -170,18 +161,20 @@ Real-time web dashboard with:
 | API Snapshot | `http://localhost:8080/api/snapshot` |
 | WebSocket | `ws://localhost:8080/ws` |
 | Health Check | `http://localhost:8080/api/health` |
-| Prometheus Metrics | `http://localhost:9091/metrics` |
+| Rust Metrics | `http://localhost:9100/metrics` |
+| Accounting Exporter | `http://localhost:9091/metrics` |
 
 ---
 
 ## SECURITY
 
 - Exchange keys: withdrawals DISABLED, IP whitelisting, periodic rotation
-- Keys remain inaccessible to Hermes
+- Production Bitfinex keys are delivered to `pirana.service` through unit-private systemd credentials, not the project `.env`. The Hermes daily-audit unit does not load those credentials, blocks access to the legacy `.env`, and receives only a sanitized child environment.
+- Hermes must not receive blanket sudo. Automated control-plane actions are limited to non-interactive start/stop/restart of `pirana.service` by the tracked sudoers policy.
 - API secrets use `zeroize` for memory safety
 - `#[serde(skip_serializing)]` prevents key leakage in logs
-- Isolated infrastructure, immutable logs, read-only containers
-- Outbound firewall restrictions
+- Containers are configured read-only where practical; host-level isolation and log retention must be verified operationally.
+- Firewall / reverse-proxy restrictions are deployment controls, not assumptions made by the application.
 
 ---
 
@@ -192,7 +185,7 @@ Real-time web dashboard with:
 ```bash
 # Build
 cd /home/wwwenda/workspace/pirana
-cargo build --release
+cargo build --locked --release
 
 # Services (auto-start on boot, auto-restart on crash)
 sudo systemctl restart pirana.service
@@ -241,10 +234,9 @@ pirana/
 │   └── pirana-telemetry/               # Prometheus metrics, tracing
 ├── ai-orchestration/                   # Hermes AI layer
 │   ├── prompts/                        # System prompts
-│   ├── skills/                         # Hermes skills
 │   └── config/                         # AI configuration
 ├── infrastructure/
-│   ├── docker/                         # Docker Compose (engine, prometheus, grafana, loki)
+│   ├── docker/                         # Docker Compose (engine, Prometheus, Grafana)
 │   └── monitoring/                     # Prometheus config
 ├── strategy.toml                       # Active strategy configuration
 ├── pirana_exporter.py                  # Prometheus exporter
@@ -256,10 +248,11 @@ pirana/
 
 ## MONITORING
 
-- **Prometheus**: metrics collection (port 9091)
-- **Grafana**: dashboards (port 3000)
-- **Loki**: log aggregation (port 3100)
-- **Nginx**: reverse proxy on port 80
+- **Rust Prometheus endpoint**: port 9100 (loopback by default)
+- **Accounting exporter**: port 9091 (loopback by default)
+- **Prometheus**: container UI/listener exposed on loopback host port 9090 in Docker Compose
+- **Grafana**: exposed on loopback host port 3000 in Docker Compose
+- Reverse proxy/firewall exposure is an operator responsibility and must be verified on the live host.
 
 ---
 
@@ -270,7 +263,7 @@ pirana/
 - **OFI threshold fix**: `ofi_trigger_threshold` from `strategy.toml` is now properly passed to `OfiCalculator` instead of using hardcoded `OFI_THRESHOLD = 0.6` constant
 - **Position tracking fix**: BUY positions, balance updates, and exposure updates now happen **synchronously before** `tokio::spawn` to eliminate race conditions where SELL arrived before BUY was registered
 - **Naked short prevention**: SELL orders are **skipped** if no open BUY position exists, instead of executing and logging a warning
-- **Order type**: aktuálně `EXCHANGE MARKET` (ověřeno v journalctl: 21/21 exekucí). Přepnutí na `EXCHANGE LIMIT` je PLÁN, ne stav. Účet má potvrzený zero-fee status (100/100 exekucí fee=0).
+- **Historical note (2026-07-10):** the runtime used `EXCHANGE MARKET` at that time. This is no longer current. The present execution path uses slippage-bounded `EXCHANGE IOC` and authoritative terminal/fill recovery as described above.
 - **Win rate calculation**: Now properly updated on every SELL trade (was hardcoded 0.0)
 - **Order book processing**: Bitfinex book channel data is now parsed and stored in `DashboardState.order_book` (was empty)
 - **TP/SL realism**: Adjusted from $350/$150 to $15/$25 — achievable within the 10s trade interval

@@ -1,0 +1,20 @@
+[Unit]
+Description=Pirana Telegram control bot
+After=network-online.target pirana.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wwwenda
+Group=wwwenda
+WorkingDirectory=/home/wwwenda/workspace/pirana
+EnvironmentFile=/etc/pirana/telegram.env
+InaccessiblePaths=-/home/wwwenda/workspace/pirana/.env
+ExecStart=/usr/bin/python3 /home/wwwenda/workspace/pirana/scripts/telegram_control_bot.py
+Restart=always
+RestartSec=5
+UMask=0077
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

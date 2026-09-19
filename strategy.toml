@@ -109,11 +109,14 @@ l2_weight_alpha = 0.40
 min_l2_imbalance_threshold = 0.15
 
 [trailing_stop]
-# [SCALP replay] trail 0.3×ATR, trigger 6 USD — těsné, viz replay konfigurace
-enabled = true
-min_trigger_usd = 6.0
-be_offset_usd = 2.0
-trail_multiplier = 0.3
+# [AUDIT 2026-09-19 P0 FIX]: Falešný Breakeven způsoboval 100 % ztrát (21 z 21 exitů, ztráta -0.020276 USD).
+# Důvod: min_trigger_usd 6.0 USD a be_offset_usd 2.0 USD jsou MENŠÍ než spread trhu (8 USD).
+# Posun SL na Entry+2 USD následovaný prodejem Market orderem na Bid způsobil fill na Entry-6 USD.
+# Vypnuto: exity jsou řízeny výhradně robustním ATR Take Profit (100% win rate) a Stop Loss.
+enabled = false
+min_trigger_usd = 25.0
+be_offset_usd = 10.0
+trail_multiplier = 0.5
 
 [profit_skimmer]
 enabled = true

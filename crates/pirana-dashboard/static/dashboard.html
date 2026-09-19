@@ -219,7 +219,15 @@
         </div>
     </div>
 
-    <div class="services">
+    <section class="card" style="margin:24px 0" aria-label="Účetnictví">
+<h2>Účet Bitfinex BTC/USD</h2>
+<p>Všechny obchody účtu, nikoli pouze Pirana. Realizované výsledky z trvalé evidence.</p>
+<p id="accounting-status">NEOVĚŘENO</p>
+<table style="width:100%;text-align:left"><thead><tr><th>Období</th><th>Hrubý PnL USD</th><th>Poplatky USD</th><th>Čistý PnL USD</th></tr></thead>
+<tbody><tr><td>Nové období <span id="period-start"></span><br><small id="period-status">Nenastaveno</small></td><td id="period-gross">NEOVĚŘENO</td><td id="period-fees">NEOVĚŘENO</td><td id="period-net">NEOVĚŘENO</td></tr><tr><td>Dnes Europe/Prague</td><td id="daily-gross">NEOVĚŘENO</td><td id="daily-fees">NEOVĚŘENO</td><td id="daily-net">NEOVĚŘENO</td></tr>
+<tr><td>Pokrytá historie</td><td id="lifetime-gross">NEOVĚŘENO</td><td id="lifetime-fees">NEOVĚŘENO</td><td id="lifetime-net">NEOVĚŘENO</td></tr></tbody></table>
+</section>
+<div class="services">
 
         <a href="http://100.115.0.40" class="card card-pirana">
             <div class="card-icon icon-pirana">⚡</div>
@@ -277,5 +285,39 @@
     </div>
 
 </div>
+<script>
+function accountingMoney(value) {
+    return typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))
+        ? value : 'NEOVĚŘENO';
+}
+function renderAccounting(a) {
+    const verified = a && a.status === 'complete';
+    document.getElementById('accounting-status').textContent = verified
+        ? 'Ověřená pokrytá historie účtu' : 'NEOVĚŘENO: ' + ((a && a.issues) || ['zdroj nedostupný']).join('; ');
+    const current = a && a.active_period;
+    const currentVerified = current && current.status === 'complete';
+    const start = current && Number.isSafeInteger(current.start_ms) ? new Date(current.start_ms) : null;
+    document.getElementById('period-start').textContent = start && Number.isFinite(start.getTime())
+        ? 'od ' + start.toLocaleString('cs-CZ', {timeZone:'Europe/Prague'}) : '';
+    document.getElementById('period-status').textContent = currentVerified ? 'Ověřený výsledek nového období' : (current ? 'NEOVĚŘENO' : 'Nenastaveno');
+    for (const [suffix, key] of [['gross','gross_pnl_usd'], ['fees','fees_usd'], ['net','net_pnl_usd']]) {
+        document.getElementById('period-' + suffix).textContent = accountingMoney(currentVerified ? current[key] : null);
+    }
+    for (const period of ['daily', 'lifetime']) {
+        for (const [suffix, key] of [['gross','gross_pnl_usd'], ['fees','fees_usd'], ['net','net_pnl_usd']]) {
+            document.getElementById(period + '-' + suffix).textContent = accountingMoney(verified && a[period] ? a[period][key] : null);
+        }
+    }
+}
+async function refreshAccounting() {
+    try {
+        const response = await fetch('/api/accounting', {cache:'no-store', signal:AbortSignal.timeout(5000)});
+        if (!response.ok) throw new Error('source unavailable');
+        renderAccounting(await response.json());
+    } catch (_) { renderAccounting(null); }
+}
+refreshAccounting();
+setInterval(refreshAccounting, 10000);
+</script>
 </body>
 </html>

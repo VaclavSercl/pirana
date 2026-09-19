@@ -16,6 +16,7 @@
 | 23.8.2026 | FSM smyčka (PLÁNOVAČ→ARCHITEKT→AUDITOR→TESTER→RECONCILER) je NEZKRACOVATELNÁ. |
 | 26.8.2026 | Agent je JEDEN (Čáslav) ve více instancích. Všechny sdílejí tuto paměť. |
 | 26.8.2026 | **AGY je POUZE kontrola / oponent / pomocný agent.** Nikdy vykonavatel! Veškerou práci (audity, reporty, nasazení, obchodní rozhodnutí) provádí Čáslav přes hermes. agy = jen druhý názor, verifikace závěrů, oponentura FSM. |
+| 19.9.2026 | Operátor nařídil důkladně opravit chyby z hloubkového auditu Pirany. Opravy musí projít testy/CI před sloučením do `main`; nezaměňovat restart za prokázanou reconciliaci. |
 
 ---
 
@@ -30,6 +31,21 @@
 ---
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
+
+### 19.9.2026
+
+- **GitHub audit/hardening (ChatGPT + GitHub connector, na pokyn operátora)**:
+  Opravná větev PR #1 byla rozšířena o fail-closed načtení a validaci
+  `strategy.toml`, branch-safe verzování/rollback, pravdivé Telegram
+  `/resume`/`/reconcile` postconditions, loopback-default dashboard/exporter,
+  skutečný Rust Prometheus endpoint, reprodukovatelný Docker deployment,
+  verzované core systemd jednotky a správný accounting drop-in
+  `pirana.service.d/20-accounting.conf`. Přidáno GitHub Actions CI:
+  locked Rust check/test, Clippy -D warnings, Python testy, secret-pattern scan,
+  Compose validace a Docker build. `strategy.toml` nebyl měněn.
+  Produkční server Čáslav nebyl z této chatové instance restartován ani nasazen;
+  live deploy a post-deploy gates musí být explicitně ověřeny na hostu.
+  Historický Telegram token v public Git historii vyžaduje rotaci u provideru.
 
 ### 3.9.2026
 

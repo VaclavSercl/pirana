@@ -1,9 +1,13 @@
-use pirana_core::errors::{PiranaError, PiranaResult};
+use pirana_core::{
+    constants,
+    errors::{PiranaError, PiranaResult},
+};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, fs, path::PathBuf};
 use tracing::{info, warn};
 
-/// System configuration loaded from environment and config files
+/// Process/infrastructure configuration. Runtime trading/risk truth lives in
+/// strategy.toml plus the persisted calibrated risk_state.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiranaConfig {
     /// Exchange configuration
@@ -48,6 +52,11 @@ impl fmt::Debug for ExchangeConfig {
     }
 }
 
+/// Legacy compatibility snapshot of hard risk constants.
+///
+/// These fields are NOT runtime environment overrides. The live risk engine
+/// uses strategy.toml plus calibrated risk_state.json and clamps against
+/// pirana-core hard constants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
     /// Maximum aggregate exposure (0.0 - 1.0)
@@ -62,6 +71,7 @@ pub struct RiskConfig {
     pub consecutive_loss_threshold: u32,
 }
 
+/// Legacy compatibility snapshot of deterministic trading constants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradingConfig {
     /// Trading symbols
@@ -88,22 +98,67 @@ pub struct InfrastructureConfig {
     pub environment: String,
 }
 
+fn read_secret(env_name: &str, credential_name: &str) -> String {
+    if let Ok(value) = std::env::var(env_name) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+
+    let explicit_file = format!("{env_name}_FILE");
+    let path = std::env::var_os(&explicit_file)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .map(PathBuf::from)
+                .map(|dir| dir.join(credential_name))
+        });
+
+    path.and_then(|p| fs::read_to_string(p).ok())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
+}
+
 impl PiranaConfig {
-    /// Load configuration from environment variables
-    /// Uses dotenvy to load .env file if present
+    /// Load process configuration.
+    ///
+    /// Production does not auto-read a project .env file. Developers may opt
+    /// in explicitly with PIRANA_LOAD_DOTENV=1. Exchange credentials may be
+    /// supplied via environment variables or unit-private systemd credentials.
     pub fn from_env() -> PiranaResult<Self> {
-        // Load .env file if it exists (silently ignore if missing)
-        if dotenvy::dotenv().is_ok() {
-            info!("Loaded .env file");
+        let load_dotenv = std::env::var("PIRANA_LOAD_DOTENV")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if load_dotenv && dotenvy::dotenv().is_ok() {
+            info!("Loaded .env file because PIRANA_LOAD_DOTENV is enabled");
         }
 
-        info!("Loading configuration from environment");
+        info!("Loading configuration from environment/systemd credentials");
 
-        let api_key = std::env::var("BITFINEX_API_KEY").unwrap_or_default();
-        let api_secret = std::env::var("BITFINEX_API_SECRET").unwrap_or_default();
+        // Historical releases advertised these as live env overrides even
+        // though the trading loop never consumed PiranaConfig.risk. Keep them
+        // non-fatal for old .env files, but make the ignored state explicit.
+        for legacy in [
+            "MAX_AGGREGATE_EXPOSURE",
+            "MAX_SINGLE_TRADE_RISK",
+            "MAX_DAILY_DRAWDOWN",
+            "MAX_WEEKLY_DRAWDOWN",
+            "CONSECUTIVE_LOSS_THRESHOLD",
+        ] {
+            if std::env::var_os(legacy).is_some() {
+                warn!(
+                    "{} is a legacy ignored env variable; use strategy.toml and risk_state.json",
+                    legacy
+                );
+            }
+        }
 
-        if api_key.is_empty() {
-            warn!("BITFINEX_API_KEY not set — running in read-only mode");
+        let api_key = read_secret("BITFINEX_API_KEY", "bitfinex_api_key");
+        let api_secret = read_secret("BITFINEX_API_SECRET", "bitfinex_api_secret");
+
+        if api_key.is_empty() || api_secret.is_empty() {
+            warn!("Bitfinex credentials are incomplete — authenticated trading is unavailable");
         }
 
         Ok(Self {
@@ -118,39 +173,24 @@ impl PiranaConfig {
                     .unwrap_or(false),
             },
             risk: RiskConfig {
-                max_aggregate_exposure: std::env::var("MAX_AGGREGATE_EXPOSURE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.20),
-                max_single_trade_risk: std::env::var("MAX_SINGLE_TRADE_RISK")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.005),
-                max_daily_drawdown: std::env::var("MAX_DAILY_DRAWDOWN")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.03),
-                max_weekly_drawdown: std::env::var("MAX_WEEKLY_DRAWDOWN")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.07),
-                consecutive_loss_threshold: std::env::var("CONSECUTIVE_LOSS_THRESHOLD")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(5),
+                max_aggregate_exposure: constants::MAX_AGGREGATE_EXPOSURE,
+                max_single_trade_risk: constants::MAX_SINGLE_TRADE_RISK,
+                max_daily_drawdown: constants::MAX_DAILY_DRAWDOWN,
+                max_weekly_drawdown: constants::MAX_WEEKLY_DRAWDOWN,
+                consecutive_loss_threshold: constants::CONSECUTIVE_LOSS_THRESHOLD,
             },
             trading: TradingConfig {
-                symbols: vec!["tBTCUSD".to_string()],
-                order_book_depth: 25,
-                feature_window_size: 100,
-                signal_confidence_threshold: 0.70,
-                max_slippage_bps: 10,
+                symbols: vec![constants::DEFAULT_SYMBOL.to_string()],
+                order_book_depth: constants::ORDER_BOOK_DEPTH,
+                feature_window_size: constants::FEATURE_WINDOW_SIZE,
+                signal_confidence_threshold: constants::SIGNAL_CONFIDENCE_THRESHOLD,
+                max_slippage_bps: constants::MAX_SLIPPAGE_BPS,
             },
             infrastructure: InfrastructureConfig {
-                metrics_port: std::env::var("METRICS_PORT")
+                metrics_port: std::env::var("PIRANA_RUST_METRICS_PORT")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(9090),
+                    .unwrap_or(9100),
                 health_check_port: std::env::var("HEALTH_CHECK_PORT")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -163,14 +203,18 @@ impl PiranaConfig {
 
     /// Validate configuration
     pub fn validate(&self) -> PiranaResult<()> {
-        if self.risk.max_aggregate_exposure <= 0.0 || self.risk.max_aggregate_exposure > 1.0 {
+        if self.risk.max_aggregate_exposure <= 0.0
+            || self.risk.max_aggregate_exposure > constants::MAX_AGGREGATE_EXPOSURE
+        {
             return Err(PiranaError::Config(
-                "max_aggregate_exposure must be between 0 and 1".to_string(),
+                "max_aggregate_exposure exceeds hard cap".to_string(),
             ));
         }
-        if self.risk.max_single_trade_risk <= 0.0 || self.risk.max_single_trade_risk > 1.0 {
+        if self.risk.max_single_trade_risk <= 0.0
+            || self.risk.max_single_trade_risk > constants::MAX_SINGLE_TRADE_RISK
+        {
             return Err(PiranaError::Config(
-                "max_single_trade_risk must be between 0 and 1".to_string(),
+                "max_single_trade_risk exceeds hard cap".to_string(),
             ));
         }
         if self.trading.symbols.is_empty() {

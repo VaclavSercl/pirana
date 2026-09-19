@@ -5,6 +5,11 @@ Sends detailed system & trading status directly to Václav on Telegram.
 """
 
 import sys
+try:
+    from .pirana_report import generate_report_data, format_telegram_html
+except ImportError:  # Direct script invocation
+    from pirana_report import generate_report_data, format_telegram_html
+
 import os
 import json
 import urllib.request
@@ -13,7 +18,10 @@ import subprocess
 from datetime import datetime
 
 TELEGRAM_TOKEN = os.environ.get("CASLAV_TELEGRAM_TOKEN") or os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = int(os.environ.get("CASLAV_ALLOWED_USER_ID", "1076582576"))
+CHAT_ID_RAW = os.environ.get("CASLAV_ALLOWED_USER_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+if not CHAT_ID_RAW:
+    raise RuntimeError("CASLAV_ALLOWED_USER_ID or TELEGRAM_CHAT_ID must be configured")
+CHAT_ID = int(CHAT_ID_RAW)
 API_URL = "http://localhost:80/api/snapshot"
 
 def get_snapshot():
@@ -88,67 +96,12 @@ def send_telegram(text: str):
             print(f"Telegram response: {resp.status}")
             return True
     except Exception as e:
-        print(f"Failed to send Telegram message: {e}", file=sys.stderr)
+        print(f"Failed to send Telegram message: {type(e).__name__}", file=sys.stderr)
         return False
 
 def build_report():
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S CEST")
-    snapshot = get_snapshot()
-    sys_stats = get_system_stats()
-
-    if not snapshot:
-        return (
-            f"👑 <b>Vládce Čáslav — Polední Report (12:00)</b>\n"
-            f"📅 <i>{now_str}</i>\n\n"
-            f"⚠️ <b>Varování:</b> Lokální API snapshotu neodpovídá!\n"
-            f"🖥 <b>Server Čáslav:</b>\n"
-            f"• Uptime: {sys_stats.get('uptime')}\n"
-            f"• Load: {sys_stats.get('load')}\n"
-            f"• RAM: {sys_stats.get('memory')}\n"
-            f"• Disk: {sys_stats.get('disk')}\n"
-        )
-
-    mode = snapshot.get("system_mode", "Unknown")
-    mode_icon = "🟢" if mode == "Active" else ("🟡" if mode == "Defensive" else "🔴")
-    btc_price = snapshot.get("btc_price", 0.0)
-    btc_bal = snapshot.get("btc_balance", 0.0)
-    usd_bal = snapshot.get("usd_balance", 0.0)
-    equity = usd_bal + (btc_bal * btc_price)
-    trades_today = snapshot.get("trades_today", 0)
-    daily_pnl = snapshot.get("daily_pnl", 0.0)
-    daily_pnl_pct = snapshot.get("daily_pnl_pct", 0.0)
-    total_pnl = snapshot.get("total_pnl", 0.0)
-    win_rate = snapshot.get("win_rate", 0.0)
-    cons_loss = snapshot.get("consecutive_losses", 0)
-    uptime_sec = snapshot.get("uptime_seconds", 0)
-    uptime_h = uptime_sec // 3600
-    uptime_m = (uptime_sec % 3600) // 60
-
-    pnl_sign = "+" if daily_pnl >= 0 else ""
-    tot_sign = "+" if total_pnl >= 0 else ""
-
-    report = (
-        f"👑 <b>Vládce Čáslav — Polední Report (12:00)</b>\n"
-        f"📅 <i>{now_str}</i>\n\n"
-        f"🦈 <b>Trading Engine (Pirana &amp; Gemini HFT):</b>\n"
-        f"• Stav: {mode_icon} <b>{mode}</b> (Uptime bota: {uptime_h}h {uptime_m}m)\n"
-        f"• Cena BTC: <b>${btc_price:,.1f}</b>\n"
-        f"• Zůstatek BTC: <code>{btc_bal:.6f} BTC</code> (~${btc_bal * btc_price:,.2f})\n"
-        f"• Zůstatek USD: <code>${usd_bal:.2f}</code>\n"
-        f"• <b>Celková equity:</b> <code>${equity:,.2f}</code>\n\n"
-        f"📊 <b>Dnešní statistika obchodování:</b>\n"
-        f"• Počet obchodů dnes: <b>{trades_today}</b>\n"
-        f"• Denní PnL: <b>{pnl_sign}${daily_pnl:.4f}</b> ({pnl_sign}{daily_pnl_pct:.2f}%)\n"
-        f"• Celkový PnL: <b>{tot_sign}${total_pnl:.4f}</b>\n"
-        f"• Win Rate: <b>{win_rate:.1f}%</b> | Ztráty v řadě: <b>{cons_loss}</b>\n\n"
-        f"🖥 <b>Zdraví serveru Čáslav:</b>\n"
-        f"• Load Average: <code>{sys_stats.get('load')}</code>\n"
-        f"• Využití RAM: <code>{sys_stats.get('memory')}</code>\n"
-        f"• Využití Disku: <code>{sys_stats.get('disk')}</code>\n"
-        f"• System Uptime: <code>{sys_stats.get('uptime')}</code>\n\n"
-        f"🛡 <b>Status:</b> Všechny systémy běží autonomně a bez chyb. Akumulace BTC aktivní."
-    )
-    return report
+    """Report only validated account-scoped accounting, with unknowns preserved."""
+    return format_telegram_html(generate_report_data(no_api=False, include_runtime=True))
 
 def main():
     report_text = build_report()
@@ -160,5 +113,7 @@ def main():
         f.write(report_text)
         f.write(f"\nSent status: {success}\n")
 
+    return 0 if success else 1
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,9 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Čáslav :: Safe Strategy Config Update & Rollback Helper
+#
+# The trading runtime hot-reloads strategy.toml and owns its own durable
+# risk/FSM brakes. This helper MUST NOT infer that a loss streak means the
+# strategy file should be reverted.
 set -euo pipefail
 
-STRATEGY_FILE="/home/wwwenda/workspace/pirana/strategy.toml"
 VERSIONER="/home/wwwenda/workspace/pirana/scripts/strategy_versioning.py"
+SNAPSHOT_URL="http://127.0.0.1:8080/api/snapshot"
 
 ACTION="${1:-validate}"
 REASON="${2:-Manual update via safe_config_update.sh}"
@@ -16,22 +20,30 @@ case "$ACTION" in
         python3 "$VERSIONER" commit "$REASON"
         ;;
     rollback)
+        # Explicit operator action only. The runtime hot-reloads the resulting
+        # strategy, so a process restart is neither required nor desirable.
         python3 "$VERSIONER" rollback
-        sudo systemctl restart pirana.service
         ;;
     auto-guard)
-        # Check consecutive losses from API snapshot
-        LOSSES=$(curl -s http://localhost:80/api/snapshot 2>/dev/null | grep -o '"consecutive_losses":[0-9]*' | cut -d':' -f2 || echo "0")
-        if [ "$LOSSES" -ge 3 ]; then
-            echo "⚠️ [GUARD TRIGGERED] Consecutive losses reached $LOSSES! Initiating automated strategy rollback..."
-            python3 "$VERSIONER" rollback
-            sudo systemctl restart pirana.service
-        else
-            echo "✓ System healthy. Consecutive losses: $LOSSES/3."
-        fi
+        # Observability-only compatibility command. RiskEngine/FSM is the
+        # authoritative guard; never rewrite strategy.toml from a loss count.
+        SNAPSHOT=$(curl -fsS --max-time 5 "$SNAPSHOT_URL") || {
+            echo "CRITICAL: Pirana snapshot unavailable at $SNAPSHOT_URL" >&2
+            exit 2
+        }
+        python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+mode = str(s.get("system_mode", "Unknown"))
+losses = s.get("consecutive_losses")
+block = s.get("execution_block_reason")
+print(f"mode={mode} consecutive_losses={losses} execution_block={block or '''none'''}")
+if block or mode == "Halted":
+    raise SystemExit(2)
+' <<<"$SNAPSHOT"
         ;;
     *)
-        echo "Usage: $0 [validate | commit <reason> | rollback | auto-guard]"
+        echo "Usage: $0 [validate | commit <reason> | rollback | auto-guard]" >&2
         exit 1
         ;;
 esac

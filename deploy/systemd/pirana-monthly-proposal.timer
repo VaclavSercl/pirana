@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Pirana monthly R&D proposal on the 1st at 10:00 local time
+
+[Timer]
+OnCalendar=*-*-01 10:00:00
+Persistent=true
+AccuracySec=1min
+Unit=pirana-monthly-proposal.service
+
+[Install]
+WantedBy=timers.target

@@ -5,6 +5,12 @@ Runs on the 1st of every month to produce a comprehensive audit of trading perfo
 capital accumulation in BTC vault, exchange volume, and system stability for the preceding month.
 """
 
+try:
+    from .pirana_report import generate_report_data, format_telegram_html
+except ImportError:
+    from pirana_report import generate_report_data, format_telegram_html
+import html
+
 import sys
 import os
 import time
@@ -226,60 +232,15 @@ def get_git_status():
         return "Aktivní"
 
 def build_monthly_report(time_label, stats, snapshot):
-    btc_price = snapshot.get("btc_price", 64400.0) if snapshot else 64400.0
-    total_locked_btc = snapshot.get("locked_btc_reserve", 0.0) if snapshot else 0.0
-    total_locked_sats = int(total_locked_btc * 100_000_000)
-    total_locked_usd = total_locked_btc * btc_price
-
-    month_locked_btc = stats["month_locked_btc"]
-    month_locked_sats = int(month_locked_btc * 100_000_000)
-
-    current_equity = snapshot.get("starting_equity", 393.56) + stats["net_pnl"] if snapshot else 393.56 + stats["net_pnl"]
-    start_equity = max(current_equity - stats["net_pnl"], 1.0)
-    pnl_pct = (stats["net_pnl"] / start_equity * 100.0) if start_equity > 0 else 0.0
-
-    pnl_sign = "+" if stats["net_pnl"] >= 0 else ""
-    pf_str = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] < 100 else "∞"
-    payoff_str = f"{stats['payoff_ratio']:.2f}" if stats['payoff_ratio'] < 100 else "∞"
-
-    # Evaluation tag
-    if stats["net_pnl"] > 0 and stats["win_rate"] >= 60.0:
-        evaluation = "🟢 Mimořádně ziskový a stabilní měsíc (Akumulace BTC optimální)"
-    elif stats["net_pnl"] >= 0:
-        evaluation = "🟡 Nominální růst a kapitálová stabilita"
-    else:
-        evaluation = "🔴 Vyžadována revize parametrů (Defensive Guard aktivní)"
-
-    msg = (
-        f"👑 <b>ČÁSLAV :: MĚSÍČNÍ INSTITUCIONÁLNÍ AUDIT PIRANA</b>\n"
-        f"📅 <b>Období:</b> <code>[{time_label}]</code>\n"
-        f"──────────────────────────\n"
-        f"💰 <b>FINANČNÍ VÝSLEDKY &amp; EQUITY:</b>\n"
-        f"• Počáteční equity (1. v měsíci): <code>${start_equity:,.2f} USD</code>\n"
-        f"• Konečná equity (konec měsíce): <code>${current_equity:,.2f} USD</code>\n"
-        f"• <b>Čistý měsíční zisk (Net PnL):</b> <code>{pnl_sign}${stats['net_pnl']:.4f} USD ({pnl_sign}{pnl_pct:.2f}%)</code>\n"
-        f"• Maximální Drawdown (MDD): <code>{stats['max_drawdown_pct']:.2f}%</code>\n\n"
-        f"🏦 <b>BTC TREZOR &amp; AKUMULACE (Profit Skimmer):</b>\n"
-        f"• Nově uzamčeno v trezoru: <code>+{month_locked_btc:.8f} BTC (+{month_locked_sats:,} sat)</code>\n"
-        f"• Celkem v trezoru (All-time): <code>{total_locked_btc:.8f} BTC ({total_locked_sats:,} sat / ~${total_locked_usd:.2f} USD)</code>\n"
-        f"• <b>Zachování pravidla č. 2:</b> <code>100% Satoshis chráněno</code> 🛡️\n\n"
-        f"🎯 <b>VÝKONNOST STRATEGIE &amp; EXEKUCE:</b>\n"
-        f"• Celkem uzavřených obchodů: <code>{stats['total_roundtrips']}</code>\n"
-        f"• Win Rate: <code>{stats['win_rate']:.1f}%</code> (🟢 {stats['wins']}W / 🔴 {stats['losses']}L / ⚪ {stats['be_trades']}BE)\n"
-        f"• Profit Factor: <code>{pf_str}</code> | Payoff Ratio: <code>{payoff_str}</code>\n"
-        f"• Průměrný zisk na obchod: <code>+${stats['avg_win']:.4f} USD</code>\n"
-        f"• Nejlepší obchod měsíce: <code>+${stats['max_win_usd']:.4f} USD (+{stats['max_win_roi']:.2f}%)</code>\n\n"
-        f"📊 <b>BURZOVNÍ OBRAT &amp; POPLATKY:</b>\n"
-        f"• Celkový zobchodovaný objem: <code>{stats['total_vol_btc']:.4f} BTC (~${stats['total_vol_usd']:,.2f} USD)</code>\n"
-        f"• Ušetřeno na poplatcích (0% Zero Fee): <code>~${stats['saved_fees_usd']:.2f} USD</code>\n\n"
-        f"⚙️ <b>SRE STABILITA &amp; INFRASTRUKTURA:</b>\n"
-        f"• Uptime jádra: <code>99.98%</code> (Restartů: <code>0</code>)\n"
-        f"• Watchdog incidenty: <code>0</code>\n"
-        f"• Stav Gitu &amp; Konfigurace: <code>{get_git_status()}</code>\n\n"
-        f"🚦 <b>CELKOVÉ HODNOCENÍ MĚSÍCE:</b>\n"
-        f"{evaluation}"
+    """Current projections cannot establish a requested calendar-month return."""
+    return (
+        "<b>PIRANA — MĚSÍČNÍ REPORT</b>\n"
+        f"Období: {html.escape(str(time_label))}\n"
+        "Měsíční PnL, poplatky, výnos, uptime a akumulace BTC: NEOVĚŘENO.\n"
+        "Chybí kanonická projekce požadovaného měsíce.\n"
+        "Následuje aktuální stav, nikoli měsíční výsledek.\n\n"
+        + format_telegram_html(generate_report_data(no_api=False, include_runtime=True))
     )
-    return msg
 
 def send_telegram(token, chat_id, text):
     if not token or not chat_id:
@@ -303,7 +264,7 @@ def send_telegram(token, chat_id, text):
                     print(f"[OK] Monthly Report successfully delivered to Telegram on attempt {attempt}.")
                     return True
         except Exception as e:
-            print(f"[WARN] Telegram delivery attempt {attempt} failed: {e}", file=sys.stderr)
+            print(f"[WARN] Telegram delivery attempt {attempt} failed: {type(e).__name__}", file=sys.stderr)
             time.sleep(3)
     return False
 
@@ -316,15 +277,8 @@ def main():
     env = load_env()
     tg_token = env.get("TELEGRAM_BOT_TOKEN") or env.get("CASLAV_TELEGRAM_TOKEN")
     tg_chat_id = env.get("TELEGRAM_CHAT_ID") or env.get("CASLAV_ALLOWED_USER_ID")
-    bfx_key = env.get("BITFINEX_API_KEY")
-    bfx_secret = env.get("BITFINEX_API_SECRET")
-
-    start_dt, end_dt, start_ms, end_ms, time_label = calculate_time_window(force_now=args.force_now)
-    snapshot = get_snapshot()
-
-    raw_trades = fetch_bitfinex_trades(bfx_key, bfx_secret, start_ms, end_ms)
-    stats = analyze_trades(raw_trades)
-    report_text = build_monthly_report(time_label, stats, snapshot)
+    _, _, _, _, time_label = calculate_time_window(force_now=args.force_now)
+    report_text = build_monthly_report(time_label, None, None)
 
     if args.dry_run:
         print("\n==================== [MONTHLY REPORT DRY RUN] ====================")

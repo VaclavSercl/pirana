@@ -1,11 +1,10 @@
 #!/bin/bash
-# PIRANA — Deployment Script
-# Usage: ./deploy.sh [environment]
-
+# PIRANA — reproducible Docker deployment helper
 set -euo pipefail
 
 ENV="${1:-production}"
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+COMPOSE_FILE="${PROJECT_DIR}/infrastructure/docker/docker-compose.yml"
 
 echo "========================================="
 echo "  PIRANA Deployment"
@@ -13,41 +12,39 @@ echo "  Environment: ${ENV}"
 echo "  Directory: ${PROJECT_DIR}"
 echo "========================================="
 
-# Check prerequisites
 command -v docker >/dev/null 2>&1 || { echo "Docker required"; exit 1; }
-command -v docker compose >/dev/null 2>&1 || { echo "Docker Compose required"; exit 1; }
+docker compose version >/dev/null 2>&1 || { echo "Docker Compose v2 required"; exit 1; }
 
-# Check environment variables
-if [ -z "${BITFINEX_API_KEY:-}" ]; then
-    echo "WARNING: BITFINEX_API_KEY not set"
+test -f "${PROJECT_DIR}/Cargo.toml"
+test -f "${PROJECT_DIR}/Cargo.lock"
+test -f "${PROJECT_DIR}/strategy.toml"
+
+if [ -z "${BITFINEX_API_KEY:-}" ] || [ -z "${BITFINEX_API_SECRET:-}" ]; then
+    echo "ERROR: BITFINEX_API_KEY and BITFINEX_API_SECRET must be exported" >&2
+    exit 2
 fi
 
-if [ -z "${BITFINEX_API_SECRET:-}" ]; then
-    echo "WARNING: BITFINEX_API_SECRET not set"
-fi
+echo "[1/4] Validating strategy..."
+python3 "${PROJECT_DIR}/scripts/strategy_versioning.py" validate
 
-# Build
-echo "[1/3] Building PIRANA..."
+echo "[2/4] Building locked Rust workspace..."
 cd "${PROJECT_DIR}"
-cargo build --release 2>/dev/null || echo "Cargo not available — skipping native build"
+cargo build --release --locked
 
-# Deploy infrastructure
-echo "[2/3] Deploying infrastructure..."
-cd "${PROJECT_DIR}/infrastructure/docker"
-docker compose up -d --build
+echo "[3/4] Building and starting containers..."
+docker compose -f "${COMPOSE_FILE}" up -d --build
 
-# Verify
-echo "[3/3] Verifying deployment..."
-sleep 5
+echo "[4/4] Verifying health..."
+for _ in $(seq 1 20); do
+    if curl -fsS http://127.0.0.1:8080/api/health >/dev/null; then
+        echo "✓ Health check passed"
+        docker compose -f "${COMPOSE_FILE}" ps
+        exit 0
+    fi
+    sleep 1
+done
 
-if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
-    echo "✓ Health check passed"
-else
-    echo "✗ Health check failed — check logs"
-fi
-
-echo ""
-echo "PIRANA deployed successfully!"
-echo "  Metrics:    http://localhost:9090"
-echo "  Grafana:    http://localhost:3000"
-echo "  Prometheus: http://localhost:9091"
+echo "✗ Health check failed" >&2
+docker compose -f "${COMPOSE_FILE}" ps >&2 || true
+docker compose -f "${COMPOSE_FILE}" logs --tail=100 pirana-engine >&2 || true
+exit 1

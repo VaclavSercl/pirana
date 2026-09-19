@@ -1,7 +1,6 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Environment — NEVER commit secrets
 .env
@@ -32,10 +31,23 @@ config.toml
 *.log
 logs/
 
-# Data
+# Gauntlet durable state — machine-generated, never commit
+.gauntlet/
+
+# Data / runtime state — never commit account or execution state
 /data
 *.db
 *.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+accounting_snapshot.json
+positions.json
+state_snapshot.json
+trade_ledger.jsonl
+tick_history.jsonl
+last_calibration.json
+risk_state.json
 
 # Build artifacts
 *.o

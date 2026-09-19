@@ -1,0 +1,25 @@
+[Unit]
+Description=Pirana daily Hermes audit and canonical report
+After=network-online.target pirana.service
+Wants=network-online.target
+OnFailure=notify-telegram-failure@%n.service
+
+[Service]
+Type=oneshot
+User=wwwenda
+Group=wwwenda
+WorkingDirectory=/home/wwwenda/workspace/pirana
+Environment="PATH=/home/wwwenda/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Telegram-only configuration. Never point this unit at the runtime/exchange
+# credential file.
+EnvironmentFile=/etc/pirana/telegram.env
+InaccessiblePaths=-/home/wwwenda/workspace/pirana/.env
+ProtectProc=invisible
+PrivateTmp=true
+
+ExecStart=/home/wwwenda/workspace/pirana/scripts/daily_check.sh
+TimeoutStartSec=420
+StandardOutput=journal
+StandardError=journal
+UMask=0077
