@@ -249,7 +249,7 @@ pirana/
 
 - **Rust Prometheus endpoint**: port 9100 (loopback by default)
 - **Accounting exporter**: port 9091 (loopback by default)
-- **Prometheus**: container UI/listener exposed on loopback host port 9091 in Docker Compose
+- **Prometheus**: container UI/listener exposed on loopback host port 9090 in Docker Compose
 - **Grafana**: exposed on loopback host port 3000 in Docker Compose
 - Reverse proxy/firewall exposure is an operator responsibility and must be verified on the live host.
 
