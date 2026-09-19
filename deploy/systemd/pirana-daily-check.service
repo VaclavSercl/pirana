@@ -17,6 +17,8 @@ EnvironmentFile=/etc/pirana/telegram.env
 InaccessiblePaths=-/home/wwwenda/workspace/pirana/.env
 ProtectProc=invisible
 PrivateTmp=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
 
 ExecStart=/home/wwwenda/workspace/pirana/scripts/daily_check.sh
 TimeoutStartSec=420

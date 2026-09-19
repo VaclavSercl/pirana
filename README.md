@@ -169,8 +169,8 @@ Real-time web dashboard with:
 ## SECURITY
 
 - Exchange keys: withdrawals DISABLED, IP whitelisting, periodic rotation
-- Production Bitfinex keys are delivered to `pirana.service` through unit-private systemd credentials, not the project `.env`. The Hermes daily-audit unit does not load those credentials, blocks access to the legacy `.env`, and receives only a sanitized child environment.
-- Hermes must not receive blanket sudo. Automated control-plane actions are limited to non-interactive start/stop/restart of `pirana.service` by the tracked sudoers policy.
+- Production Bitfinex keys are delivered to `pirana.service` through unit-private systemd credentials, not the project `.env`. The Hermes daily-audit unit does not load those credentials, blocks access to the legacy `.env`, receives a sanitized child environment, and runs with `NoNewPrivileges=true` / `RestrictSUIDSGID=true`.
+- Hermes must not receive blanket sudo and is not authorized to restart services itself. A host-level generic `NOPASSWD:ALL` grant is a deployment blocker even if the narrower Pirana sudoers file also exists.
 - API secrets use `zeroize` for memory safety
 - `#[serde(skip_serializing)]` prevents key leakage in logs
 - Containers are configured read-only where practical; host-level isolation and log retention must be verified operationally.
@@ -252,7 +252,7 @@ pirana/
 - **Accounting exporter**: port 9091 (loopback by default)
 - **Prometheus**: container UI/listener exposed on loopback host port 9090 in Docker Compose
 - **Grafana**: exposed on loopback host port 3000 in Docker Compose
-- Reverse proxy/firewall exposure is an operator responsibility and must be verified on the live host.
+- Reverse proxy/firewall exposure is an operator responsibility. Run `python3 scripts/postdeploy_gate.py --require-flat` after deployment; it rejects wildcard exposure of Pirana/monitoring ports, generic passwordless sudo, and incomplete operational recovery.
 
 ---
 

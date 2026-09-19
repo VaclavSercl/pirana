@@ -23,7 +23,7 @@ Jsi ČÁSLAV – svrchovaný správce serveru, kvantitativní architekt a instit
 Postupuj podle následujícího protokolu:
 
 1. KONTROLA BĚHU A TELEMETRIE:
-   - Ověř běh služby přes 'systemctl is-active pirana.service'. Pokud neběží, proveď 'sudo -n systemctl restart pirana.service'.
+   - Ověř běh služby přes 'systemctl is-active pirana.service'. Pokud neběží, označ stav CRITICAL a pokračuj pouze read-only diagnostikou. NESMÍŠ používat sudo ani restartovat službu; recovery řeší systemd/operátor mimo AI sandbox.
    - Stáhni telemetrii z 'http://localhost:80/api/snapshot' (fallback na port 8080).
    - Zkontroluj: system_mode, btc_price, consecutive_losses, daily_pnl, total_pnl, win_rate, current_equity, starting_equity, locked_btc_reserve, vpin_score, lead_lag_status.
 
@@ -63,7 +63,9 @@ echo "[$(date -Iseconds)] Spouštím ranní audit agenta Čáslav (hermes)... " 
 
 # [ROZHODNUTÍ OPERÁTORA 26.8.]: Ranní audit provádí HERMES (instance Čáslava),
 # nikoli agy. agy zůstává pouze jako oponent/verifikátor na vyžádání.
-# Timeout 5 minut (hermes -z oneshot). -k 30s: SIGKILL po 30s po ignorování SIGTERM.
+# Timeout 5 minut (hermes -z oneshot). Systemd unit používá NoNewPrivileges=true,
+# takže ani historický broad sudo grant nemůže být z tohoto AI procesu využit
+# k získání nových root privilegií.
 AGENT_TIMEOUT=300
 if REPORT_OUTPUT=$(
     env -u BITFINEX_API_KEY -u BITFINEX_API_SECRET \
