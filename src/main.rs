@@ -84,6 +84,40 @@ pub struct ActivePosition {
     pub is_shadow: bool,
 }
 
+/// Evaluates whether a BUY position should be closed according to Bitcoin Standard (§1b):
+/// 1. Hard Invariant: NEVER sell BTC below purchase price (`entry_price`).
+/// 2. Take Profit: triggered if `price >= tp_price`.
+/// 3. Breakeven / Trailing Stop: triggered if `is_breakeven` is true AND `price <= sl_price`.
+///    Because breakeven sets `sl_price >= entry_price + be_offset_usd`, this is strictly profitable.
+/// 4. Conventional Stop Loss: strictly disabled when `stop_loss_enabled` is false.
+pub fn should_close_buy_position(
+    pos: &ActivePosition,
+    price: f64,
+    stop_loss_enabled: bool,
+) -> bool {
+    // 1. Hard Invariant: NEVER sell BTC below entry price!
+    if price < pos.entry_price {
+        return false;
+    }
+
+    // 2. Take Profit
+    if price >= pos.tp_price {
+        return true;
+    }
+
+    // 3. Breakeven / Trailing Stop (secured in profit)
+    if pos.is_breakeven && price <= pos.sl_price {
+        return true;
+    }
+
+    // 4. Conventional Stop Loss (only if explicitly enabled)
+    if stop_loss_enabled && price <= pos.sl_price {
+        return true;
+    }
+
+    false
+}
+
 /// Monotonní čítač pozic — jedinečná ID pro robustní match po fillu.
 static POSITION_PERSISTENCE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -1190,11 +1224,10 @@ async fn process_ws_message(
                                         // [OPONENTURA P0-1 FIX] TP check per-pozice: pos.tp_price
                                         // (ATR-based z entry), ne globální ceiling. Jinak shadow
                                         // TIGHT i reálný SCALP exitují na stejném nesmyslném místě.
-                                        if price >= pos.tp_price {
-                                            tracing::info!("🎯 BUY Position TP Hit! Price {} >= TP {}", price, pos.tp_price);
-                                            should_close = true;
-                                        } else if price <= pos.sl_price {
-                                            if pos.is_breakeven {
+                                        if should_close_buy_position(pos, price, conf.strategy.stop_loss_enabled) {
+                                            if price >= pos.tp_price {
+                                                tracing::info!("🎯 BUY Position TP Hit! Price {} >= TP {}", price, pos.tp_price);
+                                            } else if pos.is_breakeven {
                                                 tracing::info!("🎯 BUY Position Trailing Stop / Breakeven Hit! Price {} <= Trailing SL {}", price, pos.sl_price);
                                             } else {
                                                 tracing::warn!("🛑 BUY Position Stop Loss Hit! Price {} <= SL {}", price, pos.sl_price);
@@ -1233,12 +1266,11 @@ async fn process_ws_message(
                                         if price <= pos.tp_price {
                                             tracing::info!("🎯 SELL Position TP Hit! Price {} <= TP {}", price, pos.tp_price);
                                             should_close = true;
-                                        } else if price >= pos.sl_price {
-                                            if pos.is_breakeven {
-                                                tracing::info!("🎯 SELL Position Trailing Stop / Breakeven Hit! Price {} >= Trailing SL {}", price, pos.sl_price);
-                                            } else {
-                                                tracing::warn!("🛑 SELL Position Stop Loss Hit! Price {} >= SL {}", price, pos.sl_price);
-                                            }
+                                        } else if pos.is_breakeven && price >= pos.sl_price {
+                                            tracing::info!("🎯 SELL Position Trailing Stop / Breakeven Hit! Price {} >= Trailing SL {}", price, pos.sl_price);
+                                            should_close = true;
+                                        } else if conf.strategy.stop_loss_enabled && price >= pos.sl_price {
+                                            tracing::warn!("🛑 SELL Position Stop Loss Hit! Price {} >= SL {}", price, pos.sl_price);
                                             should_close = true;
                                         }
                                     }
@@ -1250,6 +1282,19 @@ async fn process_ws_message(
                                     }
                                     should_close = false;
                                 }
+
+                                // HARD INVARIANT (§1b BITCOIN STANDARD & OPERATOR DIRECTIVE):
+                                // Pokud nakoupíme BTC, nikdy je nebudeme znovu prodávat pod nákupní cenou!
+                                if should_close && pos.side == Side::Buy && price < pos.entry_price {
+                                    if log_throttler.should_log("no_loss_btc_protection") {
+                                        tracing::warn!(
+                                            "🛡️ [BITCOIN STANDARD] Refusing to sell BTC below entry price! Current: {:.2} < Entry: {:.2}",
+                                            price, pos.entry_price
+                                        );
+                                    }
+                                    should_close = false;
+                                }
+
                                 if should_close {
                                     positions_to_close.push(positions.remove(i));
                                 } else {
@@ -2029,7 +2074,12 @@ async fn process_ws_message(
                                     } else {
                                         String::new()
                                     };
-                                    let rationale_text = format!("{} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}){}", live_rationale, atr.current_atr(), tp_dist, sl_dist, as_info);
+                                     let sl_info = if conf.strategy.stop_loss_enabled {
+                                         format!("SL: -{:.1}", sl_dist)
+                                     } else {
+                                         "SL: OFF (No-Loss Hold)".to_string()
+                                     };
+                                     let rationale_text = format!("{} | Adaptive ATR: {:.1} USD (TP: +{:.1}, {}){}", live_rationale, atr.current_atr(), tp_dist, sl_info, as_info);
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::SpreadCapture,
@@ -2265,8 +2315,9 @@ async fn process_ws_message(
                                                      pirana_core::slippage::SlippageDecision::Execute { .. } => {}
                                                  }
 
-                                                 if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
-                                                     tracing::info!("Pullback Flow -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, SL: -{:.1})", final_trade_size, tp_dist, sl_dist);
+                                                  if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
+                                                      let sl_log = if conf.strategy.stop_loss_enabled { format!("SL: -{:.1}", sl_dist) } else { "SL: OFF".to_string() };
+                                                      tracing::info!("Pullback Flow -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, {})", final_trade_size, tp_dist, sl_log);
                                                      
                                                      // [POINT 3 — RESERVE BEFORE ASYNC]
                                                      entry_gate.lock().reserve_live_buy(std::time::Instant::now());
@@ -2524,9 +2575,10 @@ async fn process_ws_message(
                                             hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct_sell, as_info
                                         )
                                     } else {
+                                        let sl_info_sell = if conf.strategy.stop_loss_enabled { format!("SL: +{:.1}", sl_dist) } else { "SL: OFF".to_string() };
                                         format!(
-                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%{}",
-                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct_sell, as_info
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: -{:.1}, {}) | Dynamic Size: {:.2}%{}",
+                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_info_sell, dynamic_pos_pct_sell, as_info
                                         )
                                     };
                                     let sig = Signal {
@@ -3121,5 +3173,74 @@ mod recovery_mode_tests {
         assert_eq!(*state.system_mode.read(), pirana_core::types::SystemMode::Halted);
         assert!(!super::POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire));
         assert!(!super::ACCOUNTING_CAPTURE_READY.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod bitcoin_standard_tests {
+    use super::*;
+    use pirana_core::types::Side;
+
+    fn sample_buy_position(entry_price: f64, tp_dist: f64, sl_dist: f64) -> ActivePosition {
+        ActivePosition {
+            position_id: 1,
+            exchange_order_id: 101,
+            entry_mts: 1700000000000,
+            entry_price,
+            quantity: 0.001,
+            side: Side::Buy,
+            tp_price: entry_price + tp_dist,
+            sl_price: entry_price - sl_dist,
+            exposure_size: 0.10,
+            is_paper: false,
+            highest_price_seen: entry_price,
+            lowest_price_seen: entry_price,
+            is_breakeven: false,
+            trailing_active: false,
+            is_rebalance: false,
+            is_shadow: false,
+        }
+    }
+
+    #[test]
+    fn test_buy_position_never_sells_below_entry_price() {
+        let entry = 80000.0;
+        let pos = sample_buy_position(entry, 20.0, 400.0);
+
+        // When price drops below entry, even below SL level, must NEVER close
+        assert!(!should_close_buy_position(&pos, 79999.0, false));
+        assert!(!should_close_buy_position(&pos, 79600.0, false));
+        assert!(!should_close_buy_position(&pos, 50000.0, false));
+
+        // Even if stop_loss_enabled was hypothetically set, hard invariant protects below entry
+        assert!(!should_close_buy_position(&pos, 79599.0, true));
+        assert!(!should_close_buy_position(&pos, 79000.0, true));
+    }
+
+    #[test]
+    fn test_buy_position_closes_on_take_profit() {
+        let entry = 80000.0;
+        let pos = sample_buy_position(entry, 20.0, 400.0);
+
+        // At or above TP price (80020.0) -> close with profit!
+        assert!(!should_close_buy_position(&pos, 80019.9, false));
+        assert!(should_close_buy_position(&pos, 80020.0, false));
+        assert!(should_close_buy_position(&pos, 80050.0, false));
+    }
+
+    #[test]
+    fn test_buy_position_trailing_breakeven_only_in_profit() {
+        let entry = 80000.0;
+        let mut pos = sample_buy_position(entry, 20.0, 400.0);
+
+        // Breakeven secured at entry + $5
+        pos.is_breakeven = true;
+        pos.sl_price = entry + 5.0;
+
+        // Above breakeven SL -> hold
+        assert!(!should_close_buy_position(&pos, 80010.0, false));
+        // Pullback hits breakeven floor -> close with +$5 profit
+        assert!(should_close_buy_position(&pos, 80005.0, false));
+        assert!(should_close_buy_position(&pos, 80002.0, false));
     }
 }

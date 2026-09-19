@@ -3,12 +3,15 @@ reload_interval_seconds = 60
 
 [trading]
 trade_size_btc = 0.0002
-max_open_orders = 3
+max_open_orders = 10
 
 [strategy]
 entry_zone_spread_usd = 5.0
 take_profit_distance_usd = 15.0
 stop_loss_distance_usd = 400.0
+# [BITCOIN STANDARD §1b & OPERATOR DIRECTIVE]
+# Stop-loss na spotovém BTC vypnut. BTC se nikdy neprodává pod nákupní cenou.
+stop_loss_enabled = false
 ofi_trigger_threshold = 0.90
 ofi_window_size = 100
 # HFT frekvence (2026-08-23): 20000 -> 2000 ms
@@ -58,7 +61,7 @@ use_dynamic_inventory = true
 
 [risk_management]
 max_slippage_bps = 5
-position_size_pct = 1.0
+position_size_pct = 10.0
 max_aggregate_exposure_pct = 90.0
 max_single_trade_risk_pct = 5.0
 # daily_loss_limit_usd odstraněno 24.8. — risk engine používá daily_loss_limit_sats (kalibrované).

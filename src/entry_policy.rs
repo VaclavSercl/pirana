@@ -32,10 +32,10 @@ use std::time::{Duration, Instant};
 // ============================================================================
 
 /// Hard maximum number of concurrent live long positions, INCLUDING in-flight pending async submissions.
-pub const MAX_TRACKED_LIVE_LONG_POSITIONS: usize = 3;
+pub const MAX_TRACKED_LIVE_LONG_POSITIONS: usize = 10;
 
-/// Hard maximum fraction of total equity (1.0%) authorized for a single live BUY order.
-pub const MAX_LIVE_BUY_EQUITY_FRACTION: f64 = 0.01;
+/// Hard maximum fraction of total equity (10.0%, max 1/10th) authorized for a single live BUY order.
+pub const MAX_LIVE_BUY_EQUITY_FRACTION: f64 = 0.10;
 
 /// Default minimum monotonic time spacing between distinct entry impulses.
 pub const DEFAULT_MIN_IMPULSE_SPACING: Duration = Duration::from_secs(2);
@@ -635,15 +635,13 @@ pub mod tests {
         let t1 = start + Duration::from_millis(2100);
         gate.update_signal_state(true);
 
-        // 2. Can reserve 2nd pending slot (1 active + 1 pending = 2 < 3)
-        assert_eq!(
-            gate.check_live_entry(true, 1, t1),
-            EntryGateDecision::Approved
-        );
-        gate.reserve_live_buy(t1);
-        assert_eq!(gate.pending_reservations(), 2);
+        // 2. Can reserve slots up to max (1 active + 9 pending = 10)
+        for _ in 0..8 {
+            gate.reserve_live_buy(t1);
+        }
+        assert_eq!(gate.pending_reservations(), 9);
 
-        // 3. Total tracked is now 1 active + 2 pending = 3.
+        // 3. Total tracked is now 1 active + 9 pending = 10.
         // Attempting another BUY must be strictly blocked!
         gate.update_signal_state(false);
         let t2 = t1 + Duration::from_millis(2100);
@@ -653,23 +651,25 @@ pub mod tests {
             gate.check_live_entry(true, 1, t2),
             EntryGateDecision::BlockedByMaxPositions {
                 active_count: 1,
-                pending_count: 2,
-                max_allowed: 3,
+                pending_count: 9,
+                max_allowed: 10,
             }
         );
 
         // 4. One pending order fails (e.g. Bitfinex timeout / rejection) -> release reservation
         gate.release_reservation();
-        assert_eq!(gate.pending_reservations(), 1);
+        assert_eq!(gate.pending_reservations(), 8);
 
-        // Now tracked is 1 active + 1 pending = 2 < 3 -> Approved!
+        // Now tracked is 1 active + 8 pending = 9 < 10 -> Approved!
         assert_eq!(
             gate.check_live_entry(true, 1, t2),
             EntryGateDecision::Approved
         );
 
-        // 5. One pending fills -> transitioned to active_positions (now 2 active), reservation released (0 pending)
-        gate.release_reservation();
+        // 5. Release remaining reservations -> 0 pending
+        for _ in 0..8 {
+            gate.release_reservation();
+        }
         assert_eq!(gate.pending_reservations(), 0);
         assert_eq!(
             gate.check_live_entry(true, 2, t2),
@@ -754,30 +754,30 @@ pub mod tests {
             }) => {
                 assert_eq!(calculated_btc, 0.000025);
                 assert_eq!(min_required_btc, 0.000040);
-                assert_eq!(equity_cap_btc, 0.000025);
+                assert_eq!(equity_cap_btc, 0.000250);
                 assert_eq!(total_equity_usd, 200.0);
             }
             other => panic!("Expected UndersizedBelowExchangeMin, got {:?}", other),
         }
 
-        // Case B: Risk assessment asks for 5% or 20% sizing on a $10,000 portfolio
+        // Case B: Risk assessment asks for 15% or 20% sizing on a $10,000 portfolio -> capped at 10%
         let large_equity = 10000.0;
         let res_large = calculate_live_buy_sizing(
             large_equity,
             price,
-            0.05, // 5% requested ($500)
+            0.15, // 15% requested ($1500)
             large_equity,
             min_order,
         );
         assert!(res_large.is_ok());
         let sizing = res_large.unwrap();
-        // 1% hard cap on $10,000 at $80,000 = $100.00 = 0.00125 BTC
-        assert_eq!(sizing.final_qty_btc, 0.00125);
-        assert!((sizing.required_usd - 100.0).abs() < 1e-9);
-        assert!((sizing.effective_equity_fraction - 0.01).abs() < 1e-9);
+        // 10% hard cap on $10,000 at $80,000 = $1,000.00 = 0.0125 BTC
+        assert_eq!(sizing.final_qty_btc, 0.0125);
+        assert!((sizing.required_usd - 1000.0).abs() < 1e-9);
+        assert!((sizing.effective_equity_fraction - 0.10).abs() < 1e-9);
 
         // Case C: Exact boundary where 1% equity ($4.00) > exchange min ($3.20)
-        let exact_equity = 400.0; // 1% cap = $4.00 = 0.000050 BTC >= 0.000040 BTC
+        let exact_equity = 400.0; // 1% requested = $4.00 = 0.000050 BTC >= 0.000040 BTC
         let res_exact = calculate_live_buy_sizing(exact_equity, price, 0.01, exact_equity, min_order);
         assert!(res_exact.is_ok());
         let sizing_exact = res_exact.unwrap();
@@ -828,12 +828,12 @@ pub mod tests {
         let real_submitted_notional = real_submitted_qty * real_submitted_price;
 
         // 3. Invariant: REAL submitted notional MUST BE strictly <= equity * 0.01 ($100.00)
-        let equity_1pct_cap = equity * MAX_LIVE_BUY_EQUITY_FRACTION;
+        let requested_1pct_cap = equity * 0.01;
         assert!(
-            real_submitted_notional <= equity_1pct_cap,
+            real_submitted_notional <= requested_1pct_cap,
             "Real submitted notional {:.5} exceeded 1% cap {:.2}",
             real_submitted_notional,
-            equity_1pct_cap
+            requested_1pct_cap
         );
         assert!((real_submitted_notional - 99.96996).abs() < 1e-9);
 
@@ -841,10 +841,10 @@ pub mod tests {
         let naive_size = 0.001250;
         let naive_notional = naive_size * real_submitted_price;
         assert!(
-            naive_notional > equity_1pct_cap,
+            naive_notional > requested_1pct_cap,
             "Naive notional {} must exceed cap {} (demonstrating the critic's bug)",
             naive_notional,
-            equity_1pct_cap
+            requested_1pct_cap
         );
         assert!((naive_notional - 100.05).abs() < 1e-9);
     }
