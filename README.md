@@ -121,22 +121,13 @@ If 5 consecutive losses occur, abnormal volatility appears, exchange instability
 
 ### strategy.toml
 
-```toml
-[strategy]
-take_profit_distance_usd = 15.0      # TP distance from entry
-stop_loss_distance_usd = 25.0        # SL distance from entry
-ofi_trigger_threshold = 0.85         # OFI threshold (higher = fewer trades)
-ofi_window_size = 100                # Rolling window for OFI calculation
-trade_cooldown_ms = 10000            # Min time between trades (10s)
-min_confidence_score = 0.95          # Minimum signal confidence
+The tracked `strategy.toml` is the active configuration contract. Do not copy
+historical numeric examples from this README into production: runtime validation,
+hard caps and the persisted calibrated risk state are the authoritative sources.
 
-[risk_management]
-position_size_pct = 2.0              # % of portfolio per trade
-daily_loss_limit_usd = 1000.0
-max_slippage_bps = 5
-```
-
-The `strategy.toml` is **hot-reloadable** — changes take effect within `reload_interval_seconds` without restart.
+The file is **hot-reloadable**. Invalid reloads are rejected and the
+last-known-good configuration stays active; invalid/missing strategy at process
+startup fails closed.
 
 ### Environment Variables (.env)
 
@@ -181,8 +172,8 @@ Real-time web dashboard with:
 - Hermes must not receive secret-reading OS permissions. Repository structure alone is not a security boundary.
 - API secrets use `zeroize` for memory safety
 - `#[serde(skip_serializing)]` prevents key leakage in logs
-- Isolated infrastructure, immutable logs, read-only containers
-- Outbound firewall restrictions
+- Containers are configured read-only where practical; host-level isolation and log retention must be verified operationally.
+- Firewall / reverse-proxy restrictions are deployment controls, not assumptions made by the application.
 
 ---
 
@@ -193,7 +184,7 @@ Real-time web dashboard with:
 ```bash
 # Build
 cd /home/wwwenda/workspace/pirana
-cargo build --release
+cargo build --locked --release
 
 # Services (auto-start on boot, auto-restart on crash)
 sudo systemctl restart pirana.service
@@ -242,10 +233,9 @@ pirana/
 │   └── pirana-telemetry/               # Prometheus metrics, tracing
 ├── ai-orchestration/                   # Hermes AI layer
 │   ├── prompts/                        # System prompts
-│   ├── skills/                         # Hermes skills
 │   └── config/                         # AI configuration
 ├── infrastructure/
-│   ├── docker/                         # Docker Compose (engine, prometheus, grafana, loki)
+│   ├── docker/                         # Docker Compose (engine, Prometheus, Grafana)
 │   └── monitoring/                     # Prometheus config
 ├── strategy.toml                       # Active strategy configuration
 ├── pirana_exporter.py                  # Prometheus exporter
@@ -272,7 +262,7 @@ pirana/
 - **OFI threshold fix**: `ofi_trigger_threshold` from `strategy.toml` is now properly passed to `OfiCalculator` instead of using hardcoded `OFI_THRESHOLD = 0.6` constant
 - **Position tracking fix**: BUY positions, balance updates, and exposure updates now happen **synchronously before** `tokio::spawn` to eliminate race conditions where SELL arrived before BUY was registered
 - **Naked short prevention**: SELL orders are **skipped** if no open BUY position exists, instead of executing and logging a warning
-- **Order type**: aktuálně `EXCHANGE MARKET` (ověřeno v journalctl: 21/21 exekucí). Přepnutí na `EXCHANGE LIMIT` je PLÁN, ne stav. Účet má potvrzený zero-fee status (100/100 exekucí fee=0).
+- **Historical note (2026-07-10):** the runtime used `EXCHANGE MARKET` at that time. This is no longer current. The present execution path uses slippage-bounded `EXCHANGE IOC` and authoritative terminal/fill recovery as described above.
 - **Win rate calculation**: Now properly updated on every SELL trade (was hardcoded 0.0)
 - **Order book processing**: Bitfinex book channel data is now parsed and stored in `DashboardState.order_book` (was empty)
 - **TP/SL realism**: Adjusted from $350/$150 to $15/$25 — achievable within the 10s trade interval
