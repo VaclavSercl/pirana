@@ -81,10 +81,10 @@ The threshold is **configurable** via `strategy.toml` and is properly passed to 
 
 ### Order Execution
 
-- **LIMIT orders** (EXCHANGE LIMIT) — qualifies for **maker fee** (0.10% on Bitfinex Tier 0)
-- Orders are submitted asynchronously via `tokio::spawn` for non-blocking execution
-- Position tracking, balance updates, and risk engine updates happen **synchronously before** the async order submission to prevent race conditions
-- Rollback logic on order failure: position, balance, and exposure are reverted
+- Live BUY/SELL execution uses **EXCHANGE IOC** with a slippage-bounded limit price.
+- An ACK is not treated as a fill; terminal order state plus authenticated trade history are reconciled before accounting the execution.
+- Entry/exit intents are persisted by CID so restart recovery can distinguish pending, partial and completed executions.
+- Uncertain execution outcomes fail closed and block further orders pending reconciliation.
 
 ### Position Management
 
@@ -96,8 +96,8 @@ The threshold is **configurable** via `strategy.toml` and is properly passed to 
 ### Risk Management
 
 > ⚠️ Konkrétní čísla NEUVÁDĚT zde — jediným zdrojem pravdy je
-> `crates/pirana-core/src/constants.rs` (hard stropy) a po zapojení
-> samokalibrace `/opt/caslav/risk/risk_state.toml` (odvozené hodnoty).
+> `crates/pirana-core/src/constants.rs` (hard stropy) a
+> `/opt/caslav/risk/risk_state.json` (persistované odvozené hodnoty).
 > Duplikace limitů v dokumentaci = TRUTH_DIVERGENCE (viz master prompt §8.4).
 
 - Maximum Aggregate Exposure: viz `MAX_AGGREGATE_EXPOSURE` v constants.rs
@@ -170,14 +170,15 @@ Real-time web dashboard with:
 | API Snapshot | `http://localhost:8080/api/snapshot` |
 | WebSocket | `ws://localhost:8080/ws` |
 | Health Check | `http://localhost:8080/api/health` |
-| Prometheus Metrics | `http://localhost:9091/metrics` |
+| Rust Metrics | `http://localhost:9100/metrics` |
+| Accounting Exporter | `http://localhost:9091/metrics` |
 
 ---
 
 ## SECURITY
 
 - Exchange keys: withdrawals DISABLED, IP whitelisting, periodic rotation
-- Keys remain inaccessible to Hermes
+- Hermes must not receive secret-reading OS permissions. Repository structure alone is not a security boundary.
 - API secrets use `zeroize` for memory safety
 - `#[serde(skip_serializing)]` prevents key leakage in logs
 - Isolated infrastructure, immutable logs, read-only containers
@@ -256,10 +257,11 @@ pirana/
 
 ## MONITORING
 
-- **Prometheus**: metrics collection (port 9091)
-- **Grafana**: dashboards (port 3000)
-- **Loki**: log aggregation (port 3100)
-- **Nginx**: reverse proxy on port 80
+- **Rust Prometheus endpoint**: port 9100 (loopback by default)
+- **Accounting exporter**: port 9091 (loopback by default)
+- **Prometheus**: container UI/listener exposed on loopback host port 9091 in Docker Compose
+- **Grafana**: exposed on loopback host port 3000 in Docker Compose
+- Reverse proxy/firewall exposure is an operator responsibility and must be verified on the live host.
 
 ---
 
