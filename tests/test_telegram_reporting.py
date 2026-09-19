@@ -49,7 +49,7 @@ def test_html_escape_and_diagnostics_bound():
 
 
 def test_scheduled_failure_reaches_exit_code_without_network():
-    with patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': 'fixture'}):
+    with patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': 'fixture', 'TELEGRAM_CHAT_ID': '123'}):
         module = importlib.import_module('scripts.send_scheduled_report')
     for success, expected in [(True, 0), (False, 1)]:
         with patch.object(module, 'build_report', return_value='fixture'), patch.object(

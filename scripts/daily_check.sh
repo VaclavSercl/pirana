@@ -17,9 +17,9 @@ if [ -f "$ENV_FILE" ]; then
     CHAT_ID=$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '[:space:]"' | tr -d '\047')
 fi
 
-# Fallback tokeny
-TELEGRAM_TOKEN="${TELEGRAM_TOKEN:?chybi promenna TELEGRAM_TOKEN}"
-CHAT_ID="${CHAT_ID:-1076582576}"
+# Povinná konfigurace — žádný hardcoded příjemce.
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:?chybi TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN}"
+CHAT_ID="${CHAT_ID:?chybi TELEGRAM_CHAT_ID/CHAT_ID}"
 
 # 2. Definice promptu pro Agenta Čáslav
 PROMPT_CONTENT=$(cat << 'EOF'

@@ -10,7 +10,7 @@ Logika:
 1. Načte aktuální stav kalibrace z API
 2. Porovná s uloženým stavem z předchozího dne (/var/lib/pirana/last_calibration.json)
 3. Reportuje DELTA — co se skutečně změnilo
-4. Ověří invarianty (P(ruin) roste s expozicí, risk_state.toml na disku)
+4. Ověří invarianty (P(ruin) roste s expozicí, risk_state.json na disku)
 
 NEvolá rekalibraci — tu dělá Rust engine každých 15 min (main.rs:410).
 """
@@ -90,7 +90,7 @@ def save_current_state(calib):
 
 
 def check_risk_state_file():
-    """Ověří, že risk_state.toml existuje a je čitelný."""
+    """Ověří, že risk_state.json existuje a je čitelný."""
     if not RISK_STATE_FILE.exists():
         return None, "soubor neexistuje"
     try:
@@ -122,9 +122,9 @@ def send_telegram(token, chat_id, text):
 def main():
     env = load_env()
     token = env.get("TELEGRAM_BOT_TOKEN")
-    chat_id = env.get("TELEGRAM_CHAT_ID", "1076582576")
-    if not token:
-        print("TELEGRAM_BOT_TOKEN missing", file=sys.stderr)
+    chat_id = env.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required", file=sys.stderr)
         return 1
 
     snap = get_snapshot()
@@ -186,7 +186,7 @@ def main():
         f"• Riziko/obchod: <code>{risk:.3%}</code>\n"
         f"• VPIN práh: <code>{vpin:.3f}</code>\n"
         f"• P(ruin): <code>{p_ruin:.6f}</code> {p_ruin_ok}\n"
-        f"• risk_state.toml: <code>{risk_msg}</code> {risk_file_ok}\n"
+        f"• risk_state.json: <code>{risk_msg}</code> {risk_file_ok}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Audit každý den v 06:00. Rust engine rekalibruje každých 15 min.</i>"
     )

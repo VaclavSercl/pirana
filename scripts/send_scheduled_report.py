@@ -18,7 +18,10 @@ import subprocess
 from datetime import datetime
 
 TELEGRAM_TOKEN = os.environ.get("CASLAV_TELEGRAM_TOKEN") or os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = int(os.environ.get("CASLAV_ALLOWED_USER_ID", "1076582576"))
+CHAT_ID_RAW = os.environ.get("CASLAV_ALLOWED_USER_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+if not CHAT_ID_RAW:
+    raise RuntimeError("CASLAV_ALLOWED_USER_ID or TELEGRAM_CHAT_ID must be configured")
+CHAT_ID = int(CHAT_ID_RAW)
 API_URL = "http://localhost:80/api/snapshot"
 
 def get_snapshot():
