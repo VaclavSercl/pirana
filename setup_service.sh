@@ -1,26 +1,19 @@
-sudo tee /etc/systemd/system/pirana.service <<EOF
-[Unit]
-Description=Pirana HFT Bot
-After=network-online.target
-Wants=network-online.target
+#!/usr/bin/env bash
+set -euo pipefail
 
-[Service]
-Type=simple
-User=wwwenda
-Group=wwwenda
-WorkingDirectory=/home/wwwenda/workspace/pirana
-EnvironmentFile=/home/wwwenda/workspace/pirana/.env
-ExecStart=/home/wwwenda/workspace/pirana/target/release/pirana
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNIT_DIR=/etc/systemd/system
 
-[Install]
-WantedBy=multi-user.target
-EOF
+python3 "${ROOT}/scripts/strategy_versioning.py" validate
+cargo build --release --locked --manifest-path "${ROOT}/Cargo.toml"
 
-pkill pirana
+sudo install -m 0644 "${ROOT}/deploy/systemd/pirana.service" "${UNIT_DIR}/pirana.service"
+sudo mkdir -p "${UNIT_DIR}/pirana.service.d"
+for conf in "${ROOT}"/deploy/systemd/pirana.service.d/*.conf; do
+    sudo install -m 0644 "${conf}" "${UNIT_DIR}/pirana.service.d/$(basename "${conf}")"
+done
 
 sudo systemctl daemon-reload
 sudo systemctl enable pirana.service
-sudo systemctl start pirana.service
+sudo systemctl restart pirana.service
+sudo systemctl --no-pager --full status pirana.service
