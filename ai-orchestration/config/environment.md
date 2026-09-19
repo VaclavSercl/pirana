@@ -7,12 +7,17 @@
 - `BITFINEX_API_SECRET` — API secret
 - `PIRANA_TESTNET` — Set to "true" for testnet mode
 
-### Risk Overrides (optional)
-- `MAX_AGGREGATE_EXPOSURE` — Default: 0.20
-- `MAX_SINGLE_TRADE_RISK` — Default: 0.005
-- `MAX_DAILY_DRAWDOWN` — Default: 0.03
-- `MAX_WEEKLY_DRAWDOWN` — Default: 0.07
-- `CONSECUTIVE_LOSS_THRESHOLD` — Default: 5
+### Risk source of truth
+Runtime risk is **not** configured by `MAX_*` environment variables.
+
+- Hard ceilings: `crates/pirana-core/src/constants.rs`
+- Active strategy constraints: `strategy.toml`
+- Calibrated/persisted state: `/opt/caslav/risk/risk_state.json`
+
+Historical `MAX_AGGREGATE_EXPOSURE`, `MAX_SINGLE_TRADE_RISK`,
+`MAX_DAILY_DRAWDOWN`, `MAX_WEEKLY_DRAWDOWN`, and
+`CONSECUTIVE_LOSS_THRESHOLD` environment variables are accepted only as
+legacy leftovers and are explicitly ignored by the trading runtime.
 
 ### Infrastructure
 - `PIRANA_RUST_METRICS_PORT` — Default: 9100
