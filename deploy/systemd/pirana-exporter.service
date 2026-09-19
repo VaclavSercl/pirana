@@ -1,0 +1,20 @@
+[Unit]
+Description=Pirana Prometheus accounting exporter
+After=network-online.target pirana.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wwwenda
+Group=wwwenda
+WorkingDirectory=/home/wwwenda/workspace/pirana
+EnvironmentFile=/home/wwwenda/workspace/pirana/.env
+Environment=PIRANA_EXPORTER_BIND=127.0.0.1
+Environment=PIRANA_EXPORTER_PORT=9091
+ExecStart=/usr/bin/python3 /home/wwwenda/workspace/pirana/pirana_exporter.py
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
