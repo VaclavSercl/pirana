@@ -147,10 +147,10 @@ impl PiranaConfig {
                 max_slippage_bps: 10,
             },
             infrastructure: InfrastructureConfig {
-                metrics_port: std::env::var("METRICS_PORT")
+                metrics_port: std::env::var("PIRANA_RUST_METRICS_PORT")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(9090),
+                    .unwrap_or(9100),
                 health_check_port: std::env::var("HEALTH_CHECK_PORT")
                     .ok()
                     .and_then(|v| v.parse().ok())
