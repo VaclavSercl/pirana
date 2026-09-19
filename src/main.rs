@@ -6,7 +6,7 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 use pirana_config::settings::PiranaConfig;
-use pirana_core::errors::PiranaResult;
+use pirana_core::errors::{PiranaError, PiranaResult};
 use pirana_core::constants::MIN_ORDER_SIZE_BTC;
 use pirana_core::types::{Signal, SignalType, SignalParams, Symbol, Side, Tick, MarketRegime, OrderStatus, SystemMode};
 use pirana_execution::bitfinex_client::BitfinexClient;
@@ -226,20 +226,29 @@ async fn main() -> PiranaResult<()> {
     info!("║  Mode: {}                      ║", config.infrastructure.environment);
     info!("╚══════════════════════════════════════════╝");
 
-    // Initialize metrics
-    pirana_telemetry::metrics::init_metrics();
+    // Telemetry must not fail silently in production.
+    pirana_telemetry::metrics::init_metrics(config.infrastructure.metrics_port)
+        .map_err(PiranaError::Config)?;
 
     // Create shared dashboard state
     let dashboard_state = Arc::new(DashboardState::new());
 
-    let strategy_config = Arc::new(parking_lot::RwLock::new(StrategyConfig::load_or_default()));
+    // Production startup is fail-closed: a missing/invalid strategy must not
+    // silently select a different set of defaults.
+    let initial_strategy = StrategyConfig::load()
+        .map_err(|e| PiranaError::Config(format!("strategy.toml rejected: {e}")))?;
+    let strategy_config = Arc::new(parking_lot::RwLock::new(initial_strategy));
     let sc_clone = strategy_config.clone();
     tokio::spawn(async move {
         loop {
             let interval = sc_clone.read().system.reload_interval_seconds;
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-            if let Ok(new_config) = StrategyConfig::load() {
-                *sc_clone.write() = new_config;
+            match StrategyConfig::load() {
+                Ok(new_config) => *sc_clone.write() = new_config,
+                Err(e) => tracing::error!(
+                    "strategy.toml hot-reload rejected; keeping last-known-good config: {}",
+                    e
+                ),
             }
         }
     });
