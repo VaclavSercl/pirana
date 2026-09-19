@@ -1,22 +1,16 @@
-sudo tee /etc/systemd/system/pirana-exporter.service <<EOF
-[Unit]
-Description=Pirana Prometheus Exporter
-After=network-online.target
-Wants=network-online.target
+#!/usr/bin/env bash
+set -euo pipefail
 
-[Service]
-Type=simple
-User=wwwenda
-Group=wwwenda
-WorkingDirectory=/home/wwwenda/workspace/pirana
-ExecStart=/usr/bin/python3 /home/wwwenda/workspace/pirana/pirana_exporter.py
-Restart=always
-RestartSec=3
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNIT_DIR=/etc/systemd/system
 
-[Install]
-WantedBy=multi-user.target
-EOF
+sudo install -m 0644 "${ROOT}/deploy/systemd/pirana-exporter.service" "${UNIT_DIR}/pirana-exporter.service"
+sudo mkdir -p "${UNIT_DIR}/pirana-exporter.service.d"
+for conf in "${ROOT}"/deploy/systemd/pirana-exporter.service.d/*.conf; do
+    sudo install -m 0644 "${conf}" "${UNIT_DIR}/pirana-exporter.service.d/$(basename "${conf}")"
+done
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now pirana-exporter.service
-sudo systemctl status pirana-exporter.service --no-pager
+sudo systemctl enable pirana-exporter.service
+sudo systemctl restart pirana-exporter.service
+sudo systemctl --no-pager --full status pirana-exporter.service
