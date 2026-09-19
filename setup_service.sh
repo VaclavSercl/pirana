@@ -4,6 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_DIR=/etc/systemd/system
 
+for credential in /etc/pirana/credentials/bitfinex_api_key /etc/pirana/credentials/bitfinex_api_secret; do
+    if ! sudo test -s "$credential"; then
+        echo "ERROR: required systemd credential is missing/empty: $credential" >&2
+        echo "See docs/OPERATIONS.md -> Credential isolation. Service was NOT restarted." >&2
+        exit 2
+    fi
+done
+
 python3 "${ROOT}/scripts/strategy_versioning.py" validate
 cargo build --release --locked --manifest-path "${ROOT}/Cargo.toml"
 
