@@ -253,9 +253,76 @@ impl Default for AdaptiveCooldownConfig {
 }
 
 impl StrategyConfig {
+    fn invalid(message: impl Into<String>) -> Box<dyn std::error::Error> {
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()))
+    }
+
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let finite = |name: &str, value: f64| -> Result<f64, Box<dyn std::error::Error>> {
+            if !value.is_finite() {
+                return Err(Self::invalid(format!("{name} must be finite")));
+            }
+            Ok(value)
+        };
+
+        if !(1..=3600).contains(&self.system.reload_interval_seconds) {
+            return Err(Self::invalid("reload_interval_seconds must be in 1..=3600"));
+        }
+        if !(1..=10).contains(&self.trading.max_open_orders) {
+            return Err(Self::invalid("max_open_orders must be in hard range 1..=10"));
+        }
+        if self.strategy.ofi_window_size == 0 || self.strategy.trade_cooldown_ms == 0 {
+            return Err(Self::invalid("OFI window and trade cooldown must be > 0"));
+        }
+        let ofi = finite("ofi_trigger_threshold", self.strategy.ofi_trigger_threshold)?;
+        let confidence = finite("min_confidence_score", self.strategy.min_confidence_score)?;
+        if !(0.0 < ofi && ofi <= 1.0) {
+            return Err(Self::invalid("ofi_trigger_threshold must be in (0, 1]"));
+        }
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(Self::invalid("min_confidence_score must be in [0, 1]"));
+        }
+
+        let max_exp = finite("max_aggregate_exposure_pct", self.risk_management.max_aggregate_exposure_pct)?;
+        let max_single = finite("max_single_trade_risk_pct", self.risk_management.max_single_trade_risk_pct)?;
+        let min_pos = finite("min_position_size_pct", self.risk_management.min_position_size_pct)?;
+        let baseline = finite("position_size_pct", self.risk_management.position_size_pct)?;
+        let max_pos = finite("max_position_size_pct", self.risk_management.max_position_size_pct)?;
+        if !(0.01..=90.0).contains(&max_exp) {
+            return Err(Self::invalid("max_aggregate_exposure_pct exceeds hard 90% cap"));
+        }
+        if !(0.01..=5.0).contains(&max_single) {
+            return Err(Self::invalid("max_single_trade_risk_pct exceeds hard 5% cap"));
+        }
+        if !(1.0 <= min_pos && min_pos <= baseline && baseline <= max_pos && max_pos <= 25.0) {
+            return Err(Self::invalid("position sizing must satisfy 1 <= min <= baseline <= max <= 25"));
+        }
+        if !(1..=10).contains(&self.risk_management.max_slippage_bps) {
+            return Err(Self::invalid("max_slippage_bps must be in hard range 1..=10"));
+        }
+
+        if self.volatility.atr_period == 0 || self.volatility.ticks_per_bar == 0 {
+            return Err(Self::invalid("atr_period and ticks_per_bar must be > 0"));
+        }
+        let min_tp = finite("min_tp_usd", self.volatility.min_tp_usd)?;
+        let max_tp = finite("max_tp_usd", self.volatility.max_tp_usd)?;
+        let min_sl = finite("min_sl_usd", self.volatility.min_sl_usd)?;
+        let max_sl = finite("max_sl_usd", self.volatility.max_sl_usd)?;
+        if !(0.0 < min_tp && min_tp <= max_tp && 0.0 < min_sl && min_sl <= max_sl) {
+            return Err(Self::invalid("TP/SL min/max invariant violated"));
+        }
+        if self.adaptive_cooldown.min_ms == 0
+            || self.adaptive_cooldown.min_ms > self.adaptive_cooldown.max_ms
+        {
+            return Err(Self::invalid("adaptive cooldown min_ms/max_ms invariant violated"));
+        }
+        Ok(())
+    }
+
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string("strategy.toml")?;
         let config: StrategyConfig = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
     }
 
