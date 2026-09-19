@@ -36,8 +36,11 @@ def load_env():
     return env
 
 ENV = load_env()
-BOT_TOKEN = ENV["TELEGRAM_BOT_TOKEN"]
-AUTHORIZED_CHAT_ID = int(ENV.get("TELEGRAM_CHAT_ID", "1076582576"))
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ENV.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID_RAW = os.environ.get("TELEGRAM_CHAT_ID") or ENV.get("TELEGRAM_CHAT_ID")
+if not BOT_TOKEN or not CHAT_ID_RAW:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured")
+AUTHORIZED_CHAT_ID = int(CHAT_ID_RAW)
 
 def send_telegram(chat_id, text):
     """Sends HTML formatted message to Telegram."""
@@ -107,11 +110,21 @@ def handle_scale(chat_id, args):
             send_telegram(chat_id, "❌ <b>Chyba:</b> Klíč <code>position_size_pct</code> nebyl nalezen v konfiguraci.")
             return
 
-        with open(STRATEGY_FILE, "w") as f:
+        tmp_path = STRATEGY_FILE + ".telegram.tmp"
+        with open(tmp_path, "w") as f:
             f.writelines(new_lines)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(tmp_path, "rb") as f:
+            tomllib.load(f)
+        os.replace(tmp_path, STRATEGY_FILE)
 
-        # Commit via versioner
-        subprocess.run(["python3", VERSIONER, "commit", f"Telegram command /scale {val:.1f}%"], check=True)
+        # The versioner validates semantic/hard-cap invariants and restores
+        # the last committed strategy if publication fails.
+        subprocess.run(
+            ["python3", VERSIONER, "commit", f"Telegram command /scale {val:.1f}%"],
+            check=True,
+        )
         # Restart pirana to apply immediately
         subprocess.run(["sudo", "systemctl", "restart", "pirana.service"], check=True)
 
@@ -127,24 +140,59 @@ def handle_pause(chat_id):
     except Exception as e:
         send_telegram(chat_id, f"❌ <b>Chyba při zastavení:</b> <code>{e}</code>")
 
+def _wait_for_snapshot(timeout_seconds=20):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        snap = get_snapshot()
+        if snap:
+            return snap
+        time.sleep(1)
+    return None
+
+def _runtime_recovery_status(snap):
+    if not snap:
+        return False, "API po restartu neodpovídá"
+    mode = str(snap.get("system_mode", "Unknown"))
+    block = snap.get("execution_block_reason")
+    accounting = snap.get("accounting") if isinstance(snap.get("accounting"), dict) else {}
+    accounting_status = accounting.get("status", "unknown")
+    if mode != "Halted" and not block and accounting_status == "complete":
+        return True, f"mode={mode}, accounting={accounting_status}, execution_block=none"
+    return False, f"mode={mode}, accounting={accounting_status}, execution_block={block or 'none'}"
+
 def handle_resume(chat_id):
-    """Handles /resume command."""
+    """Restart, then verify that runtime recovery actually permits trading."""
     try:
-        subprocess.run(["sudo", "systemctl", "restart", "pirana.service"], check=True)
-        time.sleep(2)
-        send_telegram(chat_id, "▶️ <b>Trading obnoven.</b>\nSlužba <code>pirana.service</code> byla úspěšně restartována a aktivována.")
+        subprocess.run(["sudo", "-n", "systemctl", "restart", "pirana.service"], check=True)
+        snap = _wait_for_snapshot()
+        ok, detail = _runtime_recovery_status(snap)
+        if ok:
+            send_telegram(chat_id, f"▶️ <b>Trading runtime obnoven a ověřen.</b>\n<code>{detail}</code>")
+        else:
+            send_telegram(chat_id, f"⚠️ <b>Restart proběhl, ale trading není potvrzen jako bezpečně obnovený.</b>\n<code>{detail}</code>")
     except Exception as e:
         send_telegram(chat_id, f"❌ <b>Chyba při spuštění:</b> <code>{e}</code>")
 
 def handle_reconcile(chat_id):
-    """Handles /reconcile command."""
+    """Trigger runtime recovery and report only verifiable postconditions."""
     try:
-        subprocess.run(["sudo", "systemctl", "restart", "pirana.service"], check=True)
-        time.sleep(2)
-        snap = get_snapshot()
-        btc_bal = snap.get("btc_balance", 0.0) if snap else 0.0
-        usd_bal = snap.get("usd_balance", 0.0) if snap else 0.0
-        send_telegram(chat_id, f"🔄 <b>Reconciliation dokončena.</b>\n• Osiřelé objednávky stornovány.\n• Synchronizované zůstatky: <code>{btc_bal:.6f} BTC</code> | <code>${usd_bal:,.2f} USD</code>.")
+        subprocess.run(["sudo", "-n", "systemctl", "restart", "pirana.service"], check=True)
+        snap = _wait_for_snapshot()
+        ok, detail = _runtime_recovery_status(snap)
+        if ok:
+            send_telegram(
+                chat_id,
+                "✅ <b>Runtime reconciliation je potvrzena dostupným API stavem.</b>\n"
+                f"<code>{detail}</code>\n"
+                "Příkaz netvrdí storno konkrétní objednávky bez burzovního důkazu.",
+            )
+        else:
+            send_telegram(
+                chat_id,
+                "⚠️ <b>Runtime reconciliation NENÍ potvrzena.</b>\n"
+                f"<code>{detail}</code>\n"
+                "Další trading musí zůstat blokovaný, dokud recovery podmínky nejsou splněny.",
+            )
     except Exception as e:
         send_telegram(chat_id, f"❌ <b>Chyba při reconciliaci:</b> <code>{e}</code>")
 
@@ -169,7 +217,7 @@ def handle_help(chat_id):
         "• <code>/scale &lt;pct&gt;</code> ➔ Úprava velikosti pozice (např. <code>/scale 8.0</code>)\n"
         "• <code>/pause</code> ➔ Okamžité pozastavení tradingu\n"
         "• <code>/resume</code> ➔ Obnovení aktivního tradingu\n"
-        "• <code>/reconcile</code> ➔ Kontrola zůstatků a storno visících orderů\n"
+        "• <code>/reconcile</code> ➔ Restart recovery + ověření accountingu a execution blocku\n"
         "• <code>/help</code> ➔ Nápověda příkazů\n"
     )
     send_telegram(chat_id, msg)
