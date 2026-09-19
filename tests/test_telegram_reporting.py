@@ -2,6 +2,7 @@
 import importlib
 import io
 import os
+import unittest
 from unittest.mock import patch
 
 from scripts import pirana_report as report
@@ -198,7 +199,11 @@ import sys
 import types
 from pathlib import Path
 
-BOT = Path('/home/wwwenda/workspace/caslav_telegram/caslav_bot.py')
+BOT = Path(os.environ.get(
+    "CASLAV_TELEGRAM_BOT_PATH",
+    "/home/wwwenda/workspace/caslav_telegram/caslav_bot.py",
+))
+EXTERNAL_BOT_AVAILABLE = BOT.is_file()
 
 
 def run_handler(rc, text):
@@ -216,6 +221,7 @@ def run_handler(rc, text):
     return messages
 
 
+@unittest.skipUnless(EXTERNAL_BOT_AVAILABLE, "external caslav_telegram bot is not part of this repository")
 def test_status_escapes_and_preserves_chunks():
     text = '<unsafe> & PnL\n' * 500
     messages = run_handler(0, text)
@@ -224,6 +230,7 @@ def test_status_escapes_and_preserves_chunks():
     assert all('<unsafe>' not in m for m in messages)
 
 
+@unittest.skipUnless(EXTERNAL_BOT_AVAILABLE, "external caslav_telegram bot is not part of this repository")
 def test_failure_does_not_publish_subprocess_stderr():
     messages = run_handler(1, 'private traceback')
     assert len(messages) == 1
