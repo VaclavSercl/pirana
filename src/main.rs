@@ -2672,10 +2672,8 @@ async fn process_ws_message(
                                                     timestamp: chrono::Utc::now().to_rfc3339(),
                                                     order_type: "PAPER".to_string(),
                                                 });
-                                            } else {
-                                                if log_throttler.should_log("no_paper_positions") {
-                                                    tracing::warn!("🔒 [PAPER TRADING] No stínové BUY positions to close! (throttled)");
-                                                }
+                                            } else if log_throttler.should_log("no_paper_positions") {
+                                                tracing::warn!("🔒 [PAPER TRADING] No stínové BUY positions to close! (throttled)");
                                             }
                                         }
                                     } else {
