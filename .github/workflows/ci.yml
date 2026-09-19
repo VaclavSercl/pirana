@@ -1,0 +1,79 @@
+name: Pirana CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - fix/**
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85.1
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal --component clippy
+          rustup default 1.85.1
+          rustc --version
+          cargo --version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependency
+        run: python -m pip install --disable-pip-version-check pytest
+
+      - name: Reject obvious Telegram bot tokens in tracked tree
+        run: |
+          python - <<'PY'
+          import pathlib, re, subprocess, sys
+          token = re.compile(rb'\b\d{8,12}:[A-Za-z0-9_-]{30,}\b')
+          bad = []
+          for name in subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0"):
+              if not name:
+                  continue
+              path = pathlib.Path(name.decode())
+              try:
+                  data = path.read_bytes()
+              except OSError:
+                  continue
+              if token.search(data):
+                  bad.append(str(path))
+          if bad:
+              print("Potential Telegram bot token in tracked files:", *bad, sep="\n")
+              sys.exit(1)
+          PY
+
+      - name: Validate active strategy
+        run: python3 scripts/strategy_versioning.py validate
+
+      - name: Rust check
+        run: cargo check --locked --all-targets
+
+      - name: Rust tests
+        run: cargo test --locked --workspace
+
+      - name: Strict root-package Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Python tests
+        run: python -m pytest -q
+
+      - name: Validate Compose configuration
+        env:
+          BITFINEX_API_KEY: ci-placeholder
+          BITFINEX_API_SECRET: ci-placeholder
+          GRAFANA_PASSWORD: ci-placeholder
+        run: docker compose -f infrastructure/docker/docker-compose.yml config --quiet
+
+      - name: Build production Docker image
+        run: docker build -f infrastructure/docker/Dockerfile .
