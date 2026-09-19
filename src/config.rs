@@ -326,47 +326,4 @@ impl StrategyConfig {
         Ok(config)
     }
 
-    pub fn load_or_default() -> Self {
-        Self::load().unwrap_or_else(|e| {
-            tracing::error!("Failed to load strategy.toml, using safe defaults: {}", e);
-            StrategyConfig {
-                system: SystemConfig { reload_interval_seconds: 60 },
-                trading: TradingConfig { trade_size_btc: 0.0001, max_open_orders: 1 },
-                strategy: StrategyParams {
-                    entry_zone_spread_usd: 1.0,
-                    take_profit_distance_usd: 5.0,
-                    stop_loss_distance_usd: 50.0,
-                    ofi_trigger_threshold: 0.75,
-                    ofi_window_size: 100,
-                    trade_cooldown_ms: 28000,
-                    min_confidence_score: 0.95,
-                },
-                inventory: InventoryConfig {
-                    min_inventory_btc: 0.0001,
-                    max_inventory_btc: 0.05,
-                    target_inventory_btc: 0.01,
-                    target_inventory_pct: 30.0,
-                    use_dynamic_inventory: true,
-                },
-                risk_management: RiskConfig {
-                    max_slippage_bps: 5,
-                    position_size_pct: 5.0,
-                    max_aggregate_exposure_pct: 90.0,
-                    max_single_trade_risk_pct: 5.0,
-                    use_dynamic_winrate_sizing: true,
-                    min_position_size_pct: 1.0,
-                    max_position_size_pct: 15.0,
-                },
-                volatility: VolatilityStrategyConfig::default(),
-                order_book: OrderBookStrategyConfig::default(),
-                trailing_stop: TrailingStopConfig::default(),
-                profit_skimmer: ProfitSkimmerConfig::default(),
-                adaptive_cooldown: AdaptiveCooldownConfig::default(),
-                lead_lag: pirana_features::cross_exchange::LeadLagConfig::default(),
-                hawkes_process: pirana_features::hawkes::HawkesConfig::default(),
-                vpin_guard: pirana_features::vpin::VpinConfig::default(),
-                avellaneda_stoikov: pirana_execution::avellaneda_stoikov::AvellanedaStoikovConfig::default(),
-            }
-        })
-    }
 }
