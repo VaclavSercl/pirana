@@ -177,7 +177,7 @@ printf 'CANONICAL FINANCIAL FIXTURE\\n'
     script = script.replace('export PATH="', 'export PATH="'+str(stub_dir)+':', 1)
     path = tmp_path/'daily.sh'
     path.write_text(script)
-    env = dict(os.environ, TELEGRAM_TOKEN='fixture', CHAT_ID='123',
+    env = dict(os.environ, TELEGRAM_BOT_TOKEN='fixture', TELEGRAM_CHAT_ID='123',
                CAPTURE_REPORT=str(tmp_path/'report'), CAPTURE_SENDS=str(tmp_path/'sends'))
     result = subprocess.run(['bash', str(path)], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
