@@ -59,6 +59,43 @@ jobs:
       - name: Validate active strategy
         run: python3 scripts/strategy_versioning.py validate
 
+      - name: Validate systemd repository graph
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          root = Path("deploy/systemd")
+          errors = []
+
+          for dropin in sorted(root.glob("*.service.d")):
+              base = root / dropin.name.removesuffix(".d")
+              if not base.is_file():
+                  errors.append(f"orphan drop-in directory: {dropin} -> missing {base}")
+
+          for timer in sorted(root.glob("*.timer")):
+              text = timer.read_text(encoding="utf-8")
+              match = re.search(r"^Unit=(.+)$", text, re.MULTILINE)
+              target = match.group(1).strip() if match else timer.name.removesuffix(".timer") + ".service"
+              if not (root / target).is_file():
+                  errors.append(f"timer {timer} targets missing unit {target}")
+
+          for service in sorted(root.glob("*.service")):
+              text = service.read_text(encoding="utf-8")
+              for target in re.findall(r"^OnFailure=([^\s]+)", text, re.MULTILINE):
+                  target = target.replace("%n", service.name)
+                  # Template units use @.service in the repository.
+                  if "@" in target:
+                      template = target.split("@", 1)[0] + "@.service"
+                      if not (root / template).is_file():
+                          errors.append(f"{service} references missing OnFailure template {template}")
+
+          if errors:
+              print("\n".join(errors), file=sys.stderr)
+              sys.exit(1)
+          print("systemd repository graph OK")
+          PY
+
       - name: Rust check
         run: cargo check --locked --all-targets
 
