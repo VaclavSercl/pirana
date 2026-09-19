@@ -1,0 +1,14 @@
+[Unit]
+Description=Caslav Pirana trading doctor
+After=network-online.target pirana.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wwwenda
+Group=wwwenda
+WorkingDirectory=/home/wwwenda/workspace/pirana
+EnvironmentFile=/home/wwwenda/workspace/pirana/.env
+ExecStart=/home/wwwenda/workspace/pirana/target/release/caslav-doctor
+TimeoutStartSec=120
+UMask=0077
