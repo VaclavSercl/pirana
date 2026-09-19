@@ -7,19 +7,13 @@ set -euo pipefail
 
 export PATH="/home/wwwenda/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 WORKSPACE_DIR="/home/wwwenda/workspace/pirana"
-ENV_FILE="${WORKSPACE_DIR}/.env"
 LOG_FILE="${WORKSPACE_DIR}/logs/daily_report.log"
 mkdir -p "${WORKSPACE_DIR}/logs"
 
-# 1. Načtení proměnných prostředí
-if [ -f "$ENV_FILE" ]; then
-    TELEGRAM_TOKEN=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '[:space:]"' | tr -d '\047')
-    CHAT_ID=$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '[:space:]"' | tr -d '\047')
-fi
-
-# Povinná konfigurace — žádný hardcoded příjemce.
-TELEGRAM_TOKEN="${TELEGRAM_TOKEN:?chybi TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN}"
-CHAT_ID="${CHAT_ID:?chybi TELEGRAM_CHAT_ID/CHAT_ID}"
+# Telegram-only configuration comes from /etc/pirana/telegram.env via systemd.
+# Exchange/custody credentials must never be loaded by this service.
+TELEGRAM_TOKEN="${TELEGRAM_BOT_TOKEN:?chybi TELEGRAM_BOT_TOKEN}"
+CHAT_ID="${TELEGRAM_CHAT_ID:?chybi TELEGRAM_CHAT_ID}"
 
 # 2. Definice promptu pro Agenta Čáslav
 PROMPT_CONTENT=$(cat << 'EOF'
@@ -71,7 +65,13 @@ echo "[$(date -Iseconds)] Spouštím ranní audit agenta Čáslav (hermes)... " 
 # nikoli agy. agy zůstává pouze jako oponent/verifikátor na vyžádání.
 # Timeout 5 minut (hermes -z oneshot). -k 30s: SIGKILL po 30s po ignorování SIGTERM.
 AGENT_TIMEOUT=300
-if REPORT_OUTPUT=$(timeout -k 30s "$AGENT_TIMEOUT" hermes -z "$PROMPT_CONTENT" --yolo 2>&1); then
+if REPORT_OUTPUT=$(
+    env -u BITFINEX_API_KEY -u BITFINEX_API_SECRET \
+        -u BITFINEX_API_KEY_FILE -u BITFINEX_API_SECRET_FILE \
+        -u TELEGRAM_BOT_TOKEN -u TELEGRAM_CHAT_ID \
+        -u CASLAV_TELEGRAM_TOKEN -u CASLAV_ALLOWED_USER_ID \
+        timeout -k 30s "$AGENT_TIMEOUT" hermes -z "$PROMPT_CONTENT" --yolo 2>&1
+); then
     AGENT_EXIT=0
 else
     AGENT_EXIT=$?

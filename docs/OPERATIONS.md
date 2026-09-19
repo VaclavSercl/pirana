@@ -81,6 +81,44 @@ immediately instead of hanging on a password prompt. Installing this file does
 not remove any older broad sudo rules; audit `/etc/sudoers` and
 `/etc/sudoers.d/` separately on the live host.
 
+## Credential isolation
+
+Production must not keep Bitfinex keys in the project `.env`.
+
+Create root-only credential sources:
+
+```sh
+sudo install -d -m 0700 /etc/pirana/credentials
+sudo install -m 0600 /dev/null /etc/pirana/credentials/bitfinex_api_key
+sudo install -m 0600 /dev/null /etc/pirana/credentials/bitfinex_api_secret
+sudoedit /etc/pirana/credentials/bitfinex_api_key
+sudoedit /etc/pirana/credentials/bitfinex_api_secret
+
+sudo install -d -m 0755 /etc/pirana
+sudo install -m 0600 /dev/null /etc/pirana/telegram.env
+sudoedit /etc/pirana/telegram.env
+```
+
+`/etc/pirana/telegram.env` contains only:
+
+```text
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+`pirana.service` receives the exchange keys through systemd `LoadCredential=`
+(unit-private credential mount). The Hermes daily-audit unit never loads those
+credentials, cannot open the legacy project `.env` in its mount namespace, and
+launches `hermes` with exchange and Telegram variables removed from its child
+environment.
+
+For local development only, `.env` loading is opt-in with
+`PIRANA_LOAD_DOTENV=1`.
+
+Before enabling the new units, remove Bitfinex keys from the project `.env`
+after verifying the credential files. Do not delete the only working copy until
+the new service starts and authenticated reconciliation succeeds.
+
 ## Network and secrets
 
 Dashboard/API, Rust metrics and the Python exporter bind to loopback by default.

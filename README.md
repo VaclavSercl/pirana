@@ -169,7 +169,8 @@ Real-time web dashboard with:
 ## SECURITY
 
 - Exchange keys: withdrawals DISABLED, IP whitelisting, periodic rotation
-- Hermes must not receive secret-reading OS permissions or blanket sudo. Automated control-plane actions are limited to non-interactive start/stop/restart of `pirana.service` by the tracked sudoers policy.
+- Production Bitfinex keys are delivered to `pirana.service` through unit-private systemd credentials, not the project `.env`. The Hermes daily-audit unit does not load those credentials, blocks access to the legacy `.env`, and receives only a sanitized child environment.
+- Hermes must not receive blanket sudo. Automated control-plane actions are limited to non-interactive start/stop/restart of `pirana.service` by the tracked sudoers policy.
 - API secrets use `zeroize` for memory safety
 - `#[serde(skip_serializing)]` prevents key leakage in logs
 - Containers are configured read-only where practical; host-level isolation and log retention must be verified operationally.

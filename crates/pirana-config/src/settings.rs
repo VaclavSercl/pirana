@@ -3,7 +3,7 @@ use pirana_core::{
     errors::{PiranaError, PiranaResult},
 };
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, fs, path::PathBuf};
 use tracing::{info, warn};
 
 /// Process/infrastructure configuration. Runtime trading/risk truth lives in
@@ -98,16 +98,43 @@ pub struct InfrastructureConfig {
     pub environment: String,
 }
 
+fn read_secret(env_name: &str, credential_name: &str) -> String {
+    if let Ok(value) = std::env::var(env_name) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+
+    let explicit_file = format!("{env_name}_FILE");
+    let path = std::env::var_os(&explicit_file)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .map(PathBuf::from)
+                .map(|dir| dir.join(credential_name))
+        });
+
+    path.and_then(|p| fs::read_to_string(p).ok())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
+}
+
 impl PiranaConfig {
-    /// Load configuration from environment variables
-    /// Uses dotenvy to load .env file if present
+    /// Load process configuration.
+    ///
+    /// Production does not auto-read a project .env file. Developers may opt
+    /// in explicitly with PIRANA_LOAD_DOTENV=1. Exchange credentials may be
+    /// supplied via environment variables or unit-private systemd credentials.
     pub fn from_env() -> PiranaResult<Self> {
-        // Load .env file if it exists (silently ignore if missing)
-        if dotenvy::dotenv().is_ok() {
-            info!("Loaded .env file");
+        let load_dotenv = std::env::var("PIRANA_LOAD_DOTENV")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if load_dotenv && dotenvy::dotenv().is_ok() {
+            info!("Loaded .env file because PIRANA_LOAD_DOTENV is enabled");
         }
 
-        info!("Loading configuration from environment");
+        info!("Loading configuration from environment/systemd credentials");
 
         // Historical releases advertised these as live env overrides even
         // though the trading loop never consumed PiranaConfig.risk. Keep them
@@ -127,11 +154,11 @@ impl PiranaConfig {
             }
         }
 
-        let api_key = std::env::var("BITFINEX_API_KEY").unwrap_or_default();
-        let api_secret = std::env::var("BITFINEX_API_SECRET").unwrap_or_default();
+        let api_key = read_secret("BITFINEX_API_KEY", "bitfinex_api_key");
+        let api_secret = read_secret("BITFINEX_API_SECRET", "bitfinex_api_secret");
 
-        if api_key.is_empty() {
-            warn!("BITFINEX_API_KEY not set — running in read-only mode");
+        if api_key.is_empty() || api_secret.is_empty() {
+            warn!("Bitfinex credentials are incomplete — authenticated trading is unavailable");
         }
 
         Ok(Self {
