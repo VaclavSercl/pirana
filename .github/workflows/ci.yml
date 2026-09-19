@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pirana-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: pirana-ci-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
