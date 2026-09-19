@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Caslav doctor every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+AccuracySec=30s
+Unit=caslav-doctor.service
+
+[Install]
+WantedBy=timers.target
