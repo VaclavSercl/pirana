@@ -1,3 +1,4 @@
+import os
 from decimal import Decimal, InvalidOperation
 import urllib.request
 import json
@@ -46,7 +47,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/metrics':
             try:
-                req = urllib.request.urlopen("http://localhost:8080/api/snapshot", timeout=2)
+                req = urllib.request.urlopen(
+                    os.environ.get("PIRANA_SNAPSHOT_URL", "http://127.0.0.1:8080/api/snapshot"),
+                    timeout=2,
+                )
                 data = json.loads(req.read())
                 
                 metrics = []
@@ -77,6 +81,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
         pass
 
 if __name__ == "__main__":
-    print("Pirana Prometheus Exporter starting on port 9091...")
-    server = HTTPServer(('0.0.0.0', 9091), MetricsHandler)
+    bind = os.environ.get("PIRANA_EXPORTER_BIND", "127.0.0.1")
+    port = int(os.environ.get("PIRANA_EXPORTER_PORT", "9091"))
+    print(f"Pirana Prometheus Exporter starting on {bind}:{port}...")
+    server = HTTPServer((bind, port), MetricsHandler)
     server.serve_forever()
