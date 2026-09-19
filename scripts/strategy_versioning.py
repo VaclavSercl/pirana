@@ -16,10 +16,12 @@ import sys
 import tomllib
 import subprocess
 from datetime import datetime
+from pathlib import Path
 
-STRATEGY_FILE = "/home/wwwenda/workspace/pirana/strategy.toml"
-BACKUP_FILE = "/home/wwwenda/workspace/pirana/strategy.toml.bak"
-REPO_DIR = "/home/wwwenda/workspace/pirana"
+_DEFAULT_REPO_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = os.environ.get("PIRANA_REPO_DIR", str(_DEFAULT_REPO_DIR))
+STRATEGY_FILE = os.environ.get("PIRANA_STRATEGY_FILE", os.path.join(REPO_DIR, "strategy.toml"))
+BACKUP_FILE = os.environ.get("PIRANA_STRATEGY_BACKUP", os.path.join(REPO_DIR, "strategy.toml.bak"))
 REMOTE = os.environ.get("PIRANA_GIT_REMOTE", "origin")
 
 
