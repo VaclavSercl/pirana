@@ -38,12 +38,17 @@ def load_env():
 ENV = load_env()
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ENV.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID_RAW = os.environ.get("TELEGRAM_CHAT_ID") or ENV.get("TELEGRAM_CHAT_ID")
-if not BOT_TOKEN or not CHAT_ID_RAW:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured")
-AUTHORIZED_CHAT_ID = int(CHAT_ID_RAW)
+AUTHORIZED_CHAT_ID = int(CHAT_ID_RAW) if CHAT_ID_RAW else None
+
+def _require_runtime_credentials():
+    if not BOT_TOKEN or AUTHORIZED_CHAT_ID is None:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured")
 
 def send_telegram(chat_id, text):
     """Sends HTML formatted message to Telegram."""
+    if not BOT_TOKEN:
+        print("[ERROR] TELEGRAM_BOT_TOKEN is not configured", file=sys.stderr)
+        return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -257,6 +262,7 @@ def process_message(msg):
 
 def poll_updates():
     """Main long-polling loop for Telegram updates."""
+    _require_runtime_credentials()
     print("🚀 Čáslav Telegram Control Daemon starting...")
     last_update_id = 0
     while True:
