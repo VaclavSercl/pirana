@@ -59,6 +59,10 @@ jobs:
       - name: Validate active strategy
         run: python3 scripts/strategy_versioning.py validate
 
+      - name: Validate shell syntax
+        run: |
+          git ls-files -z '*.sh' | xargs -0 -r -n1 bash -n
+
       - name: Validate systemd repository graph
         run: |
           python - <<'PY'
