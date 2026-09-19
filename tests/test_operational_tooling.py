@@ -147,3 +147,15 @@ def test_invalid_hard_cap_is_rejected(tmp_path, monkeypatch):
     (repo / "strategy.toml").write_text(bad)
     assert not module.commit_strategy("must reject unsafe hard cap")
     assert "max_aggregate_exposure_pct = 90.0" in (repo / "strategy.toml").read_text()
+
+
+def test_safe_config_guard_never_rolls_back_or_restarts_automatically():
+    from pathlib import Path
+    script = Path("scripts/safe_config_update.sh").read_text()
+    auto = script.split("auto-guard)", 1)[1].split(";;", 1)[0]
+    assert "rollback" not in auto
+    assert "systemctl restart" not in auto
+    assert "127.0.0.1:8080/api/snapshot" in auto
+    manual = script.split("rollback)", 1)[1].split(";;", 1)[0]
+    assert "strategy_versioning.py" not in manual or "VERSIONER" in manual
+    assert "systemctl restart" not in manual
