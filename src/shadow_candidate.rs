@@ -18,8 +18,12 @@ use serde::{Deserialize, Serialize};
 
 pub const BASE_FLOW_THRESHOLD: f64 = crate::entry_policy::DEFAULT_PULLBACK_FLOW_THRESHOLD;
 pub const BASE_HWM_RATIO: f64 = crate::entry_policy::DEFAULT_PULLBACK_FLOW_PULLBACK_RATIO;
-pub const STRONGER_FLOW_THRESHOLD: f64 = 0.40;
-pub const STRONGER_HWM_RATIO: f64 = 0.9995;
+
+/// Variant 1: Deep Dip — requires deeper 25 bps discount (0.25% under HWM)
+pub const DEEP_DIP_HWM_RATIO: f64 = 0.9975;
+
+/// Variant 2: Strong Flow — requires 3x stronger order flow confirmation (0.15)
+pub const STRONG_FLOW_THRESHOLD: f64 = 0.15;
 
 pub const TAKE_PROFIT_BPS: f64 = 5.0;
 pub const STOP_LOSS_BPS: f64 = 10.0;
@@ -31,7 +35,7 @@ pub const EVALUATION_COST_TIERS: [f64; 4] = [0.0, 1.0, 2.0, 5.0];
 pub const SHADOW_LOG_PATH: &str = "/var/lib/pirana/shadow_experiments.jsonl";
 pub const MAX_RECENT_TRADES: usize = 1_000;
 
-/// Pure helper to evaluate baseline pullback flow signal condition.
+/// Pure helper to evaluate baseline pullback flow signal condition (V0).
 #[inline]
 pub fn evaluate_baseline_signal(flow: f64, hwm: f64, price: f64) -> bool {
     flow.is_finite()
@@ -43,16 +47,70 @@ pub fn evaluate_baseline_signal(flow: f64, hwm: f64, price: f64) -> bool {
         && price < hwm * BASE_HWM_RATIO
 }
 
-/// Pure helper to evaluate fixed stronger pullback flow signal condition.
+/// Pure helper to evaluate Deep Dip variant signal condition (V1: min 25 bps below HWM).
 #[inline]
-pub fn evaluate_stronger_candidate_signal(flow: f64, hwm: f64, price: f64) -> bool {
+pub fn evaluate_deep_dip_signal(flow: f64, hwm: f64, price: f64) -> bool {
     flow.is_finite()
         && hwm.is_finite()
         && price.is_finite()
-        && flow > STRONGER_FLOW_THRESHOLD
+        && flow > BASE_FLOW_THRESHOLD
         && hwm > 0.0
         && price > 0.0
-        && price < hwm * STRONGER_HWM_RATIO
+        && price < hwm * DEEP_DIP_HWM_RATIO
+}
+
+/// Pure helper to evaluate Strong Flow variant signal condition (V2: flow > 0.15).
+#[inline]
+pub fn evaluate_strong_flow_signal(flow: f64, hwm: f64, price: f64) -> bool {
+    flow.is_finite()
+        && hwm.is_finite()
+        && price.is_finite()
+        && flow > STRONG_FLOW_THRESHOLD
+        && hwm > 0.0
+        && price > 0.0
+        && price < hwm * BASE_HWM_RATIO
+}
+
+/// Pure helper to evaluate Volatility-Adaptive Dip variant signal condition (V3: dip scaled by ATR).
+#[inline]
+pub fn evaluate_adaptive_dip_signal(flow: f64, hwm: f64, price: f64, current_atr: f64) -> bool {
+    if !flow.is_finite()
+        || !hwm.is_finite()
+        || !price.is_finite()
+        || !current_atr.is_finite()
+        || hwm <= 0.0
+        || price <= 0.0
+        || current_atr <= 0.0
+        || flow <= BASE_FLOW_THRESHOLD
+    {
+        return false;
+    }
+    let dip_fraction = (0.5 * current_atr / price).clamp(0.0005, 0.0050);
+    price < hwm * (1.0 - dip_fraction)
+}
+
+/// Pure helper to evaluate Cartea-Jaimungal (CJG) drift-augmented pullback flow signal (V4).
+/// In Cartea & Jaimungal (2014), reservation price incorporates order flow drift:
+/// r* = s - q*gamma*sigma^2*dt + alpha_flow / (gamma * kappa).
+/// Under positive flow momentum, required dip threshold is dynamically modulated:
+/// price < HWM * (1 - clamp(0.0010 - (flow * 0.0002) / (atr / price), 0.0004, 0.0030))
+#[inline]
+pub fn evaluate_cjg_candidate_signal(flow: f64, hwm: f64, price: f64, current_atr: f64) -> bool {
+    if !flow.is_finite()
+        || !hwm.is_finite()
+        || !price.is_finite()
+        || !current_atr.is_finite()
+        || hwm <= 0.0
+        || price <= 0.0
+        || current_atr <= 0.0
+        || flow <= BASE_FLOW_THRESHOLD
+    {
+        return false;
+    }
+    let normalized_vol = (current_atr / price).max(0.0005);
+    let drift_adjustment = (flow * 0.0002 / normalized_vol).clamp(0.0, 0.0006);
+    let required_dip = (0.0010 - drift_adjustment).clamp(0.0004, 0.0030);
+    price < hwm * (1.0 - required_dip)
 }
 
 /// Raw resolved shadow trade record matching gauntlet promotion gate schemas.
@@ -361,10 +419,23 @@ impl ShadowStrategyEvaluator {
     }
 }
 
-/// Dual shadow experiment engine managing concurrent baseline and candidate evaluators.
+/// Signals evaluated across all Pullback Flow variants on a single tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PullbackFlowSignals {
+    pub baseline: bool,
+    pub deep_dip: bool,
+    pub strong_flow: bool,
+    pub adaptive_dip: bool,
+    pub cjg_model: bool,
+}
+
+/// Multi-variant shadow experiment engine managing concurrent Pullback Flow variant evaluators.
 pub struct ShadowExperimentEngine {
     pub baseline_evaluator: ShadowStrategyEvaluator,
-    pub candidate_evaluator: ShadowStrategyEvaluator,
+    pub deep_dip_evaluator: ShadowStrategyEvaluator,
+    pub strong_flow_evaluator: ShadowStrategyEvaluator,
+    pub adaptive_dip_evaluator: ShadowStrategyEvaluator,
+    pub cjg_evaluator: ShadowStrategyEvaluator,
     tx: Option<tokio::sync::mpsc::Sender<ShadowTradeRecord>>,
 }
 
@@ -372,42 +443,42 @@ impl ShadowExperimentEngine {
     pub fn new(tx: Option<tokio::sync::mpsc::Sender<ShadowTradeRecord>>) -> Self {
         Self {
             baseline_evaluator: ShadowStrategyEvaluator::new("Pullback_Flow_Baseline"),
-            candidate_evaluator: ShadowStrategyEvaluator::new("Pullback_Flow_StrongerCandidate"),
+            deep_dip_evaluator: ShadowStrategyEvaluator::new("Pullback_Flow_DeepDip"),
+            strong_flow_evaluator: ShadowStrategyEvaluator::new("Pullback_Flow_StrongFlow"),
+            adaptive_dip_evaluator: ShadowStrategyEvaluator::new("Pullback_Flow_AdaptiveDip"),
+            cjg_evaluator: ShadowStrategyEvaluator::new("Pullback_Flow_CJG_DriftAware"),
             tx,
         }
     }
 
-    /// Process a tick event across both baseline and candidate evaluators.
+    /// Process a tick event across all Pullback Flow variant evaluators.
     pub fn process_tick(
         &mut self,
         price: f64,
         now_ms: u64,
         best_bid: Option<f64>,
         best_ask: Option<f64>,
-        baseline_signal: bool,
-        candidate_signal: bool,
+        signals: PullbackFlowSignals,
     ) {
-        if let Some(record) = self.baseline_evaluator.process_observation(
-            baseline_signal,
-            now_ms,
-            best_bid,
-            best_ask,
-            price,
-        ) {
-            if let Some(tx) = &self.tx {
-                let _ = tx.try_send(record);
-            }
-        }
+        let items = [
+            (&mut self.baseline_evaluator, signals.baseline),
+            (&mut self.deep_dip_evaluator, signals.deep_dip),
+            (&mut self.strong_flow_evaluator, signals.strong_flow),
+            (&mut self.adaptive_dip_evaluator, signals.adaptive_dip),
+            (&mut self.cjg_evaluator, signals.cjg_model),
+        ];
 
-        if let Some(record) = self.candidate_evaluator.process_observation(
-            candidate_signal,
-            now_ms,
-            best_bid,
-            best_ask,
-            price,
-        ) {
-            if let Some(tx) = &self.tx {
-                let _ = tx.try_send(record);
+        for (evaluator, sig) in items {
+            if let Some(record) = evaluator.process_observation(
+                sig,
+                now_ms,
+                best_bid,
+                best_ask,
+                price,
+            ) {
+                if let Some(tx) = &self.tx {
+                    let _ = tx.try_send(record);
+                }
             }
         }
     }
@@ -416,8 +487,40 @@ impl ShadowExperimentEngine {
         self.baseline_evaluator.compute_stats()
     }
 
+    #[allow(dead_code)]
+    pub fn deep_dip_stats(&self) -> ShadowStrategyStats {
+        self.deep_dip_evaluator.compute_stats()
+    }
+
+    #[allow(dead_code)]
+    pub fn strong_flow_stats(&self) -> ShadowStrategyStats {
+        self.strong_flow_evaluator.compute_stats()
+    }
+
+    #[allow(dead_code)]
+    pub fn adaptive_dip_stats(&self) -> ShadowStrategyStats {
+        self.adaptive_dip_evaluator.compute_stats()
+    }
+
+    #[allow(dead_code)]
+    pub fn cjg_stats(&self) -> ShadowStrategyStats {
+        self.cjg_evaluator.compute_stats()
+    }
+
+    /// Legacy accessor for compatibility
     pub fn candidate_stats(&self) -> ShadowStrategyStats {
-        self.candidate_evaluator.compute_stats()
+        self.deep_dip_evaluator.compute_stats()
+    }
+
+    #[allow(dead_code)]
+    pub fn all_stats(&self) -> Vec<ShadowStrategyStats> {
+        vec![
+            self.baseline_evaluator.compute_stats(),
+            self.deep_dip_evaluator.compute_stats(),
+            self.strong_flow_evaluator.compute_stats(),
+            self.adaptive_dip_evaluator.compute_stats(),
+            self.cjg_evaluator.compute_stats(),
+        ]
     }
 }
 
@@ -619,59 +722,77 @@ mod tests {
     }
 
     #[test]
-    fn test_signal_evaluation_baseline_vs_stronger() {
+    fn test_signal_evaluation_pullback_flow_variants() {
         let hwm = 100.0;
+        let atr = 0.50; // 50 USD / 100 = 0.5% => clamp between 0.0005 and 0.0050 => 0.0025 (25 bps)
 
-        // Baseline: flow > 0.05 && price < hwm * 0.999 (price < 99.90)
-        // Stronger: flow > 0.40 && price < hwm * 0.9995 (price < 99.95)
+        // V0 Baseline: flow > 0.05 && price < 99.90 (10 bps dip)
+        // V1 Deep Dip: flow > 0.05 && price < 99.75 (25 bps dip)
+        // V2 Strong Flow: flow > 0.15 && price < 99.90 (10 bps dip)
+        // V3 Adaptive: flow > 0.05 && price < hwm * (1 - clamp(0.5 * atr / price, 0.0005, 0.0050))
 
-        // Case 1: flow = 0.10, price = 99.80 -> Baseline fires, Stronger does NOT (flow <= 0.40)
-        assert!(evaluate_baseline_signal(0.10, hwm, 99.80));
-        assert!(!evaluate_stronger_candidate_signal(0.10, hwm, 99.80));
+        // Case 1: flow = 0.10, price = 99.85 (15 bps dip)
+        // Baseline: fires (flow 0.10 > 0.05, 99.85 < 99.90)
+        // Deep Dip: does NOT fire (99.85 >= 99.75)
+        // Strong Flow: does NOT fire (flow 0.10 <= 0.15)
+        assert!(evaluate_baseline_signal(0.10, hwm, 99.85));
+        assert!(!evaluate_deep_dip_signal(0.10, hwm, 99.85));
+        assert!(!evaluate_strong_flow_signal(0.10, hwm, 99.85));
 
-        // Case 2: flow = 0.50, price = 99.92 -> Stronger fires, Baseline does NOT (price >= 99.90)
-        assert!(!evaluate_baseline_signal(0.50, hwm, 99.92));
-        assert!(evaluate_stronger_candidate_signal(0.50, hwm, 99.92));
+        // Case 2: flow = 0.20, price = 99.70 (30 bps dip)
+        // All should fire!
+        assert!(evaluate_baseline_signal(0.20, hwm, 99.70));
+        assert!(evaluate_deep_dip_signal(0.20, hwm, 99.70));
+        assert!(evaluate_strong_flow_signal(0.20, hwm, 99.70));
+        assert!(evaluate_adaptive_dip_signal(0.20, hwm, 99.70, atr));
 
-        // Case 3: flow = 0.50, price = 99.80 -> Both fire
-        assert!(evaluate_baseline_signal(0.50, hwm, 99.80));
-        assert!(evaluate_stronger_candidate_signal(0.50, hwm, 99.80));
-
-        // Case 4: flow = 0.02, price = 99.80 -> Neither fires
-        assert!(!evaluate_baseline_signal(0.02, hwm, 99.80));
-        assert!(!evaluate_stronger_candidate_signal(0.02, hwm, 99.80));
-
-        // Case 5: Non-finite inputs -> safe false
-        assert!(!evaluate_baseline_signal(f64::NAN, hwm, 99.80));
-        assert!(!evaluate_stronger_candidate_signal(0.50, f64::INFINITY, 99.80));
+        // Case 3: Non-finite inputs safe rejection
+        assert!(!evaluate_baseline_signal(f64::NAN, hwm, 99.70));
+        assert!(!evaluate_deep_dip_signal(0.20, f64::NAN, 99.70));
+        assert!(!evaluate_strong_flow_signal(0.20, hwm, f64::INFINITY));
+        assert!(!evaluate_adaptive_dip_signal(0.20, hwm, 99.70, f64::NAN));
     }
 
     #[test]
-    fn test_dual_engine_tick_processing() {
+    fn test_multi_variant_engine_tick_processing() {
         let mut engine = ShadowExperimentEngine::new(None);
 
         let hwm = 100.0;
         let price = 99.80;
         let b_sig = evaluate_baseline_signal(0.10, hwm, price);
-        let c_sig = evaluate_stronger_candidate_signal(0.10, hwm, price);
+        let d_sig = evaluate_deep_dip_signal(0.10, hwm, price); // false (99.80 >= 99.75)
+        let s_sig = evaluate_strong_flow_signal(0.10, hwm, price); // false (0.10 <= 0.15)
+        let a_sig = evaluate_adaptive_dip_signal(0.10, hwm, price, 0.10);
+        let c_sig = evaluate_cjg_candidate_signal(0.10, hwm, price, 0.10);
+
         assert!(b_sig);
-        assert!(!c_sig);
+        assert!(!d_sig);
+        assert!(!s_sig);
+
+        let signals = PullbackFlowSignals {
+            baseline: b_sig,
+            deep_dip: d_sig,
+            strong_flow: s_sig,
+            adaptive_dip: a_sig,
+            cjg_model: c_sig,
+        };
 
         // Process tick at t=1000
-        engine.process_tick(price, 1000, Some(99.70), Some(99.90), b_sig, c_sig);
+        engine.process_tick(price, 1000, Some(99.70), Some(99.90), signals);
 
         assert!(matches!(
             engine.baseline_evaluator.state,
             ShadowState::SignalPending { .. }
         ));
-        assert_eq!(engine.candidate_evaluator.state, ShadowState::Idle);
+        assert_eq!(engine.deep_dip_evaluator.state, ShadowState::Idle);
+        assert_eq!(engine.strong_flow_evaluator.state, ShadowState::Idle);
 
         // Process next tick at t=1001
-        engine.process_tick(price, 1001, Some(99.70), Some(99.90), false, false);
+        engine.process_tick(price, 1001, Some(99.70), Some(99.90), PullbackFlowSignals::default());
         assert!(matches!(
             engine.baseline_evaluator.state,
             ShadowState::InPosition { .. }
         ));
-        assert_eq!(engine.candidate_evaluator.state, ShadowState::Idle);
+        assert_eq!(engine.deep_dip_evaluator.state, ShadowState::Idle);
     }
 }

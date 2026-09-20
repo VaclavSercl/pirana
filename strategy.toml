@@ -138,10 +138,11 @@ min_ms = 1000
 max_ms = 20000
 
 [lead_lag]
-enabled = true
-binance_enabled = true
-coinbase_enabled = true
-# Minimální cenový rozdíl v USD mezi Leader trhy (Binance + Coinbase) a Bitfinexem
+# [DOKTRÍNA JEDINÉ STRATEGIE — 2026-09-20]
+# Vypnuto: Ostrý i výzkumný fokus je výhradně na Pullback Flow + Stoikov vyvažování.
+enabled = false
+binance_enabled = false
+coinbase_enabled = false
 min_lead_disparity_usd = 15.0
 velocity_window_ms = 250
 weight_binance = 0.65

@@ -48,8 +48,9 @@ use signal_exit::{evaluate_signal_exit, SignalExitDecision};
 
 mod shadow_candidate;
 use shadow_candidate::{
-    evaluate_baseline_signal, evaluate_stronger_candidate_signal, spawn_shadow_writer,
-    ShadowExperimentEngine, SHADOW_LOG_PATH,
+    evaluate_adaptive_dip_signal, evaluate_baseline_signal, evaluate_cjg_candidate_signal,
+    evaluate_deep_dip_signal, evaluate_strong_flow_signal, spawn_shadow_writer,
+    PullbackFlowSignals, ShadowExperimentEngine, SHADOW_LOG_PATH,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1807,13 +1808,15 @@ async fn process_ws_message(
 
                                 vpin.process_trade(side, qty.abs());
                                 let vpin_score = vpin.calculate_vpin();
+                                let (buy_vpin, sell_vpin) = vpin.calculate_directional_vpin();
                                 // [CASLAV v5.1 / Ú3] Prah toxicity ctem z KALIBROVANEHO
                                 // stavu risk enginu, ne ze statickeho strategy.toml.
                                 // Do teto opravy kalibrator prah pocital a publikoval
                                 // na dashboardu, ale hot loop porovnaval proti zmrazene
                                 // hodnote z configu — kalibrace byla ucinna jen na papire.
                                 let vpin_threshold = risk_engine.vpin_toxicity_threshold();
-                                let is_vpin_toxic = vpin.is_toxic_with_threshold(vpin_threshold);
+                                let is_vpin_sell_toxic = vpin.is_sell_toxic_with_threshold(vpin_threshold);
+                                let is_vpin_buy_toxic = vpin.is_buy_toxic_with_threshold(vpin_threshold);
                                 let is_vpin_emergency = vpin.is_emergency_toxic();
 
                                 *state.vpin_score.write() = vpin_score;
@@ -1822,16 +1825,39 @@ async fn process_ws_message(
                                 // VPIN Adverse Selection & Emergency Flash Crash Guard
                                 if is_vpin_emergency {
                                     if log_throttler.should_log("vpin_emergency_toxic") {
-                                        tracing::warn!("🚨 [VPIN EMERGENCY FLASH CRASH ALERT] VPIN={:.1}% >= 75% | Flash Crash Risk - Blocking new entries & safeguarding passive book", vpin_score * 100.0);
+                                        tracing::warn!(
+                                            "🚨 [VPIN EMERGENCY FLASH CRASH ALERT] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.1}% | Flash Crash Risk - Blocking new entries & safeguarding passive book",
+                                            vpin_score * 100.0,
+                                            sell_vpin * 100.0,
+                                            buy_vpin * 100.0,
+                                            vpin.emergency_threshold() * 100.0
+                                        );
                                     }
                                     return;
                                 }
 
-                                if is_vpin_toxic && !is_lead_lag_buy && !is_hawkes_buy && !is_lead_lag_sell && !is_hawkes_sell {
-                                    if log_throttler.should_log("vpin_high_toxicity") {
-                                        tracing::warn!("⚠️ [VPIN HIGH TOXICITY] VPIN={:.1}% >= {:.0}% (kalibrovany prah; staticky config {:.0}%) - Adverse selection guard active, skipping standard noise entries", vpin_score * 100.0, vpin_threshold * 100.0, conf.vpin_guard.toxicity_threshold * 100.0);
+                                // [DIRECTIONAL VPIN ADVERSE SELECTION GUARD (Easley, Lopez de Prado & O'Hara 2024)]
+                                // We block long entries ONLY during sell-side dumping (adverse selection for buyers).
+                                // When institutional buyers sweep the book (buy_vpin dominates), entries are permitted.
+                                if is_vpin_sell_toxic && !is_lead_lag_buy && !is_hawkes_buy && !is_lead_lag_sell && !is_hawkes_sell {
+                                    if log_throttler.should_log("vpin_high_toxicity_sell") {
+                                        tracing::warn!(
+                                            "⚠️ [DIRECTIONAL VPIN SELL TOXICITY] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.0}% (kalibrovany prah) - Sell-side adverse selection guard active, skipping BUY entry",
+                                            vpin_score * 100.0,
+                                            sell_vpin * 100.0,
+                                            buy_vpin * 100.0,
+                                            vpin_threshold * 100.0
+                                        );
                                     }
                                     return;
+                                } else if is_vpin_buy_toxic && log_throttler.should_log("vpin_high_toxicity_buy") {
+                                    tracing::info!(
+                                        "🚀 [DIRECTIONAL VPIN BUY FLOW] VPIN={:.1}% (Buy={:.1}%, Sell={:.1}%) >= {:.0}% - Institutional buy flow detected, entries permitted",
+                                        vpin_score * 100.0,
+                                        buy_vpin * 100.0,
+                                        sell_vpin * 100.0,
+                                        vpin_threshold * 100.0
+                                    );
                                 }
 
                                 // [FÁZE 2c] Pullback entry: v TrendUp režimu
@@ -1854,12 +1880,67 @@ async fn process_ws_message(
                                 let price_below_spike = hwm <= 0.0 || price < hwm * 0.9998;
                                 let ofi_pullback_ok = ofi.is_buying_pressure() && price_below_spike;
 
-                                // [PULLBACK FLOW SIGNAL] flow > 0.05 AND cena pod HWM*0.999.
-                                // Historical trade-print results are proxy-only and never authorize promotion.
+                                // [PULLBACK FLOW SIGNAL MATRIX]
+                                // V0 Baseline: flow > 0.05 AND price < HWM * 0.9990
+                                // V1 Deep Dip: flow > 0.05 AND price < HWM * 0.9975
+                                // V2 Strong Flow: flow > 0.15 AND price < HWM * 0.9990
+                                // V3 Adaptive Dip: flow > 0.05 AND dip scaled by ATR
+                                // V4 CJG Drift-Aware: flow > 0.05 AND drift-modulated dip
                                 let flow_hwm = flow_calculator.hwm();
                                 let current_flow = flow_calculator.current_flow();
-                                let pullback_flow_signal = evaluate_baseline_signal(current_flow, flow_hwm, price);
-                                let stronger_candidate_signal = evaluate_stronger_candidate_signal(current_flow, flow_hwm, price);
+                                let current_atr = atr.current_atr();
+                                let shadow_signals = PullbackFlowSignals {
+                                    baseline: evaluate_baseline_signal(current_flow, flow_hwm, price),
+                                    deep_dip: evaluate_deep_dip_signal(current_flow, flow_hwm, price),
+                                    strong_flow: evaluate_strong_flow_signal(current_flow, flow_hwm, price),
+                                    adaptive_dip: evaluate_adaptive_dip_signal(current_flow, flow_hwm, price, current_atr),
+                                    cjg_model: evaluate_cjg_candidate_signal(current_flow, flow_hwm, price, current_atr),
+                                };
+                                let raw_pullback_flow_signal = shadow_signals.baseline;
+
+                                // [MICROSTRUCTURE CONFIRMATION GATES (2024-2026 RESEARCH)]
+                                // Gate 1: Hawkes Liquidation Avalanche / Sell Cascade Brake (Raffaelli et al. 2026)
+                                let is_sell_cascade = conf.hawkes_process.enabled && hawkes_eval.is_sell_cascade;
+
+                                // Gate 2: Multi-Level L2 Depth Queue Confirmation Gate (Bieganowski & Ślepaczuk 2026)
+                                // Reject entry if ask side heavily dominates the book (queue resistance / ask wall)
+                                let is_ask_wall = conf.order_book.use_l2_depth_imbalance && l2_depth.is_selling_supported();
+
+                                // Gate 3: Hawkes Buy Clustering Conviction Boost (Raffaelli et al. 2026)
+                                let hawkes_buy_conviction = conf.hawkes_process.enabled
+                                    && hawkes_eval.buy_zscore >= 1.2
+                                    && hawkes_eval.buy_intensity > hawkes_eval.sell_intensity;
+
+                                if raw_pullback_flow_signal {
+                                    if is_sell_cascade {
+                                        if log_throttler.should_log("hawkes_sell_cascade_block") {
+                                            tracing::warn!(
+                                                "🛑 [HAWKES CASCADE BRAKE] Live BUY suppressed: Active sell cascade detected (Z_sell={:.2} >= {:.2}, Sell λ={:.2} > Buy λ={:.2})",
+                                                hawkes_eval.sell_zscore,
+                                                conf.hawkes_process.zscore_threshold,
+                                                hawkes_eval.sell_intensity,
+                                                hawkes_eval.buy_intensity
+                                            );
+                                        }
+                                    } else if is_ask_wall {
+                                        if log_throttler.should_log("l2_ask_wall_block") {
+                                            tracing::warn!(
+                                                "🛑 [L2 DEPTH BRAKE] Live BUY suppressed: Heavy ask wall resistance detected (L2 imb={:.3} <= -{:.2})",
+                                                l2_imb,
+                                                conf.order_book.min_l2_imbalance_threshold
+                                            );
+                                        }
+                                    } else if hawkes_buy_conviction && log_throttler.should_log("hawkes_buy_boost") {
+                                        tracing::info!(
+                                            "⚡ [HAWKES CONVICTION BOOST] Pullback BUY confirmed with buy clustering (Z_buy={:.2} >= 1.2, Buy λ={:.2} > Sell λ={:.2})",
+                                            hawkes_eval.buy_zscore,
+                                            hawkes_eval.buy_intensity,
+                                            hawkes_eval.sell_intensity
+                                        );
+                                    }
+                                }
+
+                                let pullback_flow_signal = raw_pullback_flow_signal && !is_sell_cascade && !is_ask_wall;
 
                                 let best_bid = order_book.best_bid().map(|b| b.price);
                                 let best_ask = order_book.best_ask().map(|a| a.price);
@@ -1868,8 +1949,7 @@ async fn process_ws_message(
                                     now_ms,
                                     best_bid,
                                     best_ask,
-                                    pullback_flow_signal,
-                                    stronger_candidate_signal,
+                                    shadow_signals,
                                 );
 
                                 let ofi_entry_condition = if conf.order_book.use_l2_depth_imbalance {

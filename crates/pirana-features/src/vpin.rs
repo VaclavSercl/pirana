@@ -38,6 +38,16 @@ impl VolumeBucket {
     }
 
     #[inline]
+    pub fn buy_imbalance(&self) -> f64 {
+        (self.buy_volume - self.sell_volume).max(0.0)
+    }
+
+    #[inline]
+    pub fn sell_imbalance(&self) -> f64 {
+        (self.sell_volume - self.buy_volume).max(0.0)
+    }
+
+    #[inline]
     pub fn total_volume(&self) -> f64 {
         self.buy_volume + self.sell_volume
     }
@@ -150,6 +160,46 @@ impl VpinCalculator {
         }
     }
 
+    /// Calculates directional VPIN metrics (buy_vpin, sell_vpin) in range [0.0, 1.0].
+    /// In accordance with Easley, Lopez de Prado & O'Hara (2024), total VPIN decomposes
+    /// identically into:
+    /// buy_vpin = sum(max(B_tau - S_tau, 0)) / (N * V)
+    /// sell_vpin = sum(max(S_tau - B_tau, 0)) / (N * V)
+    /// where buy_vpin + sell_vpin == calculate_vpin().
+    pub fn calculate_directional_vpin(&self) -> (f64, f64) {
+        if !self.config.enabled {
+            return (0.0, 0.0);
+        }
+
+        let n = self.completed_buckets.len();
+        if n == 0 {
+            let current_total = self.current_buy_vol + self.current_sell_vol;
+            if current_total > 0.001 {
+                let buy_imb = (self.current_buy_vol - self.current_sell_vol).max(0.0);
+                let sell_imb = (self.current_sell_vol - self.current_buy_vol).max(0.0);
+                return (
+                    (buy_imb / current_total).clamp(0.0, 1.0),
+                    (sell_imb / current_total).clamp(0.0, 1.0),
+                );
+            }
+            return (0.0, 0.0);
+        }
+
+        let bucket_size = self.config.bucket_size_btc.max(0.001);
+        let total_buy_imbalance: f64 = self.completed_buckets.iter().map(|b| b.buy_imbalance()).sum();
+        let total_sell_imbalance: f64 = self.completed_buckets.iter().map(|b| b.sell_imbalance()).sum();
+        let total_expected_volume = (n as f64) * bucket_size;
+
+        if total_expected_volume > 0.0 {
+            (
+                (total_buy_imbalance / total_expected_volume).clamp(0.0, 1.0),
+                (total_sell_imbalance / total_expected_volume).clamp(0.0, 1.0),
+            )
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
     /// Minimalni pocet dokoncenych kosu, nez ma VPIN smysl vyhodnocovat.
     /// Pod touto hranici je odhad cisty sum — v pomeru k velikosti kose.
     pub const MIN_COMPLETED_BUCKETS: usize = 10;
@@ -195,6 +245,38 @@ impl VpinCalculator {
         self.calculate_vpin() >= t
     }
 
+    /// Check if market toxicity is driven by sell-side dumping (adverse selection for long positions).
+    /// Returns true when total VPIN exceeds the threshold AND sell-side imbalance dominates.
+    pub fn is_sell_toxic_with_threshold(&self, threshold: f64) -> bool {
+        if !self.config.enabled || self.is_warming_up() {
+            return false;
+        }
+        let t = if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
+            threshold
+        } else {
+            self.config.toxicity_threshold
+        };
+        let total_vpin = self.calculate_vpin();
+        let (buy_vpin, sell_vpin) = self.calculate_directional_vpin();
+        total_vpin >= t && sell_vpin >= buy_vpin
+    }
+
+    /// Check if market toxicity is driven by aggressive institutional buying (positive momentum).
+    /// Returns true when total VPIN exceeds the threshold AND buy-side imbalance dominates.
+    pub fn is_buy_toxic_with_threshold(&self, threshold: f64) -> bool {
+        if !self.config.enabled || self.is_warming_up() {
+            return false;
+        }
+        let t = if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
+            threshold
+        } else {
+            self.config.toxicity_threshold
+        };
+        let total_vpin = self.calculate_vpin();
+        let (buy_vpin, sell_vpin) = self.calculate_directional_vpin();
+        total_vpin >= t && buy_vpin >= sell_vpin
+    }
+
     /// Static threshold currently configured (for logging / dashboards).
     #[inline]
     pub fn configured_threshold(&self) -> f64 {
@@ -209,33 +291,90 @@ impl VpinCalculator {
             && self.calculate_vpin() >= self.emergency_threshold()
     }
 
-    /// Human-readable toxicity status
+    /// Human-readable toxicity status with directional decomposition
     pub fn status(&self) -> String {
         if !self.config.enabled {
             return "VPIN Guard Disabled".to_string();
         }
 
         let vpin = self.calculate_vpin();
+        let (buy_vpin, sell_vpin) = self.calculate_directional_vpin();
         let buckets = self.completed_buckets.len();
         let target_buckets = self.config.bucket_count;
 
         if self.is_warming_up() {
             return format!(
-                "Warming Up: VPIN={:.1}% (only {}/{} buckets — metric not reliable yet)",
+                "Warming Up: VPIN={:.1}% (Buy={:.1}%, Sell={:.1}%) (only {}/{} buckets — metric not reliable yet)",
                 vpin * 100.0,
+                buy_vpin * 100.0,
+                sell_vpin * 100.0,
                 buckets,
                 Self::MIN_COMPLETED_BUCKETS
             );
         }
 
         if vpin >= self.emergency_threshold() {
-            format!("🚨 [EMERGENCY TOXICITY] VPIN={:.1}% >= 75% | Flash Crash Risk ({}/{} buckets)", vpin * 100.0, buckets, target_buckets)
+            if sell_vpin >= buy_vpin {
+                format!(
+                    "🚨 [EMERGENCY TOXICITY - SELL DUMP] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.1}% | Flash Crash Risk ({}/{} buckets)",
+                    vpin * 100.0,
+                    sell_vpin * 100.0,
+                    buy_vpin * 100.0,
+                    self.emergency_threshold() * 100.0,
+                    buckets,
+                    target_buckets
+                )
+            } else {
+                format!(
+                    "🚨 [EMERGENCY TOXICITY - BUY PUMP] VPIN={:.1}% (Buy={:.1}%, Sell={:.1}%) >= {:.1}% | Buy Sweep Risk ({}/{} buckets)",
+                    vpin * 100.0,
+                    buy_vpin * 100.0,
+                    sell_vpin * 100.0,
+                    self.emergency_threshold() * 100.0,
+                    buckets,
+                    target_buckets
+                )
+            }
         } else if vpin >= self.config.toxicity_threshold {
-            format!("⚠️ [HIGH TOXICITY] VPIN={:.1}% >= {:.0}% | Adverse Selection Alert ({}/{} buckets)", vpin * 100.0, self.config.toxicity_threshold * 100.0, buckets, target_buckets)
+            if sell_vpin >= buy_vpin {
+                format!(
+                    "⚠️ [HIGH TOXICITY - SELL DUMP] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.0}% | Adverse Selection Alert ({}/{} buckets)",
+                    vpin * 100.0,
+                    sell_vpin * 100.0,
+                    buy_vpin * 100.0,
+                    self.config.toxicity_threshold * 100.0,
+                    buckets,
+                    target_buckets
+                )
+            } else {
+                format!(
+                    "🚀 [HIGH MOMENTUM - BUY PUMP] VPIN={:.1}% (Buy={:.1}%, Sell={:.1}%) >= {:.0}% | Bullish Institutional Inflow ({}/{} buckets)",
+                    vpin * 100.0,
+                    buy_vpin * 100.0,
+                    sell_vpin * 100.0,
+                    self.config.toxicity_threshold * 100.0,
+                    buckets,
+                    target_buckets
+                )
+            }
         } else if vpin >= 0.35 {
-            format!("Moderate Flow Toxicity: VPIN={:.1}% ({}/{} buckets)", vpin * 100.0, buckets, target_buckets)
+            format!(
+                "Moderate Flow Toxicity: VPIN={:.1}% (Buy={:.1}%, Sell={:.1}%) ({}/{} buckets)",
+                vpin * 100.0,
+                buy_vpin * 100.0,
+                sell_vpin * 100.0,
+                buckets,
+                target_buckets
+            )
         } else {
-            format!("Low Toxicity / Noise: VPIN={:.1}% ({}/{} buckets)", vpin * 100.0, buckets, target_buckets)
+            format!(
+                "Low Toxicity / Noise: VPIN={:.1}% (Buy={:.1}%, Sell={:.1}%) ({}/{} buckets)",
+                vpin * 100.0,
+                buy_vpin * 100.0,
+                sell_vpin * 100.0,
+                buckets,
+                target_buckets
+            )
         }
     }
 }
@@ -432,5 +571,50 @@ mod tests {
         }
         assert!(!calc.is_warming_up());
         assert!(calc.is_toxic(), "with enough buckets, toxic flow must block");
+    }
+
+    #[test]
+    fn test_vpin_directional_separation() {
+        let config = VpinConfig {
+            enabled: true,
+            bucket_size_btc: 0.5,
+            bucket_count: 10,
+            toxicity_threshold: 0.65,
+            emergency_cancel_on_toxic: true,
+        };
+
+        // 1. Pure BUY sweep: Institutional buyer sweeps the book
+        let mut buy_calc = VpinCalculator::new(config.clone());
+        for _ in 0..12 {
+            buy_calc.process_trade(Side::Buy, 0.5);
+        }
+        let vpin_buy_sweep = buy_calc.calculate_vpin();
+        let (buy_vpin_1, sell_vpin_1) = buy_calc.calculate_directional_vpin();
+        assert!(vpin_buy_sweep > 0.95);
+        assert!(buy_vpin_1 > 0.95);
+        assert!(sell_vpin_1 < 0.01);
+        assert!((buy_vpin_1 + sell_vpin_1 - vpin_buy_sweep).abs() < 1e-9);
+
+        // Under directional logic: buy sweep IS buy-toxic (momentum), but NOT sell-toxic (no adverse dump)
+        assert!(buy_calc.is_buy_toxic_with_threshold(0.65));
+        assert!(!buy_calc.is_sell_toxic_with_threshold(0.65), "Buy sweep must NOT trigger sell-side adverse selection block!");
+        assert!(buy_calc.status().contains("BUY PUMP"));
+
+        // 2. Pure SELL sweep: Institutional liquidation waterfall / flash crash dump
+        let mut sell_calc = VpinCalculator::new(config);
+        for _ in 0..12 {
+            sell_calc.process_trade(Side::Sell, 0.5);
+        }
+        let vpin_sell_sweep = sell_calc.calculate_vpin();
+        let (buy_vpin_2, sell_vpin_2) = sell_calc.calculate_directional_vpin();
+        assert!(vpin_sell_sweep > 0.95);
+        assert!(sell_vpin_2 > 0.95);
+        assert!(buy_vpin_2 < 0.01);
+        assert!((buy_vpin_2 + sell_vpin_2 - vpin_sell_sweep).abs() < 1e-9);
+
+        // Under directional logic: sell sweep IS sell-toxic (adverse selection guard blocks BUY)
+        assert!(sell_calc.is_sell_toxic_with_threshold(0.65));
+        assert!(!sell_calc.is_buy_toxic_with_threshold(0.65));
+        assert!(sell_calc.status().contains("SELL DUMP"));
     }
 }
