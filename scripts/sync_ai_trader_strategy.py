@@ -4,10 +4,10 @@ Synchronizes the production trading strategy state from the live Pirana node
 into the public ai-trader-strategy repository (https://github.com/VaclavSercl/ai-trader-strategy).
 
 Maintains:
-- strategies/live/T16-pullback-flow-stoikov/SPECIFICATION.json
-- strategies/live/T16-pullback-flow-stoikov/README.md
-- strategies/live/T16-pullback-flow-stoikov/AI_GENERATION_PROMPT.md
-- strategies/live/T16-pullback-flow-stoikov/PERFORMANCE_HISTORY.md
+- 01-live-production/T16-pullback-flow-stoikov/SPECIFICATION.json
+- 01-live-production/T16-pullback-flow-stoikov/README.md
+- 01-live-production/T16-pullback-flow-stoikov/AI_GENERATION_PROMPT.md
+- 01-live-production/T16-pullback-flow-stoikov/PERFORMANCE_HISTORY.md
 - README.md (Leaderboard & Registry)
 """
 
