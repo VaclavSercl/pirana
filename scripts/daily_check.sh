@@ -98,5 +98,6 @@ export CASLAV_ALLOWED_USER_ID="$CHAT_ID"
 export PYTHONPATH="${WORKSPACE_DIR}/scripts${PYTHONPATH:+:$PYTHONPATH}"
 # Escapování probíhá až po omezení prostého textu, nikdy uvnitř HTML entity.
 printf '%s\n\nAI AUDIT — NEOVĚŘENÉ KVALITATIVNÍ HODNOCENÍ\n%s' "$FINANCIAL_REPORT" "$REPORT_OUTPUT" |
-    python3 -c 'import html, sys; from send_scheduled_report import send_telegram; text = sys.stdin.read(); head, marker, audit = text.partition("AI AUDIT — NEOVĚŘENÉ KVALITATIVNÍ HODNOCENÍ\n"); text = head + marker + audit[:600]; sys.exit(0 if send_telegram(html.escape(text[:3900])) else 1)'
-echo "[$(date -Iseconds)] Ranní report byl odeslán do Telegramu." >> "$LOG_FILE"
+# Synchronizace stavu strategie do veřejného registru ai-trader-strategy
+python3 "${WORKSPACE_DIR}/scripts/sync_ai_trader_strategy.py" >> "$LOG_FILE" 2>&1 || true
+echo "[$(date -Iseconds)] Ranní report byl odeslán do Telegramu a registr strategií synchronizován." >> "$LOG_FILE"

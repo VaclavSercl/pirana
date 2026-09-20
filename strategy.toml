@@ -7,7 +7,8 @@ max_open_orders = 10
 
 [strategy]
 entry_zone_spread_usd = 5.0
-take_profit_distance_usd = 15.0
+# Fallback pevná TP vzdálenost při use_dynamic_atr = false (M-IPF baseline: 40 USD ~ 5.0 bps)
+take_profit_distance_usd = 40.0
 stop_loss_distance_usd = 400.0
 # [BITCOIN STANDARD §1b & OPERATOR DIRECTIVE]
 # Stop-loss na spotovém BTC vypnut. BTC se nikdy neprodává pod nákupní cenou.
@@ -99,7 +100,8 @@ ticks_per_bar = 6
 # Stín SCALP se mění na TIGHT; nový stín = momentum-only kandidát (backlog).
 atr_tp_multiplier = 0.5
 atr_sl_multiplier = 0.5
-min_tp_usd = 10.0
+# [M-IPF 2026-09-20]: min_tp_usd garantuje minimální zisk 25 USD (> 2.5x spreadu Bitfinexu 10-15 USD)
+min_tp_usd = 25.0
 max_tp_usd = 120.0
 min_sl_usd = 30.0
 max_sl_usd = 150.0

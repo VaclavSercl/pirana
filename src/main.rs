@@ -494,8 +494,9 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let initial_vpin_conf = strategy_config.read().vpin_guard.clone();
     let mut vpin = VpinCalculator::new(initial_vpin_conf);
     // [FLOW CALCULATOR] Rolling normalized buy/sell flow + HWM pro pullback_flow_signal.
+    // 25 ticků (~21 s) pro záchyt mikro-impulsu toku na odrazu dipu, 100 ticků pro HWM.
     let mut flow_calculator = FlowCalculator::new(
-        strategy_config.read().strategy.ofi_window_size, // flow_window = OFI okno (20)
+        25, // flow_window = 25 ticků pro záchyt rychlého nákupního impulsu
         100, // hwm_window = 100 ticků
     );
     let initial_as_conf = strategy_config.read().avellaneda_stoikov.clone();
@@ -1881,11 +1882,11 @@ async fn process_ws_message(
                                 let ofi_pullback_ok = ofi.is_buying_pressure() && price_below_spike;
 
                                 // [PULLBACK FLOW SIGNAL MATRIX]
-                                // V0 Baseline: flow > 0.05 AND price < HWM * 0.9990
-                                // V1 Deep Dip: flow > 0.05 AND price < HWM * 0.9975
-                                // V2 Strong Flow: flow > 0.15 AND price < HWM * 0.9990
-                                // V3 Adaptive Dip: flow > 0.05 AND dip scaled by ATR
-                                // V4 CJG Drift-Aware: flow > 0.05 AND drift-modulated dip
+                                // V0 Baseline: flow > 0.08 AND price < HWM * 0.9992 (M-IPF balanced: 8 bps dip)
+                                // V1 Deep Dip: flow > 0.08 AND price < HWM * 0.9975
+                                // V2 Strong Flow: flow > 0.15 AND price < HWM * 0.9992
+                                // V3 Adaptive Dip: flow > 0.08 AND dip scaled by ATR
+                                // V4 CJG Drift-Aware: flow > 0.08 AND drift-modulated dip
                                 let flow_hwm = flow_calculator.hwm();
                                 let current_flow = flow_calculator.current_flow();
                                 let current_atr = atr.current_atr();

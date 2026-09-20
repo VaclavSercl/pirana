@@ -40,11 +40,11 @@ pub const MAX_LIVE_BUY_EQUITY_FRACTION: f64 = 0.10;
 /// Default minimum monotonic time spacing between distinct entry impulses.
 pub const DEFAULT_MIN_IMPULSE_SPACING: Duration = Duration::from_secs(2);
 
-/// Default threshold for the production pullback flow confirmation signal.
-pub const DEFAULT_PULLBACK_FLOW_THRESHOLD: f64 = 0.05;
+/// Default threshold for the production pullback flow confirmation signal (balanced conviction).
+pub const DEFAULT_PULLBACK_FLOW_THRESHOLD: f64 = 0.08;
 
-/// Default pullback ratio from recent high-water mark (HWM) for pullback flow confirmation.
-pub const DEFAULT_PULLBACK_FLOW_PULLBACK_RATIO: f64 = 0.999;
+/// Default pullback ratio from recent high-water mark (HWM) for pullback flow confirmation (8 bps dip).
+pub const DEFAULT_PULLBACK_FLOW_PULLBACK_RATIO: f64 = 0.9992;
 
 // ============================================================================
 // POINT 3: MONOTONIC-TIME ENTRY GATE & IMPULSE LATCH
