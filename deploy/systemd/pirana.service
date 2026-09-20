@@ -2,6 +2,9 @@
 Description=Pirana trading engine
 After=network-online.target
 Wants=network-online.target
+OnFailure=notify-telegram-failure@%n.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -25,6 +28,7 @@ ExecStartPre=/usr/bin/python3 /home/wwwenda/workspace/pirana/scripts/strategy_ve
 ExecStart=/home/wwwenda/workspace/pirana/target/release/pirana
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 LimitNOFILE=65535
 UMask=0077
 PrivateTmp=true

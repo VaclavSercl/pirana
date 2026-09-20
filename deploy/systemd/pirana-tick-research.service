@@ -1,0 +1,32 @@
+[Unit]
+Description=Pirana Tick Research Sidecar (public WS trades)
+After=network-online.target
+Wants=network-online.target
+OnFailure=notify-telegram-failure@%n.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=wwwenda
+Group=wwwenda
+WorkingDirectory=/home/wwwenda/workspace/pirana
+ExecStart=/home/wwwenda/.hermes/hermes-agent/venv/bin/python3 scripts/tick_research.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Resource containment
+MemoryHigh=128M
+MemoryMax=192M
+TasksMax=32
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pirana-tick-research
+
+[Install]
+WantedBy=multi-user.target

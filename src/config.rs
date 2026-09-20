@@ -44,6 +44,8 @@ pub struct StrategyParams {
     pub entry_zone_spread_usd: f64,
     pub take_profit_distance_usd: f64,
     pub stop_loss_distance_usd: f64,
+    #[serde(default = "default_false")]
+    pub stop_loss_enabled: bool,
     pub ofi_trigger_threshold: f64,
     pub ofi_window_size: usize,
     pub trade_cooldown_ms: u64,
@@ -124,6 +126,7 @@ pub struct VolatilityStrategyConfig {
 }
 
 fn default_true() -> bool { true }
+fn default_false() -> bool { false }
 fn default_atr_period() -> usize { 14 }
 fn default_ticks_per_bar() -> usize { 50 }
 fn default_atr_tp_multiplier() -> f64 { 0.5 }

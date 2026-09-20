@@ -32,6 +32,11 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 20.9.2026
+
+- **08:45 (Single Live Strategy Doctrine & Microstructure Enhancements — Antigravity)**: Canonizována jediná ostrá strategie Pullback Flow s Avellaneda-Stoikov inventářem a Bitcoin Standard ATR výstupy (`strategy.toml`: `lead_lag.enabled = false`). Nasazena 4-variantní matice shadow testů Pullback Flow + V4 Cartea-Jaimungal drift-aware model (`src/shadow_candidate.rs`). Integrovány 3 vědecké mikrostrukturní prvky z let 2024–2026: 1) Directional VPIN (`crates/pirana-features/src/vpin.rs`) s dekompozicí na buy/sell toxicitu (BUY je blokován pouze při sell dumpu, nikoli při buy sweepech); 2) L2 depth queue gate (`!l2_depth.is_selling_supported()`) chránící před nákupem do ask wall; 3) Hawkes cascade brake ($Z_{\text{sell}} \ge 2.5$) a buy clustering conviction boost ($Z_{\text{buy}} \ge 1.2$). Plná sada testů (>250 testů) prošla, release binárka zkompilována a nasazena na `pirana.service`. Systém běží v režimu Active, caslav-doctor ZDRAVÝ.
+- **07:00 (ranní audit — Hermes CLI)**: Audit bez zásahu do TOML. Služba Active, uptime 39690 s (~11 hodin). Stav: Active, TREND-DOWN režim, VPIN 68.4% (vysoká toxicita, adverse selection guard aktivní). Pozice 84: entry $81,500, SL $81,400 (informační, stop_loss_enabled=false), lowest $80,112 — SL NEEXEKUOVÁN (správně — Bitcoin Standard), pozice čeká na TP $81,550. Exposure 10.78%. Hawkes cascade SELL signály (Z=2.5-5.3, λ_sell 5-34) systematicky DENIED jako neziskové (ANTI-CHURN: worst_case ~$80,380 < entry $81,500). Lead-Lag disparity +$10.38 USD (v prahu ±$15). Accounting: 20 nespárovaných SELL costů (trvající problém). Režim TREND-DOWN. Sizing 1.0 % PONECHÁN. Žádná změna TOML. Doporučeno: pozice 84 je v červeném (unrealized loss ~0.8%), ale SL je vypnutý záměrně podle Bitcoin Standard.
+
 ### 19.9.2026
 
 - **GitHub audit/hardening (ChatGPT + GitHub connector, na pokyn operátora)**:

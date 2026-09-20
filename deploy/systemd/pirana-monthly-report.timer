@@ -1,10 +1,10 @@
 [Unit]
 Description=Run Pirana Executive Monthly Audit on 1st of every month at 08:00 AM
-Unit=pirana-monthly-report.service
 
 [Timer]
 OnCalendar=*-*-01 08:00:00
 Persistent=true
+Unit=pirana-monthly-report.service
 
 [Install]
 WantedBy=timers.target

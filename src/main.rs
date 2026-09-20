@@ -48,8 +48,9 @@ use signal_exit::{evaluate_signal_exit, SignalExitDecision};
 
 mod shadow_candidate;
 use shadow_candidate::{
-    evaluate_baseline_signal, evaluate_stronger_candidate_signal, spawn_shadow_writer,
-    ShadowExperimentEngine, SHADOW_LOG_PATH,
+    evaluate_adaptive_dip_signal, evaluate_baseline_signal, evaluate_cjg_candidate_signal,
+    evaluate_deep_dip_signal, evaluate_strong_flow_signal, spawn_shadow_writer,
+    PullbackFlowSignals, ShadowExperimentEngine, SHADOW_LOG_PATH,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,6 +83,40 @@ pub struct ActivePosition {
     /// prefixem pro offline srovnání živé (SCALP) vs stínové (TIGHT)
     /// strategie.
     pub is_shadow: bool,
+}
+
+/// Evaluates whether a BUY position should be closed according to Bitcoin Standard (§1b):
+/// 1. Hard Invariant: NEVER sell BTC below purchase price (`entry_price`).
+/// 2. Take Profit: triggered if `price >= tp_price`.
+/// 3. Breakeven / Trailing Stop: triggered if `is_breakeven` is true AND `price <= sl_price`.
+///    Because breakeven sets `sl_price >= entry_price + be_offset_usd`, this is strictly profitable.
+/// 4. Conventional Stop Loss: strictly disabled when `stop_loss_enabled` is false.
+pub fn should_close_buy_position(
+    pos: &ActivePosition,
+    price: f64,
+    stop_loss_enabled: bool,
+) -> bool {
+    // 1. Hard Invariant: NEVER sell BTC below entry price!
+    if price < pos.entry_price {
+        return false;
+    }
+
+    // 2. Take Profit
+    if price >= pos.tp_price {
+        return true;
+    }
+
+    // 3. Breakeven / Trailing Stop (secured in profit)
+    if pos.is_breakeven && price <= pos.sl_price {
+        return true;
+    }
+
+    // 4. Conventional Stop Loss (only if explicitly enabled)
+    if stop_loss_enabled && price <= pos.sl_price {
+        return true;
+    }
+
+    false
 }
 
 /// Monotonní čítač pozic — jedinečná ID pro robustní match po fillu.
@@ -459,8 +494,9 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let initial_vpin_conf = strategy_config.read().vpin_guard.clone();
     let mut vpin = VpinCalculator::new(initial_vpin_conf);
     // [FLOW CALCULATOR] Rolling normalized buy/sell flow + HWM pro pullback_flow_signal.
+    // 25 ticků (~21 s) pro záchyt mikro-impulsu toku na odrazu dipu, 100 ticků pro HWM.
     let mut flow_calculator = FlowCalculator::new(
-        strategy_config.read().strategy.ofi_window_size, // flow_window = OFI okno (20)
+        25, // flow_window = 25 ticků pro záchyt rychlého nákupního impulsu
         100, // hwm_window = 100 ticků
     );
     let initial_as_conf = strategy_config.read().avellaneda_stoikov.clone();
@@ -1190,11 +1226,10 @@ async fn process_ws_message(
                                         // [OPONENTURA P0-1 FIX] TP check per-pozice: pos.tp_price
                                         // (ATR-based z entry), ne globální ceiling. Jinak shadow
                                         // TIGHT i reálný SCALP exitují na stejném nesmyslném místě.
-                                        if price >= pos.tp_price {
-                                            tracing::info!("🎯 BUY Position TP Hit! Price {} >= TP {}", price, pos.tp_price);
-                                            should_close = true;
-                                        } else if price <= pos.sl_price {
-                                            if pos.is_breakeven {
+                                        if should_close_buy_position(pos, price, conf.strategy.stop_loss_enabled) {
+                                            if price >= pos.tp_price {
+                                                tracing::info!("🎯 BUY Position TP Hit! Price {} >= TP {}", price, pos.tp_price);
+                                            } else if pos.is_breakeven {
                                                 tracing::info!("🎯 BUY Position Trailing Stop / Breakeven Hit! Price {} <= Trailing SL {}", price, pos.sl_price);
                                             } else {
                                                 tracing::warn!("🛑 BUY Position Stop Loss Hit! Price {} <= SL {}", price, pos.sl_price);
@@ -1233,12 +1268,11 @@ async fn process_ws_message(
                                         if price <= pos.tp_price {
                                             tracing::info!("🎯 SELL Position TP Hit! Price {} <= TP {}", price, pos.tp_price);
                                             should_close = true;
-                                        } else if price >= pos.sl_price {
-                                            if pos.is_breakeven {
-                                                tracing::info!("🎯 SELL Position Trailing Stop / Breakeven Hit! Price {} >= Trailing SL {}", price, pos.sl_price);
-                                            } else {
-                                                tracing::warn!("🛑 SELL Position Stop Loss Hit! Price {} >= SL {}", price, pos.sl_price);
-                                            }
+                                        } else if pos.is_breakeven && price >= pos.sl_price {
+                                            tracing::info!("🎯 SELL Position Trailing Stop / Breakeven Hit! Price {} >= Trailing SL {}", price, pos.sl_price);
+                                            should_close = true;
+                                        } else if conf.strategy.stop_loss_enabled && price >= pos.sl_price {
+                                            tracing::warn!("🛑 SELL Position Stop Loss Hit! Price {} >= SL {}", price, pos.sl_price);
                                             should_close = true;
                                         }
                                     }
@@ -1250,6 +1284,19 @@ async fn process_ws_message(
                                     }
                                     should_close = false;
                                 }
+
+                                // HARD INVARIANT (§1b BITCOIN STANDARD & OPERATOR DIRECTIVE):
+                                // Pokud nakoupíme BTC, nikdy je nebudeme znovu prodávat pod nákupní cenou!
+                                if should_close && pos.side == Side::Buy && price < pos.entry_price {
+                                    if log_throttler.should_log("no_loss_btc_protection") {
+                                        tracing::warn!(
+                                            "🛡️ [BITCOIN STANDARD] Refusing to sell BTC below entry price! Current: {:.2} < Entry: {:.2}",
+                                            price, pos.entry_price
+                                        );
+                                    }
+                                    should_close = false;
+                                }
+
                                 if should_close {
                                     positions_to_close.push(positions.remove(i));
                                 } else {
@@ -1762,13 +1809,15 @@ async fn process_ws_message(
 
                                 vpin.process_trade(side, qty.abs());
                                 let vpin_score = vpin.calculate_vpin();
+                                let (buy_vpin, sell_vpin) = vpin.calculate_directional_vpin();
                                 // [CASLAV v5.1 / Ú3] Prah toxicity ctem z KALIBROVANEHO
                                 // stavu risk enginu, ne ze statickeho strategy.toml.
                                 // Do teto opravy kalibrator prah pocital a publikoval
                                 // na dashboardu, ale hot loop porovnaval proti zmrazene
                                 // hodnote z configu — kalibrace byla ucinna jen na papire.
                                 let vpin_threshold = risk_engine.vpin_toxicity_threshold();
-                                let is_vpin_toxic = vpin.is_toxic_with_threshold(vpin_threshold);
+                                let is_vpin_sell_toxic = vpin.is_sell_toxic_with_threshold(vpin_threshold);
+                                let is_vpin_buy_toxic = vpin.is_buy_toxic_with_threshold(vpin_threshold);
                                 let is_vpin_emergency = vpin.is_emergency_toxic();
 
                                 *state.vpin_score.write() = vpin_score;
@@ -1777,16 +1826,39 @@ async fn process_ws_message(
                                 // VPIN Adverse Selection & Emergency Flash Crash Guard
                                 if is_vpin_emergency {
                                     if log_throttler.should_log("vpin_emergency_toxic") {
-                                        tracing::warn!("🚨 [VPIN EMERGENCY FLASH CRASH ALERT] VPIN={:.1}% >= 75% | Flash Crash Risk - Blocking new entries & safeguarding passive book", vpin_score * 100.0);
+                                        tracing::warn!(
+                                            "🚨 [VPIN EMERGENCY FLASH CRASH ALERT] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.1}% | Flash Crash Risk - Blocking new entries & safeguarding passive book",
+                                            vpin_score * 100.0,
+                                            sell_vpin * 100.0,
+                                            buy_vpin * 100.0,
+                                            vpin.emergency_threshold() * 100.0
+                                        );
                                     }
                                     return;
                                 }
 
-                                if is_vpin_toxic && !is_lead_lag_buy && !is_hawkes_buy && !is_lead_lag_sell && !is_hawkes_sell {
-                                    if log_throttler.should_log("vpin_high_toxicity") {
-                                        tracing::warn!("⚠️ [VPIN HIGH TOXICITY] VPIN={:.1}% >= {:.0}% (kalibrovany prah; staticky config {:.0}%) - Adverse selection guard active, skipping standard noise entries", vpin_score * 100.0, vpin_threshold * 100.0, conf.vpin_guard.toxicity_threshold * 100.0);
+                                // [DIRECTIONAL VPIN ADVERSE SELECTION GUARD (Easley, Lopez de Prado & O'Hara 2024)]
+                                // We block long entries ONLY during sell-side dumping (adverse selection for buyers).
+                                // When institutional buyers sweep the book (buy_vpin dominates), entries are permitted.
+                                if is_vpin_sell_toxic && !is_lead_lag_buy && !is_hawkes_buy && !is_lead_lag_sell && !is_hawkes_sell {
+                                    if log_throttler.should_log("vpin_high_toxicity_sell") {
+                                        tracing::warn!(
+                                            "⚠️ [DIRECTIONAL VPIN SELL TOXICITY] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.0}% (kalibrovany prah) - Sell-side adverse selection guard active, skipping BUY entry",
+                                            vpin_score * 100.0,
+                                            sell_vpin * 100.0,
+                                            buy_vpin * 100.0,
+                                            vpin_threshold * 100.0
+                                        );
                                     }
                                     return;
+                                } else if is_vpin_buy_toxic && log_throttler.should_log("vpin_high_toxicity_buy") {
+                                    tracing::info!(
+                                        "🚀 [DIRECTIONAL VPIN BUY FLOW] VPIN={:.1}% (Buy={:.1}%, Sell={:.1}%) >= {:.0}% - Institutional buy flow detected, entries permitted",
+                                        vpin_score * 100.0,
+                                        buy_vpin * 100.0,
+                                        sell_vpin * 100.0,
+                                        vpin_threshold * 100.0
+                                    );
                                 }
 
                                 // [FÁZE 2c] Pullback entry: v TrendUp režimu
@@ -1809,12 +1881,67 @@ async fn process_ws_message(
                                 let price_below_spike = hwm <= 0.0 || price < hwm * 0.9998;
                                 let ofi_pullback_ok = ofi.is_buying_pressure() && price_below_spike;
 
-                                // [PULLBACK FLOW SIGNAL] flow > 0.05 AND cena pod HWM*0.999.
-                                // Historical trade-print results are proxy-only and never authorize promotion.
+                                // [PULLBACK FLOW SIGNAL MATRIX]
+                                // V0 Baseline: flow > 0.08 AND price < HWM * 0.9992 (M-IPF balanced: 8 bps dip)
+                                // V1 Deep Dip: flow > 0.08 AND price < HWM * 0.9975
+                                // V2 Strong Flow: flow > 0.15 AND price < HWM * 0.9992
+                                // V3 Adaptive Dip: flow > 0.08 AND dip scaled by ATR
+                                // V4 CJG Drift-Aware: flow > 0.08 AND drift-modulated dip
                                 let flow_hwm = flow_calculator.hwm();
                                 let current_flow = flow_calculator.current_flow();
-                                let pullback_flow_signal = evaluate_baseline_signal(current_flow, flow_hwm, price);
-                                let stronger_candidate_signal = evaluate_stronger_candidate_signal(current_flow, flow_hwm, price);
+                                let current_atr = atr.current_atr();
+                                let shadow_signals = PullbackFlowSignals {
+                                    baseline: evaluate_baseline_signal(current_flow, flow_hwm, price),
+                                    deep_dip: evaluate_deep_dip_signal(current_flow, flow_hwm, price),
+                                    strong_flow: evaluate_strong_flow_signal(current_flow, flow_hwm, price),
+                                    adaptive_dip: evaluate_adaptive_dip_signal(current_flow, flow_hwm, price, current_atr),
+                                    cjg_model: evaluate_cjg_candidate_signal(current_flow, flow_hwm, price, current_atr),
+                                };
+                                let raw_pullback_flow_signal = shadow_signals.baseline;
+
+                                // [MICROSTRUCTURE CONFIRMATION GATES (2024-2026 RESEARCH)]
+                                // Gate 1: Hawkes Liquidation Avalanche / Sell Cascade Brake (Raffaelli et al. 2026)
+                                let is_sell_cascade = conf.hawkes_process.enabled && hawkes_eval.is_sell_cascade;
+
+                                // Gate 2: Multi-Level L2 Depth Queue Confirmation Gate (Bieganowski & Ślepaczuk 2026)
+                                // Reject entry if ask side heavily dominates the book (queue resistance / ask wall)
+                                let is_ask_wall = conf.order_book.use_l2_depth_imbalance && l2_depth.is_selling_supported();
+
+                                // Gate 3: Hawkes Buy Clustering Conviction Boost (Raffaelli et al. 2026)
+                                let hawkes_buy_conviction = conf.hawkes_process.enabled
+                                    && hawkes_eval.buy_zscore >= 1.2
+                                    && hawkes_eval.buy_intensity > hawkes_eval.sell_intensity;
+
+                                if raw_pullback_flow_signal {
+                                    if is_sell_cascade {
+                                        if log_throttler.should_log("hawkes_sell_cascade_block") {
+                                            tracing::warn!(
+                                                "🛑 [HAWKES CASCADE BRAKE] Live BUY suppressed: Active sell cascade detected (Z_sell={:.2} >= {:.2}, Sell λ={:.2} > Buy λ={:.2})",
+                                                hawkes_eval.sell_zscore,
+                                                conf.hawkes_process.zscore_threshold,
+                                                hawkes_eval.sell_intensity,
+                                                hawkes_eval.buy_intensity
+                                            );
+                                        }
+                                    } else if is_ask_wall {
+                                        if log_throttler.should_log("l2_ask_wall_block") {
+                                            tracing::warn!(
+                                                "🛑 [L2 DEPTH BRAKE] Live BUY suppressed: Heavy ask wall resistance detected (L2 imb={:.3} <= -{:.2})",
+                                                l2_imb,
+                                                conf.order_book.min_l2_imbalance_threshold
+                                            );
+                                        }
+                                    } else if hawkes_buy_conviction && log_throttler.should_log("hawkes_buy_boost") {
+                                        tracing::info!(
+                                            "⚡ [HAWKES CONVICTION BOOST] Pullback BUY confirmed with buy clustering (Z_buy={:.2} >= 1.2, Buy λ={:.2} > Sell λ={:.2})",
+                                            hawkes_eval.buy_zscore,
+                                            hawkes_eval.buy_intensity,
+                                            hawkes_eval.sell_intensity
+                                        );
+                                    }
+                                }
+
+                                let pullback_flow_signal = raw_pullback_flow_signal && !is_sell_cascade && !is_ask_wall;
 
                                 let best_bid = order_book.best_bid().map(|b| b.price);
                                 let best_ask = order_book.best_ask().map(|a| a.price);
@@ -1823,8 +1950,7 @@ async fn process_ws_message(
                                     now_ms,
                                     best_bid,
                                     best_ask,
-                                    pullback_flow_signal,
-                                    stronger_candidate_signal,
+                                    shadow_signals,
                                 );
 
                                 let ofi_entry_condition = if conf.order_book.use_l2_depth_imbalance {
@@ -2029,7 +2155,12 @@ async fn process_ws_message(
                                     } else {
                                         String::new()
                                     };
-                                    let rationale_text = format!("{} | Adaptive ATR: {:.1} USD (TP: +{:.1}, SL: -{:.1}){}", live_rationale, atr.current_atr(), tp_dist, sl_dist, as_info);
+                                     let sl_info = if conf.strategy.stop_loss_enabled {
+                                         format!("SL: -{:.1}", sl_dist)
+                                     } else {
+                                         "SL: OFF (No-Loss Hold)".to_string()
+                                     };
+                                     let rationale_text = format!("{} | Adaptive ATR: {:.1} USD (TP: +{:.1}, {}){}", live_rationale, atr.current_atr(), tp_dist, sl_info, as_info);
                                     let sig = Signal {
                                         id: pirana_core::types::SignalId::new(),
                                         signal_type: SignalType::SpreadCapture,
@@ -2265,8 +2396,9 @@ async fn process_ws_message(
                                                      pirana_core::slippage::SlippageDecision::Execute { .. } => {}
                                                  }
 
-                                                 if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
-                                                     tracing::info!("Pullback Flow -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, SL: -{:.1})", final_trade_size, tp_dist, sl_dist);
+                                                  if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
+                                                      let sl_log = if conf.strategy.stop_loss_enabled { format!("SL: -{:.1}", sl_dist) } else { "SL: OFF".to_string() };
+                                                      tracing::info!("Pullback Flow -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, {})", final_trade_size, tp_dist, sl_log);
                                                      
                                                      // [POINT 3 — RESERVE BEFORE ASYNC]
                                                      entry_gate.lock().reserve_live_buy(std::time::Instant::now());
@@ -2524,9 +2656,10 @@ async fn process_ws_message(
                                             hawkes_eval.rationale, ofi_val, l2_imb, vpin_score * 100.0, dynamic_pos_pct_sell, as_info
                                         )
                                     } else {
+                                        let sl_info_sell = if conf.strategy.stop_loss_enabled { format!("SL: +{:.1}", sl_dist) } else { "SL: OFF".to_string() };
                                         format!(
-                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: -{:.1}, SL: +{:.1}) | Dynamic Size: {:.2}%{}",
-                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_dist, dynamic_pos_pct_sell, as_info
+                                            "OFI: {:.2}, L2 Depth Imb: {:.2}, Composite: {:.2}, VPIN: {:.1}% | Adaptive ATR: {:.1} USD (TP: -{:.1}, {}) | Dynamic Size: {:.2}%{}",
+                                            ofi_val, l2_imb, composite_signal, vpin_score * 100.0, atr.current_atr(), tp_dist, sl_info_sell, dynamic_pos_pct_sell, as_info
                                         )
                                     };
                                     let sig = Signal {
@@ -3121,5 +3254,74 @@ mod recovery_mode_tests {
         assert_eq!(*state.system_mode.read(), pirana_core::types::SystemMode::Halted);
         assert!(!super::POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire));
         assert!(!super::ACCOUNTING_CAPTURE_READY.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod bitcoin_standard_tests {
+    use super::*;
+    use pirana_core::types::Side;
+
+    fn sample_buy_position(entry_price: f64, tp_dist: f64, sl_dist: f64) -> ActivePosition {
+        ActivePosition {
+            position_id: 1,
+            exchange_order_id: 101,
+            entry_mts: 1700000000000,
+            entry_price,
+            quantity: 0.001,
+            side: Side::Buy,
+            tp_price: entry_price + tp_dist,
+            sl_price: entry_price - sl_dist,
+            exposure_size: 0.10,
+            is_paper: false,
+            highest_price_seen: entry_price,
+            lowest_price_seen: entry_price,
+            is_breakeven: false,
+            trailing_active: false,
+            is_rebalance: false,
+            is_shadow: false,
+        }
+    }
+
+    #[test]
+    fn test_buy_position_never_sells_below_entry_price() {
+        let entry = 80000.0;
+        let pos = sample_buy_position(entry, 20.0, 400.0);
+
+        // When price drops below entry, even below SL level, must NEVER close
+        assert!(!should_close_buy_position(&pos, 79999.0, false));
+        assert!(!should_close_buy_position(&pos, 79600.0, false));
+        assert!(!should_close_buy_position(&pos, 50000.0, false));
+
+        // Even if stop_loss_enabled was hypothetically set, hard invariant protects below entry
+        assert!(!should_close_buy_position(&pos, 79599.0, true));
+        assert!(!should_close_buy_position(&pos, 79000.0, true));
+    }
+
+    #[test]
+    fn test_buy_position_closes_on_take_profit() {
+        let entry = 80000.0;
+        let pos = sample_buy_position(entry, 20.0, 400.0);
+
+        // At or above TP price (80020.0) -> close with profit!
+        assert!(!should_close_buy_position(&pos, 80019.9, false));
+        assert!(should_close_buy_position(&pos, 80020.0, false));
+        assert!(should_close_buy_position(&pos, 80050.0, false));
+    }
+
+    #[test]
+    fn test_buy_position_trailing_breakeven_only_in_profit() {
+        let entry = 80000.0;
+        let mut pos = sample_buy_position(entry, 20.0, 400.0);
+
+        // Breakeven secured at entry + $5
+        pos.is_breakeven = true;
+        pos.sl_price = entry + 5.0;
+
+        // Above breakeven SL -> hold
+        assert!(!should_close_buy_position(&pos, 80010.0, false));
+        // Pullback hits breakeven floor -> close with +$5 profit
+        assert!(should_close_buy_position(&pos, 80005.0, false));
+        assert!(should_close_buy_position(&pos, 80002.0, false));
     }
 }
