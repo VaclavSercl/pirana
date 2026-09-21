@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "runtime": "auto",
+  "runtime_preference": ["claude", "codex", "gemini", "hermes"],
+  "repair_budget_max": 3,
+  "limits": {
+    "repomap_max_lines": 250,
+    "memory_retain_sessions": 5,
+    "recalled_sessions_max": 2,
+    "max_file_bytes": 2097152,
+    "default_command_timeout": 180
+  },
+  "commands": [
+    {
+      "name": "harness-tests",
+      "phase": "tests",
+      "argv": ["{python}", "-m", "unittest", "discover", "-s", ".synthbit/tests", "-v"],
+      "cwd": ".",
+      "timeout": 180,
+      "required": true
+    },
+    {
+      "name": "shellcheck",
+      "phase": "static",
+      "argv": ["shellcheck", ".gauntlet.sh", ".generate_repomap.sh", ".synthbit/sandbox.sh", ".synthbit/bin/ai-run"],
+      "cwd": ".",
+      "timeout": 30,
+      "required": false
+    }
+  ],
+  "allowed_paths": [
+    ".synthbit/*",
+    ".gauntlet.sh",
+    ".generate_repomap.sh",
+    ".gitignore",
+    "AGENTS.md",
+    "PLAN.md",
+    "README.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    "repomap.py",
+    "recall.py",
+    "prune_memory.py",
+    "ledger.py",
+    "dispatcher.py",
+    "install.py"
+  ],
+  "dependency_changes": [],
+  "permission_changes": [],
+  "network_audit": false,
+  "audit_commands": [],
+  "docker": {
+    "enabled": false,
+    "image": null
+  },
+  "recall": {
+    "optional": false,
+    "backend": "auto"
+  },
+  "publication": {
+    "require_verified_checkpoint": true,
+    "exact_sha": true
+  }
+}

@@ -1,0 +1,125 @@
+.gitignore
+  /.gauntlet/
+  /.synthbit/reports/
+  /.synthbit/.recalled_context
+.repomap.txt
+  .gitignore
+  /.gauntlet/
+  /.synthbit/reports/
+.synthbit/README.md
+  # SynthBit development harness — v2_2
+  ## Architecture
+  ## Trust and filesystem boundaries
+  ## Verification policy
+  ## History and recovery contract
+  ## Validation coverage
+.synthbit/common.py
+  class Blocked(RuntimeError)
+  def uid_check(path: ...) -> None
+  def safe(root: ..., relative: ...) -> Path
+  def read(path: ..., limit: ...=...) -> bytes
+  def digest(data: ...) -> str
+  def json_bytes(obj) -> bytes
+  def sync_dir(path: ...) -> None
+  def atomic(root: ..., relative: ..., data: ..., mode: ...=...) -> None
+  @contextlib.contextmanager def lock(root: ..., relative: ...)
+  def git(root: ..., *args, check: ..., timeout: ..., input)
+.synthbit/config.json
+  key schema_version
+  key runtime
+  key runtime_preference
+  key repair_budget_max
+  key limits
+  key commands
+  key allowed_paths
+  key dependency_changes
+  key permission_changes
+  key network_audit
+.synthbit/dispatcher.py
+  def detect_runtime(name: ...) -> tuple[...]
+  def bounded_run(argv: ..., cwd: ..., timeout: ...=...) -> tuple[...]
+  def preflight(root: ..., require_clean: ...=...) -> dict
+  def doctor(root: ...) -> dict
+  def run_dispatcher(args: ...) -> int
+  def main(argv=...)
+.synthbit/gate.py
+  def result(name, status, reason, command=..., exit_status=..., duration=...)
+  def validate_config(config)
+  def bounded_process(argv, cwd, timeout)
+  def run_command(root, command, audit=...)
+  def normalize_audit(kind, data, code)
+  def secret_findings(text)
+  def matches(name, patterns)
+  def blob(root, oid, maximum)
+  def candidate_versions(root, baseline, maximum)
+  def scan_candidates(root, baseline, config)
+.synthbit/install.py
+  def find_bashrc(home: ...) -> ...
+  def find_zshrc(home: ..., zdotdir: ...=...) -> ...
+  def install_block(file: ..., block: ...) -> bool
+  def remove_block(file: ...) -> bool
+  def install_launcher(repo: ..., dry_run: ...=...) -> dict
+  def dry_run_install(repo: ...) -> dict
+  def do_install(repo: ...) -> dict
+  def do_uninstall() -> dict
+  def main(argv=...)
+.synthbit/ledger.py
+  def git_common_dir(root: ...) -> Path
+  def common_store(root: ..., *relative) -> Path
+  def ledger_path(root: ...) -> Path
+  def append_event(root: ..., event: ...) -> dict
+  def events(root: ...) -> list[...]
+  def latest_completed_run(root: ...) -> ...
+  def preview_rollback(root: ...) -> dict
+  def perform_rollback(root: ..., run_id: ..., hard: ...=...) -> dict
+  def create_checkpoint(root: ..., run_id: ..., description: ..., attempt: ...=..., status: ...=..., **extra) -> dict
+  def doctor(root: ...) -> dict
+.synthbit/repomap.py
+  def _expr(node: ...) -> str
+  def _annotation(node: ...) -> str
+  def _args(node: ...) -> str
+  def _decorators(node: ...) -> str
+  def _sig(node: ...) -> str
+  def extract_python(path: ...) -> list[...]
+  def _extract_sh(lines: ...) -> list[...]
+  def _extract_toml(lines: ...) -> list[...]
+  def _extract_md(lines: ...) -> list[...]
+  def _extract_json(text: ...) -> list[...]
+.synthbit/tests/test_common.py
+  class CommonTests(unittest.TestCase)
+    def setUp(self)
+    def tearDown(self)
+    def test_containment_and_symlink(self)
+    def test_atomic_mode_and_idempotence(self)
+    def test_unusual_files_index_and_worktree_fingerprint(self)
+    def test_nested_resolution(self)
+    def test_lock_contention_release(self)
+    def test_read_bounds(self)
+    def test_ignore_nested(self)
+.synthbit/tests/test_gate.py
+  class GateTests(unittest.TestCase)
+    def setUp(self)
+    def test_config_rejects_shell_and_escape(self)
+    def test_required_optional_missing(self)
+    def test_test_failure_is_failure(self)
+    def test_audit_findings_differ_from_error(self)
+    def test_secrets_no_values_in_output(self)
+    def test_staged_secret_even_if_worktree_cleaned(self)
+    def test_symlink_and_binary_blocked(self)
+    def test_sensitive_filename_and_conflict(self)
+AGENTS.md
+  # SynthBit repository instructions
+  ### Repository operating rules
+  ### MEMORY
+  ### SESSION LOG
+PLAN.md
+  # SynthBit v2.3 — Universal Development Harness
+  ## Goal
+  ## Non-goals
+  ## Detected Environment
+  ## Impact Analysis
+  ## File Checklist
+  ## Acceptance Criteria
+  ## Verification Commands
+  ## Failure Scenarios
+  ## Recovery Strategy

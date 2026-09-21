@@ -1,0 +1,13 @@
+# SynthBit generated state (implementation, policy and archived memory stay tracked)
+/.gauntlet/
+/.synthbit/reports/
+/.synthbit/.recalled_context
+/.synthbit/.recalled_context.meta.json
+/.synthbit/memory_index.db*
+/.synthbit/ledger.jsonl
+/.synthbit/locks/
+/.synthbit/tmp/
+/.synthbit/recovery/
+/.agent-sandboxes/
+__pycache__/
+*.pyc
