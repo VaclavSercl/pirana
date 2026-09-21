@@ -1,3 +1,4 @@
+use crate::slippage::VwapResult;
 use crate::types::{PriceLevel, Side, Symbol};
 use std::collections::BTreeMap;
 
@@ -98,7 +99,9 @@ impl OrderBook {
     /// [CASLAV v5.1 / OPONENTURA FIX] Původní implementace měla strany
     /// prohozené (BUY bral bids) — slippage guard tím byl zcela nefunkční:
     /// vždy vyhlásil price improvement a nikdy neskipnul.
-    pub fn vwap(&self, taker_side: Side, quantity: f64) -> Option<f64> {
+    ///
+    /// [F09] Nyní vrací `Option<VwapResult>` s metadaty o hloubce knihy.
+    pub fn vwap(&self, taker_side: Side, quantity: f64) -> Option<VwapResult> {
         let levels: Vec<PriceLevel> = match taker_side {
             // Taker BUY platí asky: seřazené vzestupně (nejlevní první).
             Side::Buy => self.asks.values().copied().collect(),
@@ -121,7 +124,11 @@ impl OrderBook {
         }
 
         if total_qty > 0.0 {
-            Some(total_cost / total_qty)
+            Some(VwapResult::new(
+                total_cost / total_qty,
+                total_qty,
+                quantity,
+            ))
         } else {
             None
         }
@@ -229,11 +236,19 @@ mod tests {
 
         // Taker BUY 1 BTC konzumuje asky → VWAP musí být 60010 (ask), ne 60000 (bid).
         let buy_vwap = book.vwap(Side::Buy, 1.0).unwrap();
-        assert!((buy_vwap - 60_010.0).abs() < 1e-9, "taker BUY VWAP = {buy_vwap}, očekávám ask");
+        assert!(
+            (buy_vwap.price - 60_010.0).abs() < 1e-9,
+            "taker BUY VWAP = {}, očekávám ask",
+            buy_vwap.price
+        );
 
         // Taker SELL 1 BTC konzumuje bidy → VWAP musí být 60000 (bid), ne 60010 (ask).
         let sell_vwap = book.vwap(Side::Sell, 1.0).unwrap();
-        assert!((sell_vwap - 60_000.0).abs() < 1e-9, "taker SELL VWAP = {sell_vwap}, očekávám bid");
+        assert!(
+            (sell_vwap.price - 60_000.0).abs() < 1e-9,
+            "taker SELL VWAP = {}, očekávám bid",
+            sell_vwap.price
+        );
     }
 
     /// VWAP musí správně procházet hloubku: taker BUY 3 BTC při asku
@@ -247,7 +262,12 @@ mod tests {
 
         let vwap = book.vwap(Side::Buy, 3.0).unwrap();
         let expected = (1.0 * 60_010.0 + 2.0 * 60_020.0) / 3.0;
-        assert!((vwap - expected).abs() < 1e-9, "vwap = {vwap}, očekávám {expected}");
+        assert!(
+            (vwap.price - expected).abs() < 1e-9,
+            "vwap = {}, očekávám {}",
+            vwap.price,
+            expected
+        );
     }
 
     #[test]

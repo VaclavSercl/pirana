@@ -4,3 +4,5 @@ pub mod errors;
 pub mod order_book;
 pub mod reconciliation;
 pub mod slippage;
+
+pub use slippage::VwapResult;

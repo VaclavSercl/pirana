@@ -91,6 +91,8 @@ pub struct DashboardState {
     pub market_regime: Arc<parking_lot::RwLock<String>>,
     /// VPIN status / adverse selection alert
     pub vpin_status: Arc<parking_lot::RwLock<String>>,
+    /// Whether market data feed is available (set false on idle timeout)
+    pub market_data_available: Arc<parking_lot::RwLock<bool>>,
     /// [CASLAV v5.1] Kalibrovany rizikovy stav (sebekalibrace)
     pub calibration: Arc<parking_lot::RwLock<CalibrationView>>,
     /// Avellaneda-Stoikov reservation price
@@ -352,6 +354,7 @@ impl DashboardState {
             vpin_score: Arc::new(parking_lot::RwLock::new(0.0)),
             market_regime: Arc::new(parking_lot::RwLock::new(String::new())),
             vpin_status: Arc::new(parking_lot::RwLock::new("Low Toxicity / Initializing".to_string())),
+            market_data_available: Arc::new(parking_lot::RwLock::new(false)),
             calibration: Arc::new(parking_lot::RwLock::new(CalibrationView::default())),
             reservation_price: Arc::new(parking_lot::RwLock::new(0.0)),
             as_spread_skew: Arc::new(parking_lot::RwLock::new(0.0)),
@@ -468,6 +471,11 @@ impl DashboardState {
         if history.len() > 500 {
             history.remove(0);
         }
+    }
+
+    /// Set market data availability flag (false on idle timeout)
+    pub fn set_market_data_available(&self, available: bool) {
+        *self.market_data_available.write() = available;
     }
 }
 

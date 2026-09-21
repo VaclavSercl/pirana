@@ -2382,7 +2382,7 @@ async fn process_ws_message(
                                                  // = alpha pryč = skip. Měřením 25.8.: 3 obchody
                                                  // s 12–17 bps žraly ~40 % edge dne.
                                                  let expected_buy_vwap = order_book.vwap(Side::Buy, final_trade_size);
-                                                 match slippage_guard.check(Side::Buy, price, expected_buy_vwap) {
+                                                 match slippage_guard.check(Side::Buy, price, expected_buy_vwap.as_ref()) {
                                                      pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
                                                          if log_throttler.should_log("slippage_guard_buy") {
                                                              tracing::warn!(
@@ -2894,7 +2894,7 @@ async fn process_ws_message(
                                                             conf.risk_management.max_slippage_bps as f64,
                                                         );
                                                         let expected_sell_vwap = order_book.vwap(Side::Sell, final_trade_size);
-                                                        let limit = match slippage_guard_sell.check(Side::Sell, price, expected_sell_vwap) {
+                                                        let limit = match slippage_guard_sell.check(Side::Sell, price, expected_sell_vwap.as_ref()) {
                                                             pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
                                                                 if log_throttler.should_log("slippage_guard_sell") {
                                                                     tracing::warn!(

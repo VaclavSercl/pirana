@@ -149,7 +149,7 @@ pub fn evaluate_signal_exit(
     };
 
     let expected_vwap = match order_book.vwap(Side::Sell, quantity) {
-        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(ref v) if v.price.is_finite() && v.price > 0.0 => v.price,
         Some(_) => {
             return SignalExitDecision::RejectInvalidInputs {
                 reason: "order book sell vwap is non-positive or non-finite",

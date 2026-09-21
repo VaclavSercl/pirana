@@ -26,6 +26,33 @@ use std::collections::VecDeque;
 /// BPS přepočet: 1 bps = 0,01 %.
 pub const BPS: f64 = 1.0 / 10_000.0;
 
+/// VWAP výsledek s metadaty o hloubce knihy (F09).
+#[derive(Debug, Clone)]
+pub struct VwapResult {
+    /// VWAP cena pro taker stranu.
+    pub price: f64,
+    /// Kolik quantity bylo reálně naplněno z knihy.
+    pub filled_quantity: f64,
+    /// Kolik quantity bylo požadováno na VWAP výpočet.
+    pub requested_quantity: f64,
+}
+
+impl VwapResult {
+    /// Vytvoří nový VwapResult.
+    pub fn new(price: f64, filled_quantity: f64, requested_quantity: f64) -> Self {
+        Self {
+            price,
+            filled_quantity,
+            requested_quantity,
+        }
+    }
+
+    /// Vrací true, pokud byla naplněna plná požadovaná quantity.
+    pub fn is_fully_filled(&self) -> bool {
+        self.filled_quantity >= self.requested_quantity
+    }
+}
+
 /// Výsledek pre-trade kontroly slippage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlippageDecision {
@@ -34,7 +61,10 @@ pub enum SlippageDecision {
     Execute { expected_fill_price: f64 },
     /// Přeskočit — alpha už je pryč (slippage > práh).
     /// Nese změřený slippage v bps pro telemetrii.
-    Skip { slippage_bps: f64, expected_fill_price: f64 },
+    Skip {
+        slippage_bps: f64,
+        expected_fill_price: f64,
+    },
 }
 
 /// Exekuční slippage guard.
@@ -63,17 +93,17 @@ impl SlippageGuard {
 
     /// Pre-trade rozhodnutí.
     ///
-    /// * `side`             — Buy nebo Sell.
-    /// * `signal_price`     — cena signálu (odkud alpha vychází).
-    /// * `expected_fill_vwap`— VWAP z order booku pro danou stranu a qty.
+    /// * `side`         — Buy nebo Sell.
+    /// * `signal_price` — cena signálu (odkud alpha vychází).
+    /// * `vwap_result`  — VWAP výsledek z order booku pro danou stranu a qty.
     pub fn check(
         &self,
         side: Side,
         signal_price: f64,
-        expected_fill_vwap: Option<f64>,
+        vwap_result: Option<&VwapResult>,
     ) -> SlippageDecision {
-        let vwap = match expected_fill_vwap {
-            Some(v) if v.is_finite() && v > 0.0 => v,
+        let vwap = match vwap_result {
+            Some(r) if r.price.is_finite() && r.price > 0.0 => r.price,
             // Bez dat o knize neblokujeme — market order na BTC/USD
             // s pozicí ~0,001 BTC má zanedbatelný impact.
             _ => {
@@ -158,8 +188,7 @@ impl SlippageTelemetry {
         self.ewma_bps = if self.ewma_bps == 0.0 {
             realized_bps
         } else {
-            TELEMETRY_EWMA_LAMBDA * self.ewma_bps
-                + (1.0 - TELEMETRY_EWMA_LAMBDA) * realized_bps
+            TELEMETRY_EWMA_LAMBDA * self.ewma_bps + (1.0 - TELEMETRY_EWMA_LAMBDA) * realized_bps
         };
         if self.window.len() >= self.capacity {
             self.window.pop_front();
@@ -206,11 +235,17 @@ fn percentile(window: &VecDeque<f64>, p: f64) -> Option<f64> {
 mod tests {
     use super::*;
 
+    /// Helper pro testy — VwapResult s plným naplněním.
+    fn vwap_result_for_test(price: f64) -> VwapResult {
+        VwapResult::new(price, 1.0, 1.0)
+    }
+
     #[test]
     fn guard_passes_when_vwap_within_threshold() {
         let g = SlippageGuard::new(5.0);
         // BUY: VWAP ask o 2 bps výš než signál — OK.
-        let d = g.check(Side::Buy, 80_000.0, Some(80_016.0)); // 2 bps
+        let vwap = vwap_result_for_test(80_016.0); // 2 bps
+        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
         assert!(matches!(d, SlippageDecision::Execute { .. }));
     }
 
@@ -218,7 +253,8 @@ mod tests {
     fn guard_skips_when_vwap_exceeds_threshold() {
         let g = SlippageGuard::new(5.0);
         // BUY: VWAP ask o 10 bps výš — skip.
-        let d = g.check(Side::Buy, 80_000.0, Some(80_080.0)); // 10 bps
+        let vwap = vwap_result_for_test(80_080.0); // 10 bps
+        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
         match d {
             SlippageDecision::Skip { slippage_bps, .. } => {
                 assert!((slippage_bps - 10.0).abs() < 0.01, "bps = {slippage_bps}");
@@ -231,10 +267,12 @@ mod tests {
     fn guard_sell_side_measures_opposite() {
         let g = SlippageGuard::new(5.0);
         // SELL: VWAP bid o 3 bps níž než signál — OK (3 < 5).
-        let d = g.check(Side::Sell, 80_000.0, Some(79_976.0)); // 3 bps
+        let vwap = vwap_result_for_test(79_976.0); // 3 bps
+        let d = g.check(Side::Sell, 80_000.0, Some(&vwap));
         assert!(matches!(d, SlippageDecision::Execute { .. }));
         // SELL: VWAP bid o 8 bps níž — skip.
-        let d = g.check(Side::Sell, 80_000.0, Some(79_936.0)); // 8 bps
+        let vwap = vwap_result_for_test(79_936.0); // 8 bps
+        let d = g.check(Side::Sell, 80_000.0, Some(&vwap));
         assert!(matches!(d, SlippageDecision::Skip { .. }));
     }
 
@@ -244,7 +282,9 @@ mod tests {
         let g = SlippageGuard::new(5.0);
         let d = g.check(Side::Buy, 80_000.0, None);
         assert!(matches!(d, SlippageDecision::Execute { .. }));
-        let d = g.check(Side::Buy, 80_000.0, Some(f64::NAN));
+        // NaN price → fail-open
+        let vwap = VwapResult::new(f64::NAN, 1.0, 1.0);
+        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
         assert!(matches!(d, SlippageDecision::Execute { .. }));
     }
 
@@ -252,8 +292,62 @@ mod tests {
     fn guard_price_improvement_always_passes() {
         let g = SlippageGuard::new(5.0);
         // BUY s VWAP POD signálem = price improvement — vždy OK.
-        let d = g.check(Side::Buy, 80_000.0, Some(79_990.0));
+        let vwap = vwap_result_for_test(79_990.0);
+        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
         assert!(matches!(d, SlippageDecision::Execute { .. }));
+    }
+
+    #[test]
+    fn guard_uses_vwap_result_fields() {
+        // [F09 REGRESNÍ TEST] Guard musí číst cenu z VwapResult.price,
+        // nikoli jen holou f64. Ověřuje, že expected_fill_price pochází
+        // ze struktury a že částečné naplnění neblokuje exekuci.
+        let g = SlippageGuard::new(5.0);
+
+        // 2 bps — Execute s expected_fill_price z VwapResult
+        let vwap = VwapResult::new(80_016.0, 1.0, 1.0);
+        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
+        match &d {
+            SlippageDecision::Execute {
+                expected_fill_price,
+            } => {
+                assert!(
+                    (*expected_fill_price - 80_016.0).abs() < 1e-9,
+                    "očekávám VWAP price {:.2}, dostal jsem {:.2}",
+                    80_016.0,
+                    expected_fill_price
+                );
+            }
+            _ => panic!("očekávám Execute, dostal jsem {:?}", d),
+        }
+
+        // 10 bps — Skip se správným expected_fill_price z VwapResult
+        let vwap = VwapResult::new(80_080.0, 1.0, 1.0);
+        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
+        match &d {
+            SlippageDecision::Skip {
+                slippage_bps,
+                expected_fill_price,
+            } => {
+                assert!(
+                    (*expected_fill_price - 80_080.0).abs() < 1e-9,
+                    "Skip musí nést VWAP price {:.2}, dostal jsem {:.2}",
+                    80_080.0,
+                    expected_fill_price
+                );
+                assert!((*slippage_bps - 10.0).abs() < 0.01, "bps = {slippage_bps}");
+            }
+            _ => panic!("očekávám Skip, dostal jsem {:?}", d),
+        }
+
+        // VwapResult s filled_quantity < requested_quantity — stále funguje
+        let partial = VwapResult::new(80_016.0, 0.5, 1.0);
+        assert!(!partial.is_fully_filled());
+        let d = g.check(Side::Buy, 80_000.0, Some(&partial));
+        assert!(
+            matches!(d, SlippageDecision::Execute { .. }),
+            "částečné naplnění nesmí bránit exekuci"
+        );
     }
 
     #[test]
