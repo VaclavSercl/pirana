@@ -43,6 +43,10 @@ use entry_policy::{
     EntryGate, EntryGateDecision, EntryRoutingDecision, DEFAULT_MIN_IMPULSE_SPACING,
 };
 
+mod ws_registry;
+mod exit_planner;
+mod trade_dedup;
+
 mod signal_exit;
 use signal_exit::{evaluate_signal_exit, SignalExitDecision};
 
@@ -2907,28 +2911,30 @@ async fn process_ws_message(
                                                             }
                                                         }
 
-                                                        // 2. Slippage Guard check BEFORE removing the position from active_positions
-                                                        let slippage_guard_sell = pirana_core::slippage::SlippageGuard::new(
+                                                        // F02: Shared exit planner enforces IOC + no-loss invariant
+                                                        let exit_plan = exit_planner::plan_exit_order(
+                                                            candidate_pos.entry_price,
+                                                            final_trade_size,
+                                                            price,
                                                             conf.risk_management.max_slippage_bps as f64,
+                                                            order_book,
+                                                            0.01,
                                                         );
-                                                        let expected_sell_vwap = order_book.vwap(Side::Sell, final_trade_size);
-                                                        let limit = match slippage_guard_sell.check(Side::Sell, price, expected_sell_vwap.as_ref()) {
-                                                            pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
-                                                                if log_throttler.should_log("slippage_guard_sell") {
+                                                        let limit = match exit_plan {
+                                                            exit_planner::ExitPlan::ExecuteIOC { limit_price, .. } => limit_price,
+                                                            exit_planner::ExitPlan::Reject { reason } => {
+                                                                if log_throttler.should_log("exit_planner_reject") {
                                                                     tracing::warn!(
-                                                                        "🛡️ [SLIPPAGE GUARD] SELL skip: očekávaný fill {:.0} = +{:.1} bps > práh {} bps (signál {:.0}). Alpha pryč.",
-                                                                        expected_fill_price, slippage_bps, conf.risk_management.max_slippage_bps, price
+                                                                        "🛡️ [EXIT PLANNER REJECTED] SELL exit rejected: {} (entry={:.2}, signal={:.2}). Leaving to TP/SL.",
+                                                                        reason, candidate_pos.entry_price, price
                                                                     );
                                                                 }
                                                                 state.add_signal(signal_view);
                                                                 return;
                                                             }
-                                                            pirana_core::slippage::SlippageDecision::Execute { .. } => {
-                                                                slippage_guard_sell.ioc_limit_price(Side::Sell, price)
-                                                            }
                                                         };
 
-                                                        // 3. Now remove candidate position from active_positions
+                                                        // 2. Remove candidate position from active_positions
                                                         let removed_pos = {
                                                             let mut positions = active_positions.write();
                                                             if let Some(idx) = positions.iter().position(|p| p.position_id == candidate_pos.position_id) {
