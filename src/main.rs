@@ -1699,6 +1699,24 @@ async fn process_ws_message(
                         if let Some(trade) = array[2].as_array() {
                             if trade.len() >= 4 {
                                 let id = trade[0].as_i64().unwrap_or(0);
+                                
+                                // F04: Deduplicate te/tu by trade ID before processing
+                                // (replays/reconnects may deliver same ID twice)
+                                let trade_id = id as u64;
+                                let is_new_trade = {
+                                    let mut dedup = state.trade_dedup_ids.lock();
+                                    if dedup.contains(&trade_id) {
+                                        false
+                                    } else {
+                                        if dedup.len() >= 1000 { dedup.pop_front(); }
+                                        dedup.push_back(trade_id);
+                                        true
+                                    }
+                                };
+                                if !is_new_trade {
+                                    return;
+                                }
+                                
                                 let qty = trade[2].as_f64().unwrap_or(0.0);
                                 let price = trade[3].as_f64().unwrap_or(0.0);
                                 
