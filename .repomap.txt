@@ -1,3 +1,5 @@
+.gauntlet.sh
+.generate_repomap.sh
 .gitignore
   /.gauntlet/
   /.synthbit/reports/
@@ -13,6 +15,8 @@
   ## Verification policy
   ## History and recovery contract
   ## Validation coverage
+.synthbit/archive/memory_202609.md
+  # Archived Session Log — 202609
 .synthbit/common.py
   class Blocked(RuntimeError)
   def uid_check(path: ...) -> None
@@ -27,14 +31,14 @@
 .synthbit/config.json
   key schema_version
   key runtime
-  key runtime_preference
-  key repair_budget_max
-  key limits
   key commands
   key allowed_paths
   key dependency_changes
   key permission_changes
   key network_audit
+  key audit_commands
+  key max_file_bytes
+  key docker
 .synthbit/dispatcher.py
   def detect_runtime(name: ...) -> tuple[...]
   def bounded_run(argv: ..., cwd: ..., timeout: ...=...) -> tuple[...]
@@ -74,6 +78,25 @@
   def perform_rollback(root: ..., run_id: ..., hard: ...=...) -> dict
   def create_checkpoint(root: ..., run_id: ..., description: ..., attempt: ...=..., status: ...=..., **extra) -> dict
   def doctor(root: ...) -> dict
+.synthbit/prune.lock
+.synthbit/prune_memory.py
+  def parse_section(text: ...) -> list[...]
+  def dedup(entries: ...) -> list[...]
+  def write_archive(root: ..., entries: ...) -> int
+  def rebuild_section(retained: ...) -> str
+  def prune(agents_text: ...) -> ...
+  def main() -> int
+.synthbit/recall.py
+  def _db_path(root: ...) -> Path
+  def _fts_available() -> bool
+  def _escape_fts(query: ...) -> str
+  def _open_db(root: ...) -> sqlite3.Connection
+  def build_index(root: ...) -> int
+  def _clear_recalled(root: ...) -> None
+  def _publish_recalled(root: ..., content: ..., meta: ...) -> None
+  def _search_fts(conn: ..., query: ..., limit: ...) -> list[...]
+  def _search_fallback(root: ..., query: ..., limit: ...) -> list[...]
+  def search(root: ..., query: ..., backend: ...=..., limit: ...=...) -> dict
 .synthbit/repomap.py
   def _expr(node: ...) -> str
   def _annotation(node: ...) -> str
@@ -85,6 +108,18 @@
   def _extract_toml(lines: ...) -> list[...]
   def _extract_md(lines: ...) -> list[...]
   def _extract_json(text: ...) -> list[...]
+.synthbit/sandbox.sh
+  fn _info
+  fn _warn
+  fn _error
+  fn usage
+  fn _repo_root
+  fn _gen_run_id
+  fn _branch_name
+  fn _worktree_path
+  fn _recovery_ref
+  fn _ledger_path
+.synthbit/test-contention.lock
 .synthbit/tests/test_common.py
   class CommonTests(unittest.TestCase)
     def setUp(self)
@@ -107,6 +142,27 @@
     def test_staged_secret_even_if_worktree_cleaned(self)
     def test_symlink_and_binary_blocked(self)
     def test_sensitive_filename_and_conflict(self)
+.synthbit/tests/test_recall_prune.py
+  class RecallTests(unittest.TestCase)
+    def setUp(self)
+    def test_empty_query(self)
+    def test_no_match_fallback(self)
+    def test_seed_and_search(self)
+    def test_fts_unavailable_fails_closed(self)
+    def test_reindex(self)
+    def test_recalled_file_written(self)
+    def test_stale_invalidation(self)
+    def test_fts_backend_when_available(self)
+.synthbit/tests/test_repomap.py
+  class RepomapTests(unittest.TestCase)
+    def setUp(self)
+    def test_empty_repo(self)
+    def test_python_ast_extraction(self)
+    def test_invalid_syntax_handled(self)
+    def test_deterministic_output(self)
+    def test_max_lines_respected(self)
+    def test_ignores_gitignored(self)
+    def test_atomic_write(self)
 AGENTS.md
   # SynthBit repository instructions
   ### Repository operating rules
