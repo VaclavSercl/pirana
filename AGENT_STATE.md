@@ -32,6 +32,12 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 23.9.2026 - Codex audit continuation (server SSH)
+
+- Isolated audit candidate integrates typed market routing, protected IOC exits, full-depth liquidity checks, fee-aware persistent accounting and equity risk, plus recovery of the observed partial IOC cancellation status. Independent review and native checks passed: 455 Rust tests and 210 Python tests. Docker release validation also passed on ARM64/Rust1.85.1. Exact-checkpoint publication/deployment outcomes are recorded in /home/wwwenda/workspace/pirana-evidence-20260923; this entry records the prepublication checkpoint. Strategy sizing was not changed. No live intents or accounting history were manually deleted.
+- Hourly Codex oversight configured; authenticated initial check found no fills in the last24h and matching exchange BTC versus3 durable positions. One pending BUY explains the recovery wait. Private evidence is retained outside tracked files.
+
+
 ### 22.9.2026
 
 - **07:00 (ranní audit — Hermes CLI)**: ⚠️ **CRITICAL: systém HALTED**. `system_mode=Halted`, `execution_block_reason=execution reconciliation pending: position/order state not confirmed`. Služba běží (uptime ~35 h), ale NEOBCHODUJE. 2 otevřené BUY pozice (#127 @81,882, #128 @81,905) v unrealized ztrátě (current $81,686). 124 recovery candidates ve frontě (staré nevyřízené pozice). Poslední trade 21.9. 01:26 UTC. VPIN 45.2% (moderate), RANGE, OFI 0.0, Hawkes λ=1.60 (nízký). Slippage EWMA 1.29 bps (OK). Accounting zcela rozbitý — vše NULL, "stale projection". USD balance $294.98 + BTC 0.00105209 ≈ $85.93. Žádná změna TOML ani zásah (reconciliation vyžaduji operátor/sudo). Doporučeno: ověřit pozice #127/#128 na Burze, spustit reconcile, vyčistit recovery frontu.

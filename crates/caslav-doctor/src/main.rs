@@ -611,12 +611,12 @@ fn test_vwap_taker_semantics() -> Result<(), String> {
     book.update_level(Side::Sell, 60_010.0, 5.0, 10);
 
     let buy_vwap = book.vwap(Side::Buy, 1.0).ok_or("VWAP Buy vrátil None")?;
-    if (buy_vwap.price - 60_010.0).abs() > 1e-9 {
-        return Err(format!("taker BUY VWAP = {}, očekáváno ask 60_010 (strany prohozené?)", buy_vwap.price));
+    if (buy_vwap - 60_010.0).abs() > 1e-9 {
+        return Err(format!("taker BUY VWAP = {}, očekáváno ask 60_010 (strany prohozené?)", buy_vwap));
     }
     let sell_vwap = book.vwap(Side::Sell, 1.0).ok_or("VWAP Sell vrátil None")?;
-    if (sell_vwap.price - 60_000.0).abs() > 1e-9 {
-        return Err(format!("taker SELL VWAP = {}, očekáváno bid 60_000", sell_vwap.price));
+    if (sell_vwap - 60_000.0).abs() > 1e-9 {
+        return Err(format!("taker SELL VWAP = {}, očekáváno bid 60_000", sell_vwap));
     }
     Ok(())
 }

@@ -38,11 +38,11 @@ fn test_order_book_vwap() {
     book.update_level(Side::Sell, 60001.0, 1.0, 4);
     book.update_level(Side::Sell, 60002.0, 0.5, 2);
 
-    let bid_vwap = book.vwap(Side::Buy, 1.5).unwrap();
-    assert!(bid_vwap.price > 59999.0 && bid_vwap.price < 60000.0);
+    let bid_vwap = book.vwap(Side::Sell, 1.5).unwrap();
+    assert!(bid_vwap > 59999.0 && bid_vwap < 60000.0);
 
-    let ask_vwap = book.vwap(Side::Sell, 1.5).unwrap();
-    assert!(ask_vwap.price > 60001.0 && ask_vwap.price < 60002.0);
+    let ask_vwap = book.vwap(Side::Buy, 1.5).unwrap();
+    assert!(ask_vwap > 60001.0 && ask_vwap < 60002.0);
 }
 
 #[test]

@@ -31,6 +31,8 @@ use pirana_risk_engine::ledger_persistence;
 use std::sync::Arc;
 use tracing::{info, error, warn};
 
+static EQUITY_GUARD_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+mod market_events;
 mod config;
 use config::StrategyConfig;
 
@@ -42,10 +44,6 @@ mod entry_policy;
 use entry_policy::{
     EntryGate, EntryGateDecision, EntryRoutingDecision, DEFAULT_MIN_IMPULSE_SPACING,
 };
-
-mod ws_registry;
-mod exit_planner;
-mod trade_dedup;
 
 mod signal_exit;
 use signal_exit::{evaluate_signal_exit, SignalExitDecision};
@@ -479,6 +477,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let active_positions = Arc::new(position_persistence::PositionBook::open(position_path, operational_recovery::projection(&initial_accounting).map_err(pirana_core::errors::PiranaError::Config)?)
         .map_err(pirana_core::errors::PiranaError::Config)?);
 
+    *state.pending_skim_usd.write() = active_positions.pending_skim_usd();
+
     // Strop otevrenych orderu ze strategy.toml (drive mrtvy klic — router
     // vzdy pouzil konstantu 10). Konfigurace smi strop jen SNIZIT pod tvrdy
     // limit MAX_OPEN_ORDERS_PER_SYMBOL, nikdy ho zvysit.
@@ -547,6 +547,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         if initial_balance > 0.0 { initial_balance } else { 1000.0 },
         risk_state_path,
     );
+    risk_engine.require_equity_guard();
     risk_engine.activate();
     POSITION_PERSISTENCE_OK.store(active_positions.pending_entries().is_empty() && active_positions.unresolved_exits().is_empty(), std::sync::atomic::Ordering::Release);
     execution_recovery::refresh_status(&state);
@@ -889,25 +890,29 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         // nechá citac nafouknuty. 24. 8. pozorovano
                         // exposure_pct = 26,42 pri NULA otevrenych pozicich.
                         if equity_usd > 0.0 {
-                            let notional: f64 = active_positions_for_recon
-                                .read()
-                                .iter()
-                                .map(|p| p.quantity.abs() * btc_price)
-                                .sum();
-                            let wallet_notional = (new_btc - opening_btc_reserve).max(0.0) * btc_price;
-                            let actual = (notional.max(wallet_notional) / equity_usd).clamp(0.0, 10.0);
-                            *state_for_reconciliation.exposure_pct.write() = actual * 100.0;
-                            if let Some(drift) = risk_engine_for_reconciliation
-                                .sync_exposure_from_positions(actual)
-                            {
-                                warn!(
-                                    "Expozice srovnana: drift {:+.4} -> skutecnych {:.4} \
-                                     ({} otevrenych pozic)",
-                                    drift,
-                                    actual,
-                                    active_positions_for_recon.read().len()
-                                );
-                            }
+                            // The wallet REST request must still describe this exact
+                            // economic generation when exposure is published.
+                            if EXECUTION_ACTIVITY.publish_if_unchanged(observation, || {
+                                let notional: f64 = active_positions_for_recon
+                                    .read()
+                                    .iter()
+                                    .map(|p| p.quantity.abs() * btc_price)
+                                    .sum();
+                                let wallet_notional = (new_btc - opening_btc_reserve).max(0.0) * btc_price;
+                                let actual = (notional.max(wallet_notional) / equity_usd).clamp(0.0, 10.0);
+                                *state_for_reconciliation.exposure_pct.write() = actual * 100.0;
+                                if let Some(drift) = risk_engine_for_reconciliation
+                                    .sync_exposure_from_positions(actual)
+                                {
+                                    warn!(
+                                        "Expozice srovnana: drift {:+.4} -> skutecnych {:.4} \
+                                         ({} otevrenych pozic)",
+                                        drift,
+                                        actual,
+                                        active_positions_for_recon.read().len()
+                                    );
+                                }
+                            }).is_none() { continue; }
                         }
 
                         if tick % RECALIBRATION_EVERY_N_TICKS == 0 { risk_engine_for_reconciliation.recalibrate_and_log(equity_usd, btc_price); }
@@ -963,9 +968,12 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         }
     });
 
+    let mut market_events = market_events::MarketEvents::default();
     let url = "wss://api-pub.bitfinex.com/ws/2";
 
     loop {
+        market_events.reconnect();
+        state.set_market_data_available(false);
         // Reset order book to prevent stale depth state across reconnects
         order_book = pirana_core::order_book::OrderBook::new(Symbol::new("tBTCUSD"), 0.01);
         info!("Connecting to Bitfinex public WebSocket: {}", url);
@@ -1019,47 +1027,55 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
         info!("Subscribed to BTC/USD ticker, order book and trades");
 
-        // Channel registry initialized on reconnect (see reconnect logic)
-
+        let connected_at = std::time::Instant::now();
         let mut price_update_interval = interval(Duration::from_secs(5));
         let mut connection_active = true;
+        let mut receive_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
         while connection_active {
             tokio::select! {
-                msg = tokio::time::timeout(std::time::Duration::from_secs(30), ws.next()) => {
+                msg = ws.next() => {
+                    receive_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                     match msg {
-                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                             notify_systemd_watchdog();
-                            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(data) = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|data| market_events.route(data, std::time::Instant::now(), chrono::Utc::now().timestamp_millis())) {
+                                state.set_market_data_available(data.entry_ready);
                                 process_ws_message(&state, data, &mut ofi, &mut flow_calculator, &mut atr, &mut l2_depth, &mut hawkes, &mut vpin, &mut as_model, &markout_tracker, &slippage_telemetry, &mut order_book, &mut log_throttler, &router, &mut validator, &governance, &risk_engine, &client, &mut last_price, &strategy_config, &mut last_trade_time, &active_positions, &lead_lag_engine, &pullback_detector, &tick_recorder, &entry_gate, &shadow_engine).await;
                             }
                         }
-                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data)))) => {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
                             notify_systemd_watchdog();
                             ws.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await.ok();
                         }
-                        Ok(Some(Err(e))) => {
+                        Some(Err(e)) => {
                             error!("WebSocket error: {}", e);
                             connection_active = false;
                         }
-                        Ok(None) => {
+                        None => {
                             error!("WebSocket connection closed");
-                            connection_active = false;
-                        }
-                        Err(_) => {
-                            error!("WebSocket timeout — no message for 30s");
                             connection_active = false;
                         }
                         _ => {}
                     }
                 }
+                _ = tokio::time::sleep_until(receive_deadline) => {
+                    error!("WebSocket timeout — no message for 30s");
+                    connection_active = false;
+                }
                 _ = price_update_interval.tick() => {
                     notify_systemd_watchdog();
-                    // Periodic check
+                    state.set_market_data_available(market_events.ready(std::time::Instant::now()));
+                    if connected_at.elapsed() >= Duration::from_secs(30)
+                        && !market_events.ready(std::time::Instant::now()) {
+                        error!("Market subscriptions missing, invalid or stale; reconnecting for fresh snapshots");
+                        connection_active = false;
+                    }
                 }
             }
         }
 
+        state.set_market_data_available(false);
         info!("WebSocket connection lost. Reconnecting in 5 seconds...");
         sleep(Duration::from_secs(5)).await;
     }
@@ -1069,7 +1085,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 #[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: &DashboardState,
-    mut data: serde_json::Value,
+    frame: market_events::RoutedFrame,
     ofi: &mut OfiCalculator,
     flow_calculator: &mut FlowCalculator,
     atr: &mut AtrCalculator,
@@ -1096,19 +1112,35 @@ async fn process_ws_message(
     entry_gate: &Arc<parking_lot::Mutex<EntryGate>>,
     shadow_engine: &Arc<parking_lot::Mutex<ShadowExperimentEngine>>,
 ) {
-    let execution_available = POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire);
-    let _decision_activity = execution_available.then(|| EXECUTION_ACTIVITY.begin());
+    let execution_available = frame.entry_ready && order_book.spread().is_some_and(|spread| spread > 0.0)
+        && POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire);
+    let data = frame.data;
 
     if let Some(array) = data.as_array() {
         if array.len() >= 2 {
             // Ticker data (array[1] is array of 10 items)
             if let Some(values) = array[1].as_array() {
-                if values.len() >= 10 {
+                if frame.channel == market_events::Channel::Ticker && values.len() == 10 {
                     if let Some(price) = values[6].as_f64() {
                         *state.btc_price.write() = price;
                         state.add_price_point(price);
                         *last_price = price;
                         atr.process_price(price);
+                        if let Some(generation) = EXECUTION_ACTIVITY.idle_generation() {
+                            if let Some(_wallet_view) = EXECUTION_ACTIVITY.idle_guard(generation) {
+                                let equity = *state.btc_balance.read() * price + *state.usd_balance.read();
+                                let now = chrono::Utc::now().timestamp_millis();
+                                let initialized = EQUITY_GUARD_INITIALIZED.load(std::sync::atomic::Ordering::Acquire);
+                                let result = if initialized { risk_engine.mark_equity(equity, now) } else {
+                                    risk_engine.initialize_equity_guard(pirana_risk_engine::persistence::default_state_path().with_file_name("equity_anchors.json"), equity, now)
+                                };
+                                match result {
+                                    Ok(()) => { EQUITY_GUARD_INITIALIZED.store(true, std::sync::atomic::Ordering::Release); }
+                                    Err(e) => tracing::error!("Equity guard blocked: {}", e),
+                                }
+                                *state.daily_drawdown_pct.write() = risk_engine.equity_drawdowns().0;
+                            }
+                        }
 
                         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                         lead_lag_engine.write().update_bitfinex(price, now_ms);
@@ -1151,7 +1183,13 @@ async fn process_ws_message(
                         let conf = strategy_config.read().clone();
                         if conf.avellaneda_stoikov.enabled {
                             as_model.gamma = conf.avellaneda_stoikov.risk_aversion_gamma;
-                            as_model.kappa = conf.avellaneda_stoikov.order_book_liquidity_kappa;
+                            let (bids, asks) = order_book.top_levels(25);
+                                    let bids: Vec<_> = bids.iter().map(|b| (b.price, b.quantity)).collect();
+                                    let asks: Vec<_> = asks.iter().map(|a| (a.price, a.quantity)).collect();
+                                    as_model.kappa = if frame.entry_ready {
+                                        l2_depth.estimate_dynamic_kappa(&bids, &asks, conf.avellaneda_stoikov.order_book_liquidity_kappa)
+                                    } else { conf.avellaneda_stoikov.order_book_liquidity_kappa };
+                                    *state.dynamic_kappa.write() = as_model.kappa;
                             as_model.dt = conf.avellaneda_stoikov.time_horizon_dt;
                         }
                         let total_btc = *state.btc_balance.read();
@@ -1304,7 +1342,8 @@ async fn process_ws_message(
                                 }
 
                                 if should_close {
-                                    positions_to_close.push(positions.remove(i));
+                                    positions_to_close.push(pos.clone());
+                                    i += 1;
                                 } else {
                                     i += 1;
                                 }
@@ -1312,7 +1351,26 @@ async fn process_ws_message(
                         }
 
                         // Close positions asynchronously
-                        for pos in positions_to_close {
+                        for selected in positions_to_close {
+                            let exit_limit = if selected.is_paper { price } else {
+                                if selected.side != Side::Buy { continue; }
+                                match evaluate_signal_exit(selected.entry_price, selected.quantity, price,
+                                    conf.risk_management.max_slippage_bps as f64, order_book) {
+                                    SignalExitDecision::Allow { ioc_limit_price, .. } => ioc_limit_price,
+                                    _ => continue,
+                                }
+                            };
+                            let mut execution_activity = if selected.is_paper { None } else {
+                                let Some(guard) = EXECUTION_ACTIVITY.try_begin_idle() else { continue; };
+                                Some(guard)
+                            };
+                            let pos = {
+                                let mut positions = active_positions.write();
+                                let Some(index) = positions.iter().position(|p| p.position_id == selected.position_id
+                                    && p.quantity == selected.quantity && p.entry_price == selected.entry_price) else { continue; };
+                                if let Some(guard) = execution_activity.as_mut() { guard.activate(); }
+                                positions.remove(index)
+                            };
                             let client_clone = client.clone();
                             let state_clone = state.clone();
                             let risk_engine_clone = risk_engine.clone();
@@ -1374,7 +1432,6 @@ async fn process_ws_message(
                                     });
                                 });
                             } else {
-                                let execution_activity = EXECUTION_ACTIVITY.begin();
                                 tokio::spawn(async move {
                                 let _execution_activity = execution_activity;
                                     let close_side = match pos_clone.side {
@@ -1386,12 +1443,13 @@ async fn process_ws_message(
                                         Side::Sell => -1.0,
                                     };
 
-                                    tracing::info!("Executing asynchronous MARKET {:?} order for {:.6} BTC to close position (entry price: {})", close_side, pos_clone.quantity, pos_clone.entry_price);
+                                    tracing::info!("Executing protected IOC {:?} order for {:.6} BTC to close position (entry price: {})", close_side, pos_clone.quantity, pos_clone.entry_price);
 
                                     let exit_cid = next_entry_cid();
                                     let exit_mts = chrono::Utc::now().timestamp_millis();
-                                    let exit_result = match active_positions_clone.stage_exit(exit_cid.to_string(), pos_clone.clone()) {
-                                        Ok(()) if close_side != Side::Sell || operational_recovery::sale_allowed(*state_clone.btc_balance.read(), quarantined_btc(), pos_clone.quantity) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", close_side, pirana_core::types::OrderType::Market, sign * pos_clone.quantity, price, exit_cid)).await,
+                                    let skim = strategy_config_clone.read().profit_skimmer.clone();
+                                    let exit_result = match active_positions_clone.stage_exit_quantity_with_skim(exit_cid.to_string(), pos_clone.clone(), pos_clone.quantity, if skim.enabled { skim.btc_lock_pct } else { 0.0 }) {
+                                        Ok(()) if close_side != Side::Sell || operational_recovery::sale_allowed(*state_clone.btc_balance.read(), quarantined_btc(), pos_clone.quantity) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", close_side, pirana_core::types::OrderType::IOC, sign * pos_clone.quantity, exit_limit, exit_cid)).await,
                                         Ok(()) => Err(pirana_core::errors::PiranaError::Config("sale would consume quarantined BTC".into())),
                                         Err(e) => Err(pirana_core::errors::PiranaError::Config(e)),
                                     };
@@ -1411,30 +1469,18 @@ async fn process_ws_message(
                                                 if let Err(e) = active_positions_clone.complete_confirmed_zero(&exit_cid.to_string()) { execution_recovery::pause(&state_clone, &e); }
                                                 return;
                                             }
-                                            if filled_qty - base_fee < pos_clone.quantity {
-                                                let mut residual = pos_clone.clone();
-                                                residual.quantity -= filled_qty - base_fee;
-                                                residual.exposure_size *= residual.quantity / pos_clone.quantity;
-                                                active_positions_clone.write().push(residual);
-                                            }
-
-                                            if let Err(e) = active_positions_clone.mark_exit_settled(&exit_cid.to_string()) {
+                                            // Calculate realized PnL from the REAL exchange fill price (includes slippage)
+                                            let pnl = match pos_clone.side {
+                                                Side::Buy => fill_price * filled_qty - pos_clone.entry_price * (filled_qty - base_fee),
+                                                Side::Sell => (pos_clone.entry_price - fill_price) * filled_qty,
+                                            };
+                                            if let Err(e) = active_positions_clone.complete_exit_with_profit(&exit_cid.to_string(), filled_qty - base_fee, pnl) {
                                                 execution_recovery::pause(&state_clone, &e);
                                                 return;
                                             }
-
-                                            // Record metrics in risk engine
-                                            let exposure_delta = match pos_clone.side {
-                                                Side::Buy => -pos_clone.exposure_size * (filled_qty - base_fee) / pos_clone.quantity,
-                                                Side::Sell => pos_clone.exposure_size * (filled_qty - base_fee) / pos_clone.quantity,
-                                            };
+                                            *state_clone.pending_skim_usd.write() = active_positions_clone.pending_skim_usd();
+                                            let exposure_delta = -pos_clone.exposure_size * (filled_qty - base_fee) / pos_clone.quantity;
                                             risk_engine_clone.update_exposure(exposure_delta);
-
-                                            // Calculate realized PnL from the REAL exchange fill price (includes slippage)
-                                            let pnl = match pos_clone.side {
-                                                Side::Buy => (fill_price - pos_clone.entry_price) * filled_qty,
-                                                Side::Sell => (pos_clone.entry_price - fill_price) * filled_qty,
-                                            };
                                             risk_engine_clone.record_trade_result(pnl);
 
                                             // Update balances locally using real fill
@@ -1481,20 +1527,6 @@ async fn process_ws_message(
                                                 if let Err(e) = ledger_persistence::append_trade(&closed_trade) {
                                                     ACCOUNTING_CAPTURE_READY.store(false, std::sync::atomic::Ordering::Release);
                                                     tracing::error!("Legacy diagnostic ledger write failed; BUY paused pending durable accounting sync: {}", e);
-                                                }
-                                            }
-
-                                            // Asymmetric BTC Profit Skimmer: Lock profit portion in BTC reserve
-                                            if pnl > 0.0 && fill_price > 0.0 {
-                                                let skimmer_cfg = strategy_config_clone.read().profit_skimmer.clone();
-                                                if skimmer_cfg.enabled && skimmer_cfg.btc_lock_pct > 0.0 {
-                                                    let profit_btc = pnl / fill_price;
-                                                    let lock_amount = profit_btc * (skimmer_cfg.btc_lock_pct / 100.0);
-                                                    let mut reserve = state_clone.locked_btc_reserve.write();
-                                                    *reserve += lock_amount;
-                                                    let mut lifetime = state_clone.lifetime_skimmed_btc.write();
-                                                    *lifetime += lock_amount;
-                                                    tracing::info!("🔒 [PROFIT SKIMMER] Locked {:.8} BTC into vault reserve (Active on exchange: {:.8} BTC | Lifetime accumulated: {:.8} BTC)", lock_amount, *reserve, *lifetime);
                                                 }
                                             }
 
@@ -1549,7 +1581,7 @@ async fn process_ws_message(
                                                 quantity: filled_qty,
                                                 pnl,
                                                 timestamp: chrono::Utc::now().to_rfc3339(),
-                                                order_type: "MARKET".to_string(),
+                                                order_type: "IOC".to_string(),
                                             });
 
                                             tracing::info!("Position closed asynchronously successfully. PnL: {:.6} USD (fill {:.2} vs signal {:.2})", pnl, fill_price, price);
@@ -1579,9 +1611,9 @@ async fn process_ws_message(
             
             // Order book data — array[1] is string "hb" (heartbeat) or array of book entries
             // Book entries: [PRICE, COUNT, AMOUNT] where AMOUNT > 0 = bid, AMOUNT < 0 = ask
-            if array.len() >= 2 {
+            if frame.channel == market_events::Channel::Book && array.len() >= 2 {
                 if let Some(book_data) = array[1].as_array() {
-                    let is_snapshot = book_data.first().map(|v| v.is_array()).unwrap_or(false);
+                    let is_snapshot = book_data.is_empty() || book_data.first().map(|v| v.is_array()).unwrap_or(false);
                     let is_single_update = !is_snapshot && book_data.len() >= 3
                         && book_data[0].as_f64().is_some()
                         && book_data[1].as_i64().is_some()
@@ -1610,7 +1642,7 @@ async fn process_ws_message(
 
                     if is_snapshot || is_single_update {
                         let (top_bids, top_asks) = order_book.top_levels(25);
-                        if !top_bids.is_empty() || !top_asks.is_empty() {
+                        {
                             let bid_pairs: Vec<(f64, f64)> = top_bids.iter().map(|b| (b.price, b.quantity)).collect();
                             let ask_pairs: Vec<(f64, f64)> = top_asks.iter().map(|a| (a.price, a.quantity)).collect();
                             l2_depth.process_book(&bid_pairs, &ask_pairs);
@@ -1699,30 +1731,12 @@ async fn process_ws_message(
             }
 
             // Trades data (array[1] is string "te" or "tu", array[2] is trade array)
-            if array.len() >= 3 {
+            if frame.channel == market_events::Channel::Trades && array.len() >= 3 {
                 if let Some(event) = array[1].as_str() {
                     if event == "te" || event == "tu" {
                         if let Some(trade) = array[2].as_array() {
                             if trade.len() >= 4 {
                                 let id = trade[0].as_i64().unwrap_or(0);
-                                
-                                // F04: Deduplicate te/tu by trade ID before processing
-                                // (replays/reconnects may deliver same ID twice)
-                                let trade_id = id as u64;
-                                let is_new_trade = {
-                                    let mut dedup = state.trade_dedup_ids.lock();
-                                    if dedup.contains(&trade_id) {
-                                        false
-                                    } else {
-                                        if dedup.len() >= 1000 { dedup.pop_front(); }
-                                        dedup.push_back(trade_id);
-                                        true
-                                    }
-                                };
-                                if !is_new_trade {
-                                    return;
-                                }
-                                
                                 let qty = trade[2].as_f64().unwrap_or(0.0);
                                 let price = trade[3].as_f64().unwrap_or(0.0);
                                 
@@ -1732,19 +1746,25 @@ async fn process_ws_message(
                                     price,
                                     quantity: qty.abs(),
                                     side,
-                                    timestamp: chrono::Utc::now(),
+                                    timestamp: chrono::DateTime::from_timestamp_millis(trade[1].as_i64().expect("validated timestamp")).expect("validated date"),
                                     trade_id: id as u64,
                                 };
                                 
                                 // [TICK RECORDER] perzistentní zápis každého ticku
-                                tick_recorder.lock().record(price, qty.abs(), qty > 0.0);
+                                tick_recorder.lock().record_exchange(id, trade[1].as_i64().expect("validated timestamp"), frame.received_ms, price, qty.abs(), qty > 0.0);
 
-                                ofi.process_tick(&tick, *last_price);
+                                ofi.process_tick(&tick, frame.previous_trade_price);
                                 
                                 let conf = strategy_config.read().clone();
                                 if conf.avellaneda_stoikov.enabled {
                                     as_model.gamma = conf.avellaneda_stoikov.risk_aversion_gamma;
-                                    as_model.kappa = conf.avellaneda_stoikov.order_book_liquidity_kappa;
+                                    let (bids, asks) = order_book.top_levels(25);
+                                    let bids: Vec<_> = bids.iter().map(|b| (b.price, b.quantity)).collect();
+                                    let asks: Vec<_> = asks.iter().map(|a| (a.price, a.quantity)).collect();
+                                    as_model.kappa = if frame.entry_ready {
+                                        l2_depth.estimate_dynamic_kappa(&bids, &asks, conf.avellaneda_stoikov.order_book_liquidity_kappa)
+                                    } else { conf.avellaneda_stoikov.order_book_liquidity_kappa };
+                                    *state.dynamic_kappa.write() = as_model.kappa;
                                     as_model.dt = conf.avellaneda_stoikov.time_horizon_dt;
                                 }
 
@@ -1773,10 +1793,6 @@ async fn process_ws_message(
                                     conf.strategy.trade_cooldown_ms
                                 };
 
-                                // Cooldown check
-                                if last_trade_time.elapsed().as_millis() < dynamic_cooldown_ms as u128 {
-                                    return; // Cooldown active
-                                }
                                 
                                 let total_btc = *state.btc_balance.read();
                                 let locked_btc = quarantined_btc().max(if conf.profit_skimmer.exclude_from_trading_margin {
@@ -1784,7 +1800,6 @@ async fn process_ws_message(
                                 } else {
                                     0.0
                                 });
-                                let current_btc = pirana_core::reconciliation::BalanceReconciliation::calculate_tradable_margin(total_btc, locked_btc);
                                 // Cilovy inventar jako PODIL equity, ne pevna konstanta.
                                 // Pevnych 0,01 BTC bylo pri cene 78k = 196 % kapitalu, takze
                                 // q zustavalo trvale zaporne a bot nakupoval, dokud 24. 8.
@@ -1810,7 +1825,7 @@ async fn process_ws_message(
                                 *state.reservation_price.write() = as_quote.reservation_price;
                                 *state.as_spread_skew.write() = as_quote.spread_skew;
 
-                                let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                                let now_ms = tick.timestamp.timestamp_millis() as u64;
                                 flow_calculator.process_trade(side, qty.abs(), price, now_ms);
                                 lead_lag_engine.write().update_bitfinex(price, now_ms);
                                 let lead_lag_sig = lead_lag_engine.read().evaluate(now_ms);
@@ -1846,6 +1861,11 @@ async fn process_ws_message(
 
                                 *state.vpin_score.write() = vpin_score;
                                 *state.vpin_status.write() = vpin.status();
+
+                                // Every admitted economic trade updates all models before order gating.
+                                if !execution_available || last_trade_time.elapsed().as_millis() < dynamic_cooldown_ms as u128 {
+                                    return;
+                                }
 
                                 // VPIN Adverse Selection & Emergency Flash Crash Guard
                                 if is_vpin_emergency {
@@ -2044,8 +2064,21 @@ async fn process_ws_message(
                                 } else {
                                     (conf.strategy.take_profit_distance_usd, conf.strategy.stop_loss_distance_usd)
                                 };
+                                // Only a real candidate starts economic activity; heartbeat/book/model updates do not.
+                                if !is_buying && !is_selling { return; }
+                                let Some(mut execution_activity) = EXECUTION_ACTIVITY.try_begin_idle() else { return; };
+                                if !POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire) { return; }
+                                let total_btc = *state.btc_balance.read();
+                                let current_btc = pirana_core::reconciliation::BalanceReconciliation::calculate_tradable_margin(total_btc, locked_btc);
+                                let equity = total_btc * price + *state.usd_balance.read();
+                                if !EQUITY_GUARD_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) { return; }
+                                if let Err(e) = risk_engine.mark_equity(equity, chrono::Utc::now().timestamp_millis()) {
+                                    tracing::error!("Trade blocked by equity mark: {}", e);
+                                    return;
+                                }
+                                *state.daily_drawdown_pct.write() = risk_engine.equity_drawdowns().0;
                                 // Initialize DynamicSizer
-                                let current_usd = *state.usd_balance.read();
+                                let current_usd = (*state.usd_balance.read() - if conf.profit_skimmer.exclude_from_trading_margin { active_positions.pending_skim_usd() } else { 0.0 }).max(0.0);
                                 let total_portfolio_usd = current_btc * price + current_usd;
                                 let dynamic_sizer = pirana_features::dynamic_sizing::DynamicSizer::new(
                                     conf.risk_management.min_position_size_pct,
@@ -2268,7 +2301,7 @@ async fn process_ws_message(
 
                                     if is_halted {
                                         // Paper trading in Halted mode!
-                                        let current_usd = *state.usd_balance.read();
+                                        let current_usd = (*state.usd_balance.read() - if conf.profit_skimmer.exclude_from_trading_margin { active_positions.pending_skim_usd() } else { 0.0 }).max(0.0);
                                         let total_portfolio_usd = current_btc * price + current_usd;
                                         // Use standard position sizing (e.g., 5.0% or strategy config)
                                         let paper_position_size_pct = conf.risk_management.position_size_pct / 100.0;
@@ -2336,7 +2369,7 @@ async fn process_ws_message(
                                     } else {
                                         match risk_engine.evaluate_trade(&sig, price) {
                                              Ok(assessment) if assessment.approved => {
-                                                 let current_usd = *state.usd_balance.read();
+                                                 let current_usd = (*state.usd_balance.read() - if conf.profit_skimmer.exclude_from_trading_margin { active_positions.pending_skim_usd() } else { 0.0 }).max(0.0);
                                                  let total_portfolio_usd = current_btc * price + current_usd;
 
                                                  // [CASLAV v5.1 / SLIPPAGE P1] IOC limit price calculation:
@@ -2406,7 +2439,7 @@ async fn process_ws_message(
                                                  // = alpha pryč = skip. Měřením 25.8.: 3 obchody
                                                  // s 12–17 bps žraly ~40 % edge dne.
                                                  let expected_buy_vwap = order_book.vwap(Side::Buy, final_trade_size);
-                                                 match slippage_guard.check(Side::Buy, price, expected_buy_vwap.as_ref()) {
+                                                 match slippage_guard.check(Side::Buy, price, expected_buy_vwap) {
                                                      pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
                                                          if log_throttler.should_log("slippage_guard_buy") {
                                                              tracing::warn!(
@@ -2424,6 +2457,7 @@ async fn process_ws_message(
                                                       let sl_log = if conf.strategy.stop_loss_enabled { format!("SL: -{:.1}", sl_dist) } else { "SL: OFF".to_string() };
                                                       tracing::info!("Pullback Flow -> Submitting BUY order asynchronously for {:.6} BTC (TP: +{:.1}, {})", final_trade_size, tp_dist, sl_log);
                                                      
+                                                     execution_activity.activate();
                                                      // [POINT 3 — RESERVE BEFORE ASYNC]
                                                      entry_gate.lock().reserve_live_buy(std::time::Instant::now());
 
@@ -2463,8 +2497,7 @@ async fn process_ws_message(
                                                          return;
                                                      }
 
-                                                     // Cover optimistic balances as well as exchange execution.
-                                                     let execution_activity = EXECUTION_ACTIVITY.begin();
+                                                     // Activity also covers optimistic balances.
                                                      // Update balances locally BEFORE async to prevent stale reads
                                                      *state.btc_balance.write() += final_trade_size;
                                                      *state.usd_balance.write() -= required_usd;
@@ -2487,7 +2520,7 @@ async fn process_ws_message(
                                                          quantity: final_trade_size,
                                                          pnl: 0.0,
                                                          timestamp: chrono::Utc::now().to_rfc3339(),
-                                                         order_type: "MARKET".to_string(),
+                                                         order_type: "IOC".to_string(),
                                                      });
 
                                                      let client_clone = client.clone();
@@ -2574,6 +2607,7 @@ async fn process_ws_message(
                                                                 }
 
                                                                 let inventory_qty = filled_qty + base_fee;
+                                                                let net_entry_cost = filled_qty * fill_price / inventory_qty;
                                                                 let actual_exposure = exp_size * inventory_qty / final_trade_size;
                                                                 risk_engine_clone.update_exposure(actual_exposure - exp_size);
                                                                 // Register confirmed live position
@@ -2583,11 +2617,11 @@ async fn process_ws_message(
                                                                     position_id: tracked_position_id,
                                                                     exchange_order_id: ack.exchange_order_id,
                                                                     entry_mts,
-                                                                    entry_price: fill_price,
+                                                                    entry_price: net_entry_cost,
                                                                     quantity: inventory_qty,
                                                                     side: Side::Buy,
-                                                                    tp_price: fill_price + tp_dist,
-                                                                    sl_price: fill_price - sl_dist,
+                                                                    tp_price: net_entry_cost + tp_dist,
+                                                                    sl_price: net_entry_cost - sl_dist,
                                                                     exposure_size: actual_exposure,
                                                                     is_paper: false,
                                                                     highest_price_seen: fill_price,
@@ -2837,7 +2871,7 @@ async fn process_ws_message(
                                         match risk_engine.evaluate_trade(&sig, price) {
                                             Ok(assessment) if assessment.approved => {
                                                 // Calculate dynamic size
-                                                let current_usd = *state.usd_balance.read();
+                                                let current_usd = (*state.usd_balance.read() - if conf.profit_skimmer.exclude_from_trading_margin { active_positions.pending_skim_usd() } else { 0.0 }).max(0.0);
                                                 let total_portfolio_usd = current_btc * price + current_usd;
                                                 let dynamic_trade_size = (assessment.adjusted_position_size * total_portfolio_usd) / price;
                                                 let mut final_trade_size = dynamic_trade_size.clamp(MIN_ORDER_SIZE_BTC, 1.0);
@@ -2913,33 +2947,32 @@ async fn process_ws_message(
                                                             }
                                                         }
 
-                                                        // F02: Shared exit planner enforces IOC + no-loss invariant
-                                                        let exit_plan = exit_planner::plan_exit_order(
-                                                            candidate_pos.entry_price,
-                                                            final_trade_size,
-                                                            price,
+                                                        // 2. Slippage Guard check BEFORE removing the position from active_positions
+                                                        let slippage_guard_sell = pirana_core::slippage::SlippageGuard::new(
                                                             conf.risk_management.max_slippage_bps as f64,
-                                                            order_book,
-                                                            0.01,
                                                         );
-                                                        let limit = match exit_plan {
-                                                            exit_planner::ExitPlan::ExecuteIOC { limit_price, .. } => limit_price,
-                                                            exit_planner::ExitPlan::Reject { reason } => {
-                                                                if log_throttler.should_log("exit_planner_reject") {
+                                                        let expected_sell_vwap = order_book.vwap(Side::Sell, final_trade_size);
+                                                        let limit = match slippage_guard_sell.check(Side::Sell, price, expected_sell_vwap) {
+                                                            pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
+                                                                if log_throttler.should_log("slippage_guard_sell") {
                                                                     tracing::warn!(
-                                                                        "🛡️ [EXIT PLANNER REJECTED] SELL exit rejected: {} (entry={:.2}, signal={:.2}). Leaving to TP/SL.",
-                                                                        reason, candidate_pos.entry_price, price
+                                                                        "🛡️ [SLIPPAGE GUARD] SELL skip: očekávaný fill {:.0} = +{:.1} bps > práh {} bps (signál {:.0}). Alpha pryč.",
+                                                                        expected_fill_price, slippage_bps, conf.risk_management.max_slippage_bps, price
                                                                     );
                                                                 }
                                                                 state.add_signal(signal_view);
                                                                 return;
                                                             }
+                                                            pirana_core::slippage::SlippageDecision::Execute { .. } => {
+                                                                slippage_guard_sell.ioc_limit_price(Side::Sell, price)
+                                                            }
                                                         };
 
-                                                        // 2. Remove candidate position from active_positions
+                                                        // 3. Now remove candidate position from active_positions
                                                         let removed_pos = {
                                                             let mut positions = active_positions.write();
                                                             if let Some(idx) = positions.iter().position(|p| p.position_id == candidate_pos.position_id) {
+                                                                execution_activity.activate();
                                                                 positions.remove(idx)
                                                             } else {
                                                                 tracing::warn!("Candidate position {} no longer in active_positions", candidate_pos.position_id);
@@ -3009,7 +3042,6 @@ async fn process_ws_message(
                                                 let pos_to_restore = closed_pos.clone();
                                                 let entry_price_closed = closed_pos.entry_price;
 
-                                                let execution_activity = EXECUTION_ACTIVITY.begin();
                                                 tokio::spawn(async move {
                                 let _execution_activity = execution_activity;
                                                     // Bitfinex sells require negative quantity
@@ -3018,7 +3050,8 @@ async fn process_ws_message(
                                                     // price improvement se zachytí, neplněná část se ruší.
                                                     let exit_cid = next_entry_cid();
                                     let exit_mts = chrono::Utc::now().timestamp_millis();
-                                                    let exit_result = match active_positions_clone.stage_exit_quantity(exit_cid.to_string(), pos_to_restore.clone(), final_trade_size) {
+                                                    let skim = strategy_config_sell.read().profit_skimmer.clone();
+                                                    let exit_result = match active_positions_clone.stage_exit_quantity_with_skim(exit_cid.to_string(), pos_to_restore.clone(), final_trade_size, if skim.enabled { skim.btc_lock_pct } else { 0.0 }) {
                                                         Ok(()) if operational_recovery::sale_allowed(*state_clone.btc_balance.read(), quarantined_btc(), final_trade_size) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", Side::Sell, pirana_core::types::OrderType::IOC, -final_trade_size, sell_ioc_limit, exit_cid)).await,
                                                         Ok(()) => Err(pirana_core::errors::PiranaError::Config("sale would consume quarantined BTC".into())),
                                                         Err(e) => Err(pirana_core::errors::PiranaError::Config(e)),
@@ -3061,7 +3094,14 @@ async fn process_ws_message(
                                                             }
 
                                                             // Realized PnL from the REAL fill price (includes slippage)
-                                                            let realized_pnl = (fill_price - entry_price_closed) * filled_qty;
+                                                            let realized_pnl = fill_price * filled_qty - entry_price_closed * (filled_qty - base_fee);
+                                                            if let Err(e) = active_positions_clone.complete_exit_with_profit(&exit_cid.to_string(), filled_qty - base_fee, realized_pnl) {
+                                                                execution_recovery::pause(&state_clone, &e);
+                                                                return;
+                                                            }
+                                                            let remaining = (pos_to_restore.quantity - (filled_qty - base_fee)).max(0.0);
+                                                            risk_engine_clone.update_exposure(pos_to_restore.exposure_size * remaining / pos_to_restore.quantity);
+                                                            *state_clone.pending_skim_usd.write() = active_positions_clone.pending_skim_usd();
 
                                                             // Markout recorded once, at the real fill
                                                             markout_clone.lock().record_trade(
@@ -3133,19 +3173,6 @@ async fn process_ws_message(
                                                             }
                                                             } // if !pos_to_restore.is_rebalance
 
-                                                            // Asymmetric BTC Profit Skimmer: lock profit portion in BTC reserve
-                                                            if realized_pnl > 0.0 && fill_price > 0.0 {
-                                                                let skimmer_cfg = strategy_config_sell.read().profit_skimmer.clone();
-                                                                if skimmer_cfg.enabled && skimmer_cfg.btc_lock_pct > 0.0 {
-                                                                    let lock_amount = (realized_pnl / fill_price) * (skimmer_cfg.btc_lock_pct / 100.0);
-                                                                    let mut reserve = state_clone.locked_btc_reserve.write();
-                                                                    *reserve += lock_amount;
-                                                                    let mut lifetime = state_clone.lifetime_skimmed_btc.write();
-                                                                    *lifetime += lock_amount;
-                                                                    tracing::info!("🔒 [PROFIT SKIMMER] Locked {:.8} BTC into vault reserve (Active: {:.8} BTC | Lifetime: {:.8} BTC)", lock_amount, *reserve, *lifetime);
-                                                                }
-                                                            }
-
                                                             // Daily PnL
                                                             {
                                                                 let mut daily_pnl = state_clone.daily_pnl.write();
@@ -3196,17 +3223,9 @@ async fn process_ws_message(
                                                                 quantity: filled_qty,
                                                                 pnl: realized_pnl,
                                                                 timestamp: chrono::Utc::now().to_rfc3339(),
-                                                                order_type: "MARKET".to_string(),
+                                                                order_type: "IOC".to_string(),
                                                             });
 
-                                                            if !pos_to_restore.is_rebalance && filled_qty - base_fee < pos_to_restore.quantity {
-                                                                let mut residual = pos_to_restore.clone();
-                                                                residual.quantity -= filled_qty - base_fee;
-                                                                residual.exposure_size *= residual.quantity / pos_to_restore.quantity;
-                                                                risk_engine_clone.update_exposure(residual.exposure_size);
-                                                                active_positions_clone.write().push(residual);
-                                                            }
-                                                            if let Err(e) = active_positions_clone.mark_exit_settled(&exit_cid.to_string()) { execution_recovery::pause(&state_clone, &e); return; }
                                                             tracing::info!("Asynchronous SELL order executed successfully! PnL: {:.6} USD (fill {:.2} vs signal {:.2})", realized_pnl, fill_price, price);
                                                         }
                                                         Err(e) => {

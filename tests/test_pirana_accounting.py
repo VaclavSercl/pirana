@@ -1,3 +1,4 @@
+from contextlib import ExitStack, closing
 import datetime as dt
 import importlib.util
 import json
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT=Path(__file__).resolve().parents[1]/'scripts/pirana_accounting.py'
 spec=importlib.util.spec_from_file_location('accounting',SCRIPT)
@@ -292,6 +294,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(len(report['orders']),3)
         self.assertEqual(report['orders'][1]['exec_amount'],'1')
         self.assertEqual(report['orders'][1]['base_fee'],'-0.01')
+        self.assertEqual(report['orders'][1]['quote_fee'],'0')
         self.assertEqual(report['orders'][2]['cid'],'33')
         self.assertEqual(report['orders'][2]['exec_amount'],'-0.99')
         self.assertEqual(sum(a.Decimal(l['remaining_btc']) for l in report['open_lots']),a.Decimal('1'))
@@ -303,6 +306,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(r['lifetime']['net_pnl_usd'],'444.5')
         self.assertEqual(r['lifetime']['fees_usd'],'5.5')
         self.assertEqual(r['open_lots'][0]['cost_basis_usd'],'100.5')
+        self.assertEqual([o['quote_fee'] for o in r['orders']], ['-2', '-1', '-3'])
         self.con.close(); self.con=a.connect(self.path)
         self.assertEqual(self.report(),r)
     def test_base_fee_and_rebate(self):
@@ -357,6 +361,35 @@ class LedgerTests(unittest.TestCase):
         r=self.report()
         self.assertEqual(r['fill_count'],0)
         self.assertEqual(r['legacy'],dict(record_count=4,unverified_count=2,shadow_count=1,duplicate_count=1))
+    def test_backup_flush_failure_removes_only_owned_target(self):
+        target=Path(self.tmp.name)/'failed-backup.sqlite3'
+        with mock.patch.object(a.os,'fsync',side_effect=OSError('flush failed')):
+            with self.assertRaisesRegex(OSError,'flush failed'):
+                a.backup(self.con,target)
+        self.assertFalse(target.exists())
+        # Failure leaves the live source usable and the path retryable.
+        self.ingest([fill(1,'1','100')])
+        a.backup(self.con,target)
+        original=target.read_bytes()
+        with self.assertRaises(FileExistsError):
+            a.backup(self.con,target)
+        self.assertEqual(target.read_bytes(),original)
+
+    def test_backup_file_flush_uses_writable_handle(self):
+        target=Path(self.tmp.name)/'writable-backup.sqlite3'
+        real_fsync=os.fsync
+        seen=[]
+        def flush(fd):
+            import stat
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                # A zero-length write checks access without changing content.
+                os.write(fd,b'')
+                seen.append(fd)
+            return real_fsync(fd)
+        with mock.patch.object(a.os,'fsync',side_effect=flush):
+            a.backup(self.con,target)
+        self.assertEqual(len(seen),1)
+
     def test_backup_recovery_and_corruption(self):
         self.ingest([fill(1,'1','100')])
         target=Path(self.tmp.name)/'backup.sqlite3'
@@ -533,28 +566,28 @@ time.sleep(60)
 
     def test_schema1_migration_preserves_payload_state_legacy_and_scan(self):
         for has_scan in (False,True):
-            with self.subTest(scan=has_scan):
+            with self.subTest(scan=has_scan), ExitStack() as stack:
                 path=Path(self.tmp.name)/('old-'+str(has_scan)+'.sqlite3')
                 payload=self.old_database(path,has_scan)
-                reader=a.connect(path)
+                reader=stack.enter_context(closing(a.connect(path)))
                 before=a.snapshot(reader,NOW)
                 saved_legacy=reader.execute('SELECT * FROM legacy').fetchall()
                 self.assertEqual(reader.execute('PRAGMA user_version').fetchone()[0],1)
                 backup=path.with_suffix('.backup')
                 a.backup(reader,backup)
                 reader.close()
-                writer=a.connect(path,True)
+                writer=stack.enter_context(closing(a.connect(path,True)))
                 self.assertEqual(writer.execute('PRAGMA user_version').fetchone()[0],2)
                 self.assertEqual(writer.execute('SELECT * FROM fills').fetchall(),[(1,101,payload)])
                 self.assertEqual(writer.execute('SELECT * FROM legacy').fetchall(),saved_legacy)
                 self.assertEqual(a.snapshot(writer,NOW),before)
                 self.assertEqual([r[5] for r in writer.execute('PRAGMA table_info(fills)')],[1,2,0])
                 writer.close()
-                reader=a.connect(backup)
+                reader=stack.enter_context(closing(a.connect(backup)))
                 self.assertEqual(reader.execute('PRAGMA user_version').fetchone()[0],1)
                 self.assertEqual(a.snapshot(reader,NOW),before)
                 reader.close()
-                writer=a.connect(path,True)
+                writer=stack.enter_context(closing(a.connect(path,True)))
                 self.assertEqual(a.snapshot(writer,NOW),before)
                 writer.close()
 

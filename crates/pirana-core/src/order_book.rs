@@ -1,6 +1,16 @@
-use crate::slippage::VwapResult;
 use crate::types::{PriceLevel, Side, Symbol};
 use std::collections::BTreeMap;
+
+/// Quote of only the visible liquidity, optionally bounded by an execution limit.
+/// A partial VWAP must never be interpreted as a price for the whole order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthQuote {
+    pub requested_quantity: f64,
+    pub covered_quantity: f64,
+    pub uncovered_quantity: f64,
+    pub vwap: Option<f64>,
+    pub fully_covered: bool,
+}
 
 /// Lock-free order book implementation optimized for HFT operations.
 /// Uses BTreeMap for O(log n) price level lookups.
@@ -40,6 +50,11 @@ impl OrderBook {
 
     /// Update a price level in the book
     pub fn update_level(&mut self, side: Side, price: f64, quantity: f64, order_count: u32) {
+        if !price.is_finite() || price <= 0.0 || !quantity.is_finite()
+            || !self.tick_size.is_finite() || self.tick_size <= 0.0
+        {
+            return;
+        }
         let key = self.price_to_key(price);
         let level = PriceLevel {
             price,
@@ -99,39 +114,64 @@ impl OrderBook {
     /// [CASLAV v5.1 / OPONENTURA FIX] Původní implementace měla strany
     /// prohozené (BUY bral bids) — slippage guard tím byl zcela nefunkční:
     /// vždy vyhlásil price improvement a nikdy neskipnul.
-    ///
-    /// [F09] Nyní vrací `Option<VwapResult>` s metadaty o hloubce knihy.
-    pub fn vwap(&self, taker_side: Side, quantity: f64) -> Option<VwapResult> {
-        let levels: Vec<PriceLevel> = match taker_side {
-            // Taker BUY platí asky: seřazené vzestupně (nejlevní první).
-            Side::Buy => self.asks.values().copied().collect(),
-            // Taker SELL dostává od bidů: sestupně (nejvyšší první).
-            Side::Sell => self.bids.values().rev().copied().collect(),
-        };
+    pub fn vwap(&self, taker_side: Side, quantity: f64) -> Option<f64> {
+        let quote = self.depth_quote(taker_side, quantity, None)?;
+        if quote.fully_covered { quote.vwap } else { None }
+    }
 
+    /// BUY consumes asks at or below `limit_price`; SELL consumes bids at or
+    /// above it. Invalid inputs or arithmetic return None; empty/partial depth
+    /// returns an explicit uncovered quantity, never invented liquidity.
+    pub fn depth_quote(
+        &self,
+        taker_side: Side,
+        quantity: f64,
+        limit_price: Option<f64>,
+    ) -> Option<DepthQuote> {
+        if !quantity.is_finite() || quantity <= 0.0
+            || !self.tick_size.is_finite() || self.tick_size <= 0.0
+            || limit_price.is_some_and(|p| !p.is_finite() || p <= 0.0)
+        {
+            return None;
+        }
+        let levels: Box<dyn Iterator<Item = &PriceLevel> + '_> = match taker_side {
+            Side::Buy => Box::new(self.asks.values()),
+            Side::Sell => Box::new(self.bids.values().rev()),
+        };
         let mut remaining = quantity;
         let mut total_cost = 0.0;
-        let mut total_qty = 0.0;
-
-        for level in &levels {
-            let fill_qty = remaining.min(level.quantity);
-            total_cost += fill_qty * level.price;
-            total_qty += fill_qty;
-            remaining -= fill_qty;
-            if remaining <= 0.0 {
+        for level in levels {
+            if !level.price.is_finite() || level.price <= 0.0
+                || !level.quantity.is_finite() || level.quantity <= 0.0
+            {
+                return None;
+            }
+            if limit_price.is_some_and(|limit| match taker_side {
+                Side::Buy => level.price > limit,
+                Side::Sell => level.price < limit,
+            }) {
                 break;
             }
+            let fill_qty = remaining.min(level.quantity);
+            total_cost += fill_qty * level.price;
+            if !total_cost.is_finite() {
+                return None;
+            }
+            remaining -= fill_qty;
+            if remaining == 0.0 { break; }
         }
-
-        if total_qty > 0.0 {
-            Some(VwapResult::new(
-                total_cost / total_qty,
-                total_qty,
-                quantity,
-            ))
-        } else {
-            None
+        let covered = quantity - remaining;
+        let vwap = if covered > 0.0 { Some(total_cost / covered) } else { None };
+        if vwap.is_some_and(|price| !price.is_finite() || price <= 0.0) {
+            return None;
         }
+        Some(DepthQuote {
+            requested_quantity: quantity,
+            covered_quantity: covered,
+            uncovered_quantity: remaining,
+            vwap,
+            fully_covered: remaining == 0.0,
+        })
     }
 
     /// Get total bid volume
@@ -236,19 +276,11 @@ mod tests {
 
         // Taker BUY 1 BTC konzumuje asky → VWAP musí být 60010 (ask), ne 60000 (bid).
         let buy_vwap = book.vwap(Side::Buy, 1.0).unwrap();
-        assert!(
-            (buy_vwap.price - 60_010.0).abs() < 1e-9,
-            "taker BUY VWAP = {}, očekávám ask",
-            buy_vwap.price
-        );
+        assert!((buy_vwap - 60_010.0).abs() < 1e-9, "taker BUY VWAP = {buy_vwap}, očekávám ask");
 
         // Taker SELL 1 BTC konzumuje bidy → VWAP musí být 60000 (bid), ne 60010 (ask).
         let sell_vwap = book.vwap(Side::Sell, 1.0).unwrap();
-        assert!(
-            (sell_vwap.price - 60_000.0).abs() < 1e-9,
-            "taker SELL VWAP = {}, očekávám bid",
-            sell_vwap.price
-        );
+        assert!((sell_vwap - 60_000.0).abs() < 1e-9, "taker SELL VWAP = {sell_vwap}, očekávám bid");
     }
 
     /// VWAP musí správně procházet hloubku: taker BUY 3 BTC při asku
@@ -262,12 +294,7 @@ mod tests {
 
         let vwap = book.vwap(Side::Buy, 3.0).unwrap();
         let expected = (1.0 * 60_010.0 + 2.0 * 60_020.0) / 3.0;
-        assert!(
-            (vwap.price - expected).abs() < 1e-9,
-            "vwap = {}, očekávám {}",
-            vwap.price,
-            expected
-        );
+        assert!((vwap - expected).abs() < 1e-9, "vwap = {vwap}, očekávám {expected}");
     }
 
     #[test]
@@ -279,4 +306,46 @@ mod tests {
         book.update_level(Side::Buy, 60000.0, 1.0, 0);
         assert!(book.best_bid().is_none());
     }
+    #[test]
+    fn depth_reports_partial_empty_and_limit_coverage() {
+        let mut book = OrderBook::new(Symbol::new("tBTCUSD"), 0.01);
+        let empty = book.depth_quote(Side::Buy, 3.0, None).unwrap();
+        assert_eq!(empty.uncovered_quantity, 3.0);
+        assert_eq!(empty.vwap, None);
+        assert!(!empty.fully_covered);
+        book.update_level(Side::Sell, 100.0, 1.0, 1);
+        book.update_level(Side::Sell, 110.0, 1.0, 1);
+        book.update_level(Side::Buy, 99.0, 1.0, 1);
+        book.update_level(Side::Buy, 90.0, 1.0, 1);
+        for side in [Side::Buy, Side::Sell] {
+            let quote = book.depth_quote(side, 3.0, None).unwrap();
+            assert_eq!(quote.covered_quantity, 2.0);
+            assert_eq!(quote.uncovered_quantity, 1.0);
+            assert!(!quote.fully_covered);
+            assert!(book.vwap(side, 3.0).is_none());
+            assert!(book.depth_quote(side, 2.0, None).unwrap().fully_covered);
+        }
+        let buy = book.depth_quote(Side::Buy, 2.0, Some(100.0)).unwrap();
+        assert_eq!(buy.covered_quantity, 1.0);
+        assert_eq!(buy.vwap, Some(100.0));
+        let sell = book.depth_quote(Side::Sell, 2.0, Some(99.0)).unwrap();
+        assert_eq!(sell.covered_quantity, 1.0);
+        assert_eq!(sell.vwap, Some(99.0));
+        assert_eq!(book.depth_quote(Side::Buy, 1.0, Some(99.0)).unwrap().vwap, None);
+    }
+
+    #[test]
+    fn depth_rejects_invalid_inputs_and_overflow() {
+        let mut book = OrderBook::new(Symbol::new("tBTCUSD"), 0.01);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(book.depth_quote(Side::Buy, bad, None).is_none());
+            assert!(book.depth_quote(Side::Buy, 1.0, Some(bad)).is_none());
+            book.update_level(Side::Sell, bad, 1.0, 1);
+        }
+        book.update_level(Side::Sell, 100.0, f64::NAN, 1);
+        assert!(book.best_ask().is_none());
+        book.update_level(Side::Sell, f64::MAX, 2.0, 1);
+        assert!(book.depth_quote(Side::Buy, 2.0, None).is_none());
+    }
+
 }

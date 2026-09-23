@@ -76,6 +76,8 @@ pub struct DashboardState {
     pub locked_btc_reserve: Arc<parking_lot::RwLock<f64>>,
     /// Monotonically increasing lifetime skimmed BTC counter (for institutional audits)
     pub lifetime_skimmed_btc: Arc<parking_lot::RwLock<f64>>,
+    /// Durable USD earmark; not BTC acquired or accumulated.
+    pub pending_skim_usd: Arc<parking_lot::RwLock<f64>>,
     /// Binance BTC/USDT price
     pub binance_btc_price: Arc<parking_lot::RwLock<f64>>,
     /// Coinbase BTC-USD price
@@ -278,6 +280,8 @@ pub struct DashboardSnapshot {
     pub starting_equity: f64,
     pub locked_btc_reserve: f64,
     pub lifetime_skimmed_btc: f64,
+    pub pending_skim_usd: f64,
+    pub market_data_available: bool,
     pub binance_btc_price: f64,
     pub coinbase_btc_price: f64,
     pub lead_lag_disparity_usd: f64,
@@ -351,6 +355,7 @@ impl DashboardState {
             starting_equity: Arc::new(parking_lot::RwLock::new(0.0)),
             locked_btc_reserve: Arc::new(parking_lot::RwLock::new(0.0)),
             lifetime_skimmed_btc: Arc::new(parking_lot::RwLock::new(0.0)),
+            pending_skim_usd: Arc::new(parking_lot::RwLock::new(0.0)),
             binance_btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
             coinbase_btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
             lead_lag_disparity_usd: Arc::new(parking_lot::RwLock::new(0.0)),
@@ -413,6 +418,8 @@ impl DashboardState {
             starting_equity: *self.starting_equity.read(),
             locked_btc_reserve: *self.locked_btc_reserve.read(),
             lifetime_skimmed_btc: *self.lifetime_skimmed_btc.read(),
+            pending_skim_usd: *self.pending_skim_usd.read(),
+            market_data_available: *self.market_data_available.read(),
             binance_btc_price: *self.binance_btc_price.read(),
             coinbase_btc_price: *self.coinbase_btc_price.read(),
             lead_lag_disparity_usd: *self.lead_lag_disparity_usd.read(),

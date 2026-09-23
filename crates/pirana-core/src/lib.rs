@@ -6,4 +6,4 @@ pub mod ws_registry;
 pub mod reconciliation;
 pub mod slippage;
 
-pub use slippage::VwapResult;
+pub use order_book::DepthQuote;

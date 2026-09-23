@@ -76,8 +76,8 @@ pub fn plan_exit_order(
 
     // 5. Compute worst-case executable price (book VWAP vs limit)
     let worst_case_price = match order_book.vwap(Side::Sell, quantity) {
-        Some(ref vwap) if vwap.price.is_finite() && vwap.price > 0.0 => vwap.price.min(formatted_limit),
-        _ => formatted_limit,
+        Some(vwap) if vwap.is_finite() && vwap > 0.0 => vwap.min(formatted_limit),
+        _ => return ExitPlan::Reject { reason: "insufficient full-order depth" },
     };
 
     // 6. Enforce cent-aware floor: limit must guarantee at least entry + 0.01
@@ -160,4 +160,11 @@ mod tests {
         let plan = plan_exit_order(80_000.0, 0.001, 80_100.0, 5.0, &book, 0.01);
         assert!(matches!(plan, ExitPlan::Reject { reason: "no bid liquidity" }));
     }
+    #[test]
+    fn test_exit_plan_rejects_partial_depth() {
+        let book = build_book(&[(80_090.0, 0.0005)], &[(80_110.0, 0.01)]);
+        let plan = plan_exit_order(80_000.0, 0.001, 80_100.0, 5.0, &book, 0.01);
+        assert!(matches!(plan, ExitPlan::Reject { reason: "insufficient full-order depth" }));
+    }
+
 }

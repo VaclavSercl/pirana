@@ -353,19 +353,21 @@ def _projection(con, now, fills, period):
     for f in fills:
         qty, price, fee = (decimal(f[k]) for k in ('exec_amount','exec_price','fee'))
         oid = f['order_id']
-        order = orders.setdefault(oid, dict(order_id=oid,cid=f.get('cid'),exec_amount=Decimal(0),base_fee=Decimal(0),cost=Decimal(0),volume=Decimal(0),mts=f['mts']))
+        order = orders.setdefault(oid, dict(order_id=oid,cid=f.get('cid'),exec_amount=Decimal(0),base_fee=Decimal(0),quote_fee=Decimal(0),cost=Decimal(0),volume=Decimal(0),mts=f['mts']))
         if order['cid'] != f.get('cid') or order['exec_amount'] * qty < 0:
             issues.append('ambiguous_order:'+str(oid))
             if oid in period_orders:
                 period_issues.append('ambiguous_order:'+str(oid))
         order['exec_amount'] += qty
         order['base_fee'] += fee if f['fee_currency']=='BTC' else Decimal(0)
+        order['quote_fee'] += fee if f['fee_currency']=='USD' else Decimal(0)
         order['cost'] += abs(qty)*price
         order['volume'] += abs(qty)
     order_views=[]
     for order in orders.values():
         order_views.append(dict(order_id=order['order_id'],cid=order['cid'],mts=order['mts'],
             exec_amount=number(order['exec_amount']),base_fee=number(order['base_fee']),
+            quote_fee=number(order['quote_fee']),
             entry_price=number(order['cost']/order['volume'])))
     lots=[]
     today=now.astimezone(ZoneInfo('Europe/Prague')).date()
@@ -503,11 +505,15 @@ def backup(con,path):
             raise ValueError('backup integrity failure')
         destination.close()
         destination=None
-        with target.open('rb') as handle:
+        # Windows FlushFileBuffers requires a writable handle.
+        with target.open('r+b') as handle:
             os.fsync(handle.fileno())
-        fd=os.open(target.parent,os.O_RDONLY)
-        try: os.fsync(fd)
-        finally: os.close(fd)
+        # POSIX directory fsync persists the new directory entry. Windows does
+        # not support os.open/fsync on directories; the file itself is flushed.
+        if os.name != 'nt':
+            fd=os.open(target.parent,os.O_RDONLY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
     except BaseException:
         if destination: destination.close()
         target.unlink(missing_ok=True)

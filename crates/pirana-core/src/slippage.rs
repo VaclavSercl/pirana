@@ -26,33 +26,6 @@ use std::collections::VecDeque;
 /// BPS přepočet: 1 bps = 0,01 %.
 pub const BPS: f64 = 1.0 / 10_000.0;
 
-/// VWAP výsledek s metadaty o hloubce knihy (F09).
-#[derive(Debug, Clone)]
-pub struct VwapResult {
-    /// VWAP cena pro taker stranu.
-    pub price: f64,
-    /// Kolik quantity bylo reálně naplněno z knihy.
-    pub filled_quantity: f64,
-    /// Kolik quantity bylo požadováno na VWAP výpočet.
-    pub requested_quantity: f64,
-}
-
-impl VwapResult {
-    /// Vytvoří nový VwapResult.
-    pub fn new(price: f64, filled_quantity: f64, requested_quantity: f64) -> Self {
-        Self {
-            price,
-            filled_quantity,
-            requested_quantity,
-        }
-    }
-
-    /// Vrací true, pokud byla naplněna plná požadovaná quantity.
-    pub fn is_fully_filled(&self) -> bool {
-        self.filled_quantity >= self.requested_quantity
-    }
-}
-
 /// Výsledek pre-trade kontroly slippage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlippageDecision {
@@ -61,19 +34,15 @@ pub enum SlippageDecision {
     Execute { expected_fill_price: f64 },
     /// Přeskočit — alpha už je pryč (slippage > práh).
     /// Nese změřený slippage v bps pro telemetrii.
-    Skip {
-        slippage_bps: f64,
-        expected_fill_price: f64,
-    },
+    Skip { slippage_bps: f64, expected_fill_price: f64 },
 }
 
 /// Exekuční slippage guard.
 ///
 /// `expected_fill_vwap` je VWAP ceny, které by market order reálně zaplatil
 /// (pro BUY: průchod ask stranou knihy; pro SELL: bid stranou).
-/// Když VWAP není k dispozici (prázdná kniha), guard je konzervativní
-/// a exekuci povolí — chybějící data nesmí zablokovat obchod (fail-open
-/// na straně exekuce, telemetrie zaznamená, že VWAP nebyl).
+/// Missing/invalid depth or signal data blocks execution. `Skip` uses finite
+/// f64::MAX bps and price 0 for unavailable evidence, never a fabricated quote.
 #[derive(Debug, Clone)]
 pub struct SlippageGuard {
     /// Maximální tolerovaný slippage v bps vůči signální ceně.
@@ -83,7 +52,7 @@ pub struct SlippageGuard {
 impl SlippageGuard {
     pub fn new(max_slippage_bps: f64) -> Self {
         Self {
-            max_slippage_bps: max_slippage_bps.max(0.0),
+            max_slippage_bps,
         }
     }
 
@@ -93,31 +62,28 @@ impl SlippageGuard {
 
     /// Pre-trade rozhodnutí.
     ///
-    /// * `side`         — Buy nebo Sell.
-    /// * `signal_price` — cena signálu (odkud alpha vychází).
-    /// * `vwap_result`  — VWAP výsledek z order booku pro danou stranu a qty.
+    /// * `side`             — Buy nebo Sell.
+    /// * `signal_price`     — cena signálu (odkud alpha vychází).
+    /// * `expected_fill_vwap`— VWAP z order booku pro danou stranu a qty.
     pub fn check(
         &self,
         side: Side,
         signal_price: f64,
-        vwap_result: Option<&VwapResult>,
+        expected_fill_vwap: Option<f64>,
     ) -> SlippageDecision {
-        let vwap = match vwap_result {
-            Some(r) if r.price.is_finite() && r.price > 0.0 => r.price,
-            // Bez dat o knize neblokujeme — market order na BTC/USD
-            // s pozicí ~0,001 BTC má zanedbatelný impact.
-            _ => {
-                return SlippageDecision::Execute {
-                    expected_fill_price: signal_price,
-                }
-            }
+        let unavailable = SlippageDecision::Skip {
+            slippage_bps: f64::MAX,
+            expected_fill_price: 0.0,
         };
-
-        if !signal_price.is_finite() || signal_price <= 0.0 {
-            return SlippageDecision::Execute {
-                expected_fill_price: vwap,
-            };
+        if !signal_price.is_finite() || signal_price <= 0.0
+            || !self.max_slippage_bps.is_finite() || self.max_slippage_bps < 0.0
+        {
+            return unavailable;
         }
+        let vwap = match expected_fill_vwap {
+            Some(v) if v.is_finite() && v > 0.0 => v,
+            _ => return unavailable,
+        };
 
         // Kladný slippage = zhoršení (BUY platí víc, SELL dostává míň).
         let slippage = match side {
@@ -126,6 +92,9 @@ impl SlippageGuard {
         };
         let slippage_bps = (slippage / signal_price) / BPS;
 
+        if !slippage_bps.is_finite() {
+            return unavailable;
+        }
         if slippage_bps > self.max_slippage_bps {
             SlippageDecision::Skip {
                 slippage_bps,
@@ -188,7 +157,8 @@ impl SlippageTelemetry {
         self.ewma_bps = if self.ewma_bps == 0.0 {
             realized_bps
         } else {
-            TELEMETRY_EWMA_LAMBDA * self.ewma_bps + (1.0 - TELEMETRY_EWMA_LAMBDA) * realized_bps
+            TELEMETRY_EWMA_LAMBDA * self.ewma_bps
+                + (1.0 - TELEMETRY_EWMA_LAMBDA) * realized_bps
         };
         if self.window.len() >= self.capacity {
             self.window.pop_front();
@@ -235,17 +205,11 @@ fn percentile(window: &VecDeque<f64>, p: f64) -> Option<f64> {
 mod tests {
     use super::*;
 
-    /// Helper pro testy — VwapResult s plným naplněním.
-    fn vwap_result_for_test(price: f64) -> VwapResult {
-        VwapResult::new(price, 1.0, 1.0)
-    }
-
     #[test]
     fn guard_passes_when_vwap_within_threshold() {
         let g = SlippageGuard::new(5.0);
         // BUY: VWAP ask o 2 bps výš než signál — OK.
-        let vwap = vwap_result_for_test(80_016.0); // 2 bps
-        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
+        let d = g.check(Side::Buy, 80_000.0, Some(80_016.0)); // 2 bps
         assert!(matches!(d, SlippageDecision::Execute { .. }));
     }
 
@@ -253,8 +217,7 @@ mod tests {
     fn guard_skips_when_vwap_exceeds_threshold() {
         let g = SlippageGuard::new(5.0);
         // BUY: VWAP ask o 10 bps výš — skip.
-        let vwap = vwap_result_for_test(80_080.0); // 10 bps
-        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
+        let d = g.check(Side::Buy, 80_000.0, Some(80_080.0)); // 10 bps
         match d {
             SlippageDecision::Skip { slippage_bps, .. } => {
                 assert!((slippage_bps - 10.0).abs() < 0.01, "bps = {slippage_bps}");
@@ -267,87 +230,38 @@ mod tests {
     fn guard_sell_side_measures_opposite() {
         let g = SlippageGuard::new(5.0);
         // SELL: VWAP bid o 3 bps níž než signál — OK (3 < 5).
-        let vwap = vwap_result_for_test(79_976.0); // 3 bps
-        let d = g.check(Side::Sell, 80_000.0, Some(&vwap));
+        let d = g.check(Side::Sell, 80_000.0, Some(79_976.0)); // 3 bps
         assert!(matches!(d, SlippageDecision::Execute { .. }));
         // SELL: VWAP bid o 8 bps níž — skip.
-        let vwap = vwap_result_for_test(79_936.0); // 8 bps
-        let d = g.check(Side::Sell, 80_000.0, Some(&vwap));
+        let d = g.check(Side::Sell, 80_000.0, Some(79_936.0)); // 8 bps
         assert!(matches!(d, SlippageDecision::Skip { .. }));
     }
 
     #[test]
-    fn guard_fails_open_without_vwap() {
-        // Prázdná kniha nesmí blokovat obchod.
+    fn guard_blocks_missing_invalid_or_insufficient_depth() {
         let g = SlippageGuard::new(5.0);
-        let d = g.check(Side::Buy, 80_000.0, None);
-        assert!(matches!(d, SlippageDecision::Execute { .. }));
-        // NaN price → fail-open
-        let vwap = VwapResult::new(f64::NAN, 1.0, 1.0);
-        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
-        assert!(matches!(d, SlippageDecision::Execute { .. }));
+        for side in [Side::Buy, Side::Sell] {
+            for price in [None, Some(f64::NAN), Some(f64::INFINITY), Some(0.0), Some(-1.0)] {
+                assert!(matches!(g.check(side, 80_000.0, price), SlippageDecision::Skip { .. }));
+            }
+            for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert!(matches!(g.check(side, bad, Some(80_000.0)), SlippageDecision::Skip { .. }));
+            }
+        }
+        let mut book = crate::order_book::OrderBook::new(crate::types::Symbol::new("tBTCUSD"), 0.01);
+        book.update_level(Side::Sell, 80_000.0, 0.1, 1);
+        assert!(matches!(g.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)), SlippageDecision::Skip { .. }));
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(SlippageGuard::new(bad).check(Side::Buy, 80_000.0, Some(80_000.0)), SlippageDecision::Skip { .. }));
+        }
     }
 
     #[test]
     fn guard_price_improvement_always_passes() {
         let g = SlippageGuard::new(5.0);
         // BUY s VWAP POD signálem = price improvement — vždy OK.
-        let vwap = vwap_result_for_test(79_990.0);
-        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
+        let d = g.check(Side::Buy, 80_000.0, Some(79_990.0));
         assert!(matches!(d, SlippageDecision::Execute { .. }));
-    }
-
-    #[test]
-    fn guard_uses_vwap_result_fields() {
-        // [F09 REGRESNÍ TEST] Guard musí číst cenu z VwapResult.price,
-        // nikoli jen holou f64. Ověřuje, že expected_fill_price pochází
-        // ze struktury a že částečné naplnění neblokuje exekuci.
-        let g = SlippageGuard::new(5.0);
-
-        // 2 bps — Execute s expected_fill_price z VwapResult
-        let vwap = VwapResult::new(80_016.0, 1.0, 1.0);
-        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
-        match &d {
-            SlippageDecision::Execute {
-                expected_fill_price,
-            } => {
-                assert!(
-                    (*expected_fill_price - 80_016.0).abs() < 1e-9,
-                    "očekávám VWAP price {:.2}, dostal jsem {:.2}",
-                    80_016.0,
-                    expected_fill_price
-                );
-            }
-            _ => panic!("očekávám Execute, dostal jsem {:?}", d),
-        }
-
-        // 10 bps — Skip se správným expected_fill_price z VwapResult
-        let vwap = VwapResult::new(80_080.0, 1.0, 1.0);
-        let d = g.check(Side::Buy, 80_000.0, Some(&vwap));
-        match &d {
-            SlippageDecision::Skip {
-                slippage_bps,
-                expected_fill_price,
-            } => {
-                assert!(
-                    (*expected_fill_price - 80_080.0).abs() < 1e-9,
-                    "Skip musí nést VWAP price {:.2}, dostal jsem {:.2}",
-                    80_080.0,
-                    expected_fill_price
-                );
-                assert!((*slippage_bps - 10.0).abs() < 0.01, "bps = {slippage_bps}");
-            }
-            _ => panic!("očekávám Skip, dostal jsem {:?}", d),
-        }
-
-        // VwapResult s filled_quantity < requested_quantity — stále funguje
-        let partial = VwapResult::new(80_016.0, 0.5, 1.0);
-        assert!(!partial.is_fully_filled());
-        let d = g.check(Side::Buy, 80_000.0, Some(&partial));
-        assert!(
-            matches!(d, SlippageDecision::Execute { .. }),
-            "částečné naplnění nesmí bránit exekuci"
-        );
     }
 
     #[test]
@@ -409,4 +323,32 @@ mod tests {
         }
         assert_eq!(t.sample_count(), 500);
     }
+    // Server regression retained, adapted to strict depth evidence. The old
+    // expectation that a partial quote must execute contradicted F09/A05.
+    #[test]
+    fn guard_uses_depth_price_and_rejects_partial_coverage() {
+        let guard = SlippageGuard::new(5.0);
+        let mut book = crate::order_book::OrderBook::new(crate::types::Symbol::new("tBTCUSD"), 0.01);
+        book.update_level(Side::Sell, 80_016.0, 1.0, 1);
+        assert_eq!(guard.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)),
+            SlippageDecision::Execute { expected_fill_price: 80_016.0 });
+        book.clear();
+        book.update_level(Side::Sell, 80_080.0, 1.0, 1);
+        match guard.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)) {
+            SlippageDecision::Skip { expected_fill_price, slippage_bps } => {
+                assert_eq!(expected_fill_price, 80_080.0);
+                assert!((slippage_bps - 10.0).abs() < 0.01);
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        book.clear();
+        book.update_level(Side::Sell, 80_016.0, 0.5, 1);
+        let quote = book.depth_quote(Side::Buy, 1.0, None).unwrap();
+        assert_eq!(quote.vwap, Some(80_016.0));
+        assert_eq!(quote.covered_quantity, 0.5);
+        assert!(!quote.fully_covered);
+        assert!(matches!(guard.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)),
+            SlippageDecision::Skip { .. }));
+    }
+
 }
