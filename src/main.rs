@@ -1120,7 +1120,7 @@ async fn process_ws_message(
         if array.len() >= 2 {
             // Ticker data (array[1] is array of 10 items)
             if let Some(values) = array[1].as_array() {
-                if frame.channel == market_events::Channel::Ticker && values.len() == 10 {
+                if frame.channel == market_events::Channel::Ticker && values.len() >= 10 {
                     if let Some(price) = values[6].as_f64() {
                         *state.btc_price.write() = price;
                         state.add_price_point(price);

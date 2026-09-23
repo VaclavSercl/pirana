@@ -90,7 +90,7 @@ impl MarketEvents {
                     Some(ticker) => ticker,
                     None => { self.ticker_seen = None; return None; }
                 };
-                if ticker.len() != 10 || !positive(ticker.get(6)?) {
+                if ticker.len() < 10 || !positive(ticker.get(6)?) {
                     self.ticker_seen = None;
                     return None;
                 }
@@ -185,6 +185,26 @@ mod tests {
     fn subscribe(r: &mut MarketEvents, channel: &str, id: u64) {
         r.route(json!({"event":"subscribed","symbol":"tBTCUSD","channel":channel,"chanId":id,"prec":"P0"}), Instant::now(), 10_000);
     }
+    #[test]
+    fn live_ticker_extension_preserves_required_prefix_and_readiness() {
+        let mut r = MarketEvents::default();
+        subscribe(&mut r, "ticker", 7281);
+        subscribe(&mut r, "book", 2);
+        subscribe(&mut r, "trades", 3);
+        let now = Instant::now();
+        r.route(json!([2, [[84270, 1, 1], [84272, 1, -1]]]), now, 1790195882000).unwrap();
+        r.route(json!([3, []]), now, 1790195882000);
+        let live = json!([7281, [84270, 3.57889174, 84272, 0.95909687, -2034, -0.02356731, 84272, 1515.32883168, 87301, 83467, 1358182043000_i64]]);
+        let frame = r.route(live, now, 1790195882000).unwrap();
+        assert_eq!(frame.channel, Channel::Ticker);
+        assert!(frame.entry_ready);
+        assert_eq!(frame.data[1][6], 84272);
+        assert!(r.route(json!([7281, [1,1,1,1,1,1,84272,1,1]]), now, 1790195882000).is_none());
+        assert!(!r.ready(now));
+        assert!(r.route(json!([7281, [1,1,1,1,1,1,0,1,1,1,123]]), now, 1790195882000).is_none());
+        assert!(!r.ready(now));
+    }
+
     #[test]
     fn identities_snapshots_duplicates_and_reconnect() {
         let mut r = MarketEvents::default();
