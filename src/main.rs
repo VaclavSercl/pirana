@@ -1019,6 +1019,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
         info!("Subscribed to BTC/USD ticker, order book and trades");
 
+        // Channel registry initialized on reconnect (see reconnect logic)
+
         let mut price_update_interval = interval(Duration::from_secs(5));
         let mut connection_active = true;
 
@@ -1067,7 +1069,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 #[allow(clippy::too_many_arguments)]
 async fn process_ws_message(
     state: &DashboardState,
-    data: serde_json::Value,
+    mut data: serde_json::Value,
     ofi: &mut OfiCalculator,
     flow_calculator: &mut FlowCalculator,
     atr: &mut AtrCalculator,

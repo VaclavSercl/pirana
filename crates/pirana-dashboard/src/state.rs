@@ -35,6 +35,8 @@ pub struct DashboardState {
     pub spread: Arc<parking_lot::RwLock<f64>>,
     /// F04: Recent trade IDs for deduplication (retains last 1000 unique IDs)
     pub trade_dedup_ids: Arc<parking_lot::Mutex<VecDeque<u64>>>,
+    /// F01: WebSocket channel registry (chanId → ChannelKind)
+    pub channel_registry: Arc<parking_lot::Mutex<pirana_core::ws_registry::ChannelRegistry>>,
     /// Recent trades (last 100)
     pub recent_trades: Arc<parking_lot::RwLock<Vec<TradeView>>>,
     /// Open orders
@@ -324,6 +326,7 @@ impl DashboardState {
             volatility: Arc::new(parking_lot::RwLock::new(0.0)),
             spread: Arc::new(parking_lot::RwLock::new(0.0)),
             trade_dedup_ids: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(1000))),
+            channel_registry: Arc::new(parking_lot::Mutex::new(pirana_core::ws_registry::ChannelRegistry::new())),
             recent_trades: Arc::new(parking_lot::RwLock::new(Vec::new())),
             open_orders: Arc::new(parking_lot::RwLock::new(Vec::new())),
             recent_signals: Arc::new(parking_lot::RwLock::new(Vec::new())),
