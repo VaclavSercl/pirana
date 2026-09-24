@@ -1132,6 +1132,62 @@ mod tests {
     }
 
     #[test]
+    fn skim_roundtrip_preserves_exact_persisted_decimal_bits() {
+        let decoded: SkimAccrual = serde_json::from_str(
+            r#"{"realized_pnl_usd":1.233801149999998,"reserved_usd":0.12338011499999979,"consumed_btc":0.000465}"#,
+        ).unwrap();
+        assert_eq!(decoded.realized_pnl_usd.to_bits(), 1.233801149999998_f64.to_bits());
+        assert_eq!(decoded.reserved_usd.to_bits(), 0.12338011499999979_f64.to_bits());
+        assert_eq!(decoded.reserved_usd, decoded.realized_pnl_usd * 0.1);
+    }
+
+    #[test]
+    fn skim_roundtrip_reopens_fractional_profit_without_changing_reserve() {
+        for pnl in [1.2438377999999943, 1.233801149999998, 0.32561403000000055,
+            0.019282850000003293, 0.03805200000000042, 0.04215617999999921,
+            0.027521999999997604, 0.01728165999999476, 0.018654999999995425] {
+            let p = path();
+            seed(&p);
+            let expected: f64 = pnl * 0.1;
+            {
+                let b = PositionBook::open(&p, &bought()).unwrap();
+                b.stage_exit_quantity_with_skim("777".into(), position(), 2., 10.).unwrap();
+                b.write().clear();
+                b.mark_exit_settled_with_profit("777", pnl).unwrap();
+                assert_eq!(b.pending_skim_usd().to_bits(), expected.to_bits());
+            }
+            let closed = projection(0., vec![
+                order(123, "555", "2", "0", "100"),
+                order(456, "777", "-2", "0", "110"),
+            ]);
+            for _ in 0..3 {
+                let b = PositionBook::open(&p, &closed).unwrap();
+                assert_eq!(b.pending_skim_usd().to_bits(), expected.to_bits());
+                assert!(b.read().is_empty());
+                b.reconcile(&closed).unwrap();
+                assert_eq!(b.pending_skim_usd().to_bits(), expected.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn skim_roundtrip_still_rejects_one_bit_forged_reserve_without_rewrite() {
+        let p = path();
+        seed(&p);
+        {
+            let b = PositionBook::open(&p, &bought()).unwrap();
+            b.stage_exit_quantity_with_skim("777".into(), position(), 2., 10.).unwrap();
+            b.mark_exit_settled_with_profit("777", 20.).unwrap();
+        }
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        value["skim_accruals"]["777"]["reserved_usd"] = json!(f64::from_bits(2.0_f64.to_bits() + 1));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(PositionBook::open(&p, &bought()).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+    }
+
+    #[test]
     fn forged_skim_totals_are_rejected_without_rewriting_disk() {
         let p = path();
         seed(&p);
