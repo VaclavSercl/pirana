@@ -32,6 +32,20 @@
 
 ## 🔄 PROTOCOL (co která instance dělala — číst PŘED prací, psát PO práci)
 
+### 23.9.2026 - Codex audit continuation (server SSH)
+
+- Isolated audit candidate integrates typed market routing, protected IOC exits, full-depth liquidity checks, fee-aware persistent accounting and equity risk, plus recovery of the observed partial IOC cancellation status. Independent review and native checks passed: 455 Rust tests and 210 Python tests. Docker release validation also passed on ARM64/Rust1.85.1. Exact-checkpoint publication/deployment outcomes are recorded in /home/wwwenda/workspace/pirana-evidence-20260923; this entry records the prepublication checkpoint. Strategy sizing was not changed. No live intents or accounting history were manually deleted.
+- Hourly Codex oversight configured; authenticated initial check found no fills in the last24h and matching exchange BTC versus3 durable positions. One pending BUY explains the recovery wait. Private evidence is retained outside tracked files.
+
+
+### 22.9.2026
+
+- **07:00 (ranní audit — Hermes CLI)**: ⚠️ **CRITICAL: systém HALTED**. `system_mode=Halted`, `execution_block_reason=execution reconciliation pending: position/order state not confirmed`. Služba běží (uptime ~35 h), ale NEOBCHODUJE. 2 otevřené BUY pozice (#127 @81,882, #128 @81,905) v unrealized ztrátě (current $81,686). 124 recovery candidates ve frontě (staré nevyřízené pozice). Poslední trade 21.9. 01:26 UTC. VPIN 45.2% (moderate), RANGE, OFI 0.0, Hawkes λ=1.60 (nízký). Slippage EWMA 1.29 bps (OK). Accounting zcela rozbitý — vše NULL, "stale projection". USD balance $294.98 + BTC 0.00105209 ≈ $85.93. Žádná změna TOML ani zásah (reconciliation vyžaduji operátor/sudo). Doporučeno: ověřit pozice #127/#128 na Burze, spustit reconcile, vyčistit recovery frontu.
+
+### 23.9.2026
+
+- **07:00 (ranní audit — Hermes CLI)**: Služba Active (uptime ~59 h), ale **system_mode=Halted** — `execution_block_reason=execution reconciliation pending: position/order state not confirmed` (stejný stav jako 22.9.). BTC $81,686 (BFX), Binance $81,586.57, RANGE, VPIN 45.2% (moderate), Hawkes λ=1.60 (nízký). Pozice #127/#128 otevřeny od 21.9. 01:26 UTC. Legacy: 17 RT, WR 94.1%, PnL +0.233 USD. Runtime telemetrie: vše NULL (accounting rozbitý). Strategy.toml: position_size_pct=10.0 % (NEOVĚŘENO — odlišné od AGENT_STATE.md 1.0 %; možná změna jiné instance nebo návrat po 19.9.). Sizing NEMĚNĚN (audit read-only, čeká na operátora). Žádný zásah do TOML. Doporučeno: reconciliation pozic #127/#128, ověření poctu v strategy.toml.
+
 ### 20.9.2026
 
 - **08:45 (Single Live Strategy Doctrine & Microstructure Enhancements — Antigravity)**: Canonizována jediná ostrá strategie Pullback Flow s Avellaneda-Stoikov inventářem a Bitcoin Standard ATR výstupy (`strategy.toml`: `lead_lag.enabled = false`). Nasazena 4-variantní matice shadow testů Pullback Flow + V4 Cartea-Jaimungal drift-aware model (`src/shadow_candidate.rs`). Integrovány 3 vědecké mikrostrukturní prvky z let 2024–2026: 1) Directional VPIN (`crates/pirana-features/src/vpin.rs`) s dekompozicí na buy/sell toxicitu (BUY je blokován pouze při sell dumpu, nikoli při buy sweepech); 2) L2 depth queue gate (`!l2_depth.is_selling_supported()`) chránící před nákupem do ask wall; 3) Hawkes cascade brake ($Z_{\text{sell}} \ge 2.5$) a buy clustering conviction boost ($Z_{\text{buy}} \ge 1.2$). Plná sada testů (>250 testů) prošla, release binárka zkompilována a nasazena na `pirana.service`. Systém běží v režimu Active, caslav-doctor ZDRAVÝ.

@@ -89,13 +89,31 @@ pub struct Activity {
     inflight: AtomicUsize,
     generation: AtomicU64,
 }
-pub struct Guard<'a>(&'a Activity);
+pub struct Guard<'a> { activity: &'a Activity, changed: bool }
+impl Guard<'_> {
+    /// Mark the first economic mutation while the exclusive reservation is held.
+    /// Rejected read-only candidates leave wallet observation generations intact.
+    pub fn activate(&mut self) {
+        if !self.changed {
+            self.activity.generation.fetch_add(1, Ordering::SeqCst);
+            self.changed = true;
+        }
+    }
+}
 impl Activity {
+    #[cfg(test)]
     pub fn begin(&self) -> Guard<'_> {
         let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         self.inflight.fetch_add(1, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
-        Guard(self)
+        Guard { activity: self, changed: true }
+    }
+    /// Atomically reserve a coherent wallet view only when no writer is pending.
+    pub fn try_begin_idle(&self) -> Option<Guard<'_>> {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.inflight.load(Ordering::SeqCst) != 0 { return None; }
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        Some(Guard { activity: self, changed: false })
     }
     pub fn idle_generation(&self) -> Option<u64> {
         let g = self.generation.load(Ordering::SeqCst);
@@ -116,6 +134,13 @@ impl Activity {
             None
         }
     }
+    /// Publish derived wallet state only while its original observation is
+    /// still current. The gate remains held for the entire closure, excluding
+    /// new economic reservations. The closure must not re-enter Activity.
+    pub fn publish_if_unchanged<T>(&self, observation: u64, publish: impl FnOnce() -> T) -> Option<T> {
+        let _guard = self.idle_guard(observation)?;
+        Some(publish())
+    }
     pub const fn new() -> Self {
         Self {
             gate: Mutex::new(()),
@@ -126,14 +151,74 @@ impl Activity {
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        let _gate = self.0.gate.lock().unwrap_or_else(|e| e.into_inner());
-        self.0.generation.fetch_add(1, Ordering::SeqCst);
-        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+        let _gate = self.activity.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.changed { self.activity.generation.fetch_add(1, Ordering::SeqCst); }
+        self.activity.inflight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stale_wallet_publication_cannot_erase_a_new_buy_reservation() {
+        let activity = super::Activity::new();
+        let risk = pirana_risk_engine::engine::RiskEngine::new(400.0);
+        let wallet_observation = activity.idle_generation().unwrap();
+        let mut buy = activity.try_begin_idle().unwrap();
+        buy.activate();
+        risk.update_exposure(0.1);
+        drop(buy);
+
+        let mut published = false;
+        assert!(activity.publish_if_unchanged(wallet_observation, || {
+            published = true;
+            risk.sync_exposure_from_positions(0.0)
+        }).is_none());
+        assert!(!published);
+        // The real engine returns its pre-reset drift: the full reservation
+        // survived. This final read-through-reset is confined to this test.
+        assert_eq!(risk.sync_exposure_from_positions(0.0), Some(0.1));
+    }
+
+    #[test]
+    fn unchanged_wallet_publication_updates_real_exposure() {
+        let activity = super::Activity::new();
+        let risk = pirana_risk_engine::engine::RiskEngine::new(400.0);
+        let observation = activity.idle_generation().unwrap();
+        let mut published = false;
+        assert_eq!(activity.publish_if_unchanged(observation, || {
+            published = true;
+            risk.sync_exposure_from_positions(0.2);
+            42
+        }), Some(42));
+        assert!(published);
+        assert_eq!(risk.sync_exposure_from_positions(0.0), Some(0.2));
+    }
+
+    #[test]
+    fn rejected_candidates_do_not_invalidate_wallet_request() {
+        let activity = super::Activity::new();
+        let observation = activity.idle_generation().unwrap();
+        for _ in 0..10_000 { drop(activity.try_begin_idle().unwrap()); }
+        assert!(activity.unchanged(observation));
+        assert!(activity.idle_guard(observation).is_some());
+        let mut execution = activity.try_begin_idle().unwrap();
+        execution.activate();
+        drop(execution);
+        assert!(!activity.unchanged(observation));
+    }
+
+    #[test]
+    fn economic_candidate_excludes_other_writers_until_settled() {
+        let activity = super::Activity::new();
+        let observation = activity.idle_generation().unwrap();
+        let guard = activity.try_begin_idle().unwrap();
+        assert!(activity.try_begin_idle().is_none());
+        assert!(!activity.unchanged(observation));
+        drop(guard);
+        assert!(activity.try_begin_idle().is_some());
+    }
+
     use super::*;
     use serde_json::json;
     fn fixture() -> Value {

@@ -13,6 +13,17 @@ use std::{
     sync::atomic::Ordering,
 };
 
+/// USD earmarked from a proven terminal SELL, not owned or purchased BTC.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkimAccrual {
+    realized_pnl_usd: f64,
+    reserved_usd: f64,
+    /// Present when inventory and settlement were committed together.
+    #[serde(default)]
+    consumed_btc: Option<f64>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
@@ -29,6 +40,11 @@ struct Snapshot {
     exit_requested_at: BTreeMap<String, i64>,
     #[serde(default)]
     exit_requested_quantities: BTreeMap<String, f64>,
+    /// Missing entries are legacy/disabled, never inferred from current config.
+    #[serde(default)]
+    exit_skim_pct: BTreeMap<String, f64>,
+    #[serde(default)]
+    skim_accruals: BTreeMap<String, SkimAccrual>,
 }
 
 pub struct PositionBook {
@@ -39,6 +55,8 @@ pub struct PositionBook {
     settled_exit_cids: Mutex<HashSet<String>>,
     exit_requested_at: Mutex<BTreeMap<String, i64>>,
     exit_requested_quantities: Mutex<BTreeMap<String, f64>>,
+    exit_skim_pct: Mutex<BTreeMap<String, f64>>,
+    skim_accruals: Mutex<BTreeMap<String, SkimAccrual>>,
     path: PathBuf,
     _lock: File,
 }
@@ -104,6 +122,73 @@ fn validate_intent(cid: &str, p: &ActivePosition) -> Result<(), String> {
     validate(&identified)
 }
 
+fn validate_skim(snapshot: &Snapshot) -> Result<(), String> {
+    if snapshot.schema_version != 1 && snapshot.schema_version != 2 {
+        return Err("unsupported position journal schema".into());
+    }
+    if snapshot.schema_version == 1
+        && (!snapshot.exit_skim_pct.is_empty() || !snapshot.skim_accruals.is_empty())
+    {
+        return Err("legacy journal cannot contain new skim evidence".into());
+    }
+    for (cid, pct) in &snapshot.exit_skim_pct {
+        if !snapshot.exit_intents.contains_key(cid)
+            || !pct.is_finite() || !(0.0..=100.0).contains(pct)
+        {
+            return Err("invalid captured skim policy".into());
+        }
+        if *pct > 0.0 && snapshot.settled_exit_cids.contains(cid)
+            && !snapshot.skim_accruals.contains_key(cid)
+        {
+            return Err("settled skim exit lacks durable profit evidence".into());
+        }
+    }
+    let mut total = 0.0;
+    for (cid, accrual) in &snapshot.skim_accruals {
+        let pct = snapshot.exit_skim_pct.get(cid)
+            .ok_or("skim accrual has no captured policy")?;
+        let expected = accrual.realized_pnl_usd.max(0.0) * (*pct / 100.0);
+        if !snapshot.settled_exit_cids.contains(cid)
+            || !accrual.realized_pnl_usd.is_finite()
+            || !accrual.reserved_usd.is_finite() || accrual.reserved_usd < 0.0
+            || accrual.reserved_usd != expected
+            || accrual.consumed_btc.is_some_and(|qty| !qty.is_finite() || qty <= 0.0
+                || snapshot.exit_intents.get(cid).map_or(true, |p| qty > p.quantity))
+        {
+            return Err("invalid durable skim accrual".into());
+        }
+        total += accrual.reserved_usd;
+    }
+    if !total.is_finite() { return Err("pending skim total overflow".into()); }
+    Ok(())
+}
+
+fn settle_with_profit(snapshot: &mut Snapshot, cid: &str, pnl: f64) -> Result<(), String> {
+    if !snapshot.exit_intents.contains_key(cid) || !pnl.is_finite() {
+        return Err("missing exit intent or invalid realized profit".into());
+    }
+    let pct = snapshot.exit_skim_pct.get(cid).copied().unwrap_or(0.0);
+    if let Some(previous) = snapshot.skim_accruals.get(cid) {
+        if previous.realized_pnl_usd != pnl {
+            return Err("terminal skim profit conflicts with recorded evidence".into());
+        }
+        return Ok(());
+    }
+    if snapshot.settled_exit_cids.contains(cid) && pct > 0.0 {
+        return Err("cannot backfill historical skim without evidence".into());
+    }
+    // Legacy exits remain excluded; no historical BTC or USD is manufactured.
+    if snapshot.exit_skim_pct.contains_key(cid) {
+        snapshot.skim_accruals.insert(cid.to_owned(), SkimAccrual {
+            realized_pnl_usd: pnl,
+            reserved_usd: pnl.max(0.0) * (pct / 100.0),
+            consumed_btc: None,
+        });
+    }
+    snapshot.settled_exit_cids.insert(cid.to_owned());
+    validate_skim(snapshot)
+}
+
 // Shared canonical reconstruction. This function never mutates the live book.
 fn recover(
     snapshot: Snapshot,
@@ -142,7 +227,16 @@ fn recover(
             .ok_or("invalid order identity")?;
         let amount = signed_decimal(&value["exec_amount"])?;
         let base_fee = signed_decimal(&value["base_fee"])?;
-        let price = decimal(&value["entry_price"])?;
+        let gross_price = decimal(&value["entry_price"])?;
+        // Versioned projection extension: absence is unknown, never zero fees.
+        // Refresh the authenticated ledger projection before opening old data.
+        let quote_fee = signed_decimal(&value["quote_fee"])?;
+        let price = if amount > 0.0 {
+            (amount * gross_price - quote_fee) / (amount + base_fee)
+        } else { gross_price };
+        if !price.is_finite() || price <= 0.0 {
+            return Err("invalid canonical net entry cost".into());
+        }
         let mts = value["mts"]
             .as_i64()
             .filter(|x| *x > 0 && *x <= cursor)
@@ -164,9 +258,7 @@ fn recover(
             return Err("duplicate canonical order total".into());
         }
     }
-    if snapshot.schema_version != 1 {
-        return Err("unsupported position journal schema".into());
-    }
+    validate_skim(&snapshot)?;
     let mut by_id = BTreeMap::new();
     for p in snapshot.recovery_candidates {
         validate(&p)?;
@@ -189,9 +281,11 @@ fn recover(
     }
     let mut pending = snapshot.pending_intents;
     let mut settled_exit_cids = snapshot.settled_exit_cids;
-    let exits = snapshot.exit_intents;
+    let mut exits = snapshot.exit_intents;
     let exit_requested_at = snapshot.exit_requested_at;
     let exit_requested_quantities = snapshot.exit_requested_quantities;
+    let exit_skim_pct = snapshot.exit_skim_pct;
+    let skim_accruals = snapshot.skim_accruals;
     for (cid, qty) in &exit_requested_quantities {
         let position = exits.get(cid).ok_or("exit quantity without attribution")?;
         if !qty.is_finite() || *qty <= 0.0 || *qty > position.quantity {
@@ -206,6 +300,14 @@ fn recover(
     }
     if settled_exit_cids.iter().any(|cid| !exits.contains_key(cid)) {
         return Err("settled exit without attribution".into());
+    }
+    // Upgrade old gross-price metadata only from complete authenticated costs.
+    // This is actual historical evidence, not a current fee-policy assumption.
+    for position in exits.values_mut() {
+        let &(bought, cost, _) = orders.get(&position.exchange_order_id)
+            .ok_or("exit attribution missing canonical entry cost")?;
+        if bought <= 0.0 { return Err("exit attribution entry is not a BUY".into()); }
+        position.entry_price = cost;
     }
     // Exit metadata also bridges a crash after removing a position from memory.
     for (cid, position) in &exits {
@@ -274,6 +376,13 @@ fn recover(
             }
             *consumed.entry(position.position_id).or_default() -= net;
             if settle_matched_exits {
+                // Terminality and complete net profit must be corroborated by
+                // execution recovery before finalizing a skim-enabled exit.
+                if exit_skim_pct.get(cid).copied().unwrap_or(0.0) > 0.0
+                    && !skim_accruals.contains_key(cid)
+                {
+                    return Err("terminal skim profit unresolved; reconcile proven net profit before inventory".into());
+                }
                 settled_exit_cids.insert(cid.clone());
             }
         }
@@ -288,12 +397,13 @@ fn recover(
         if !seen_orders.insert(position.exchange_order_id) {
             return Err("multiple positions share canonical entry order".into());
         }
-        let &(bought, _, _) = orders
+        let &(bought, entry_cost, _) = orders
             .get(&position.exchange_order_id)
             .ok_or("runtime entry missing canonical BUY order")?;
         if bought <= 0. {
             return Err("runtime entry matched a SELL".into());
         }
+        position.entry_price = entry_cost;
         let qty = bought - consumed.get(&position.position_id).copied().unwrap_or(0.);
         if !qty.is_finite() || qty < -1e-12 {
             return Err("strategy exits exceed bought inventory".into());
@@ -313,7 +423,7 @@ fn recover(
         return Err("strategy inventory differs from canonical account inventory".into());
     }
     Ok(Snapshot {
-        schema_version: 1,
+        schema_version: 2,
         positions: recovered,
         recovery_candidates: archive.into_values().collect(),
         pending_intents: pending,
@@ -321,6 +431,8 @@ fn recover(
         settled_exit_cids,
         exit_requested_at,
         exit_requested_quantities,
+        exit_skim_pct,
+        skim_accruals,
     })
 }
 
@@ -363,7 +475,7 @@ impl PositionBook {
             Ok(bytes) => serde_json::from_slice::<Snapshot>(&bytes)
                 .map_err(|e| format!("invalid position journal: {e}"))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Snapshot {
-                schema_version: 1,
+                schema_version: 2,
                 positions: vec![],
                 recovery_candidates: vec![],
                 pending_intents: BTreeMap::new(),
@@ -371,6 +483,8 @@ impl PositionBook {
                 settled_exit_cids: HashSet::new(),
                 exit_requested_at: BTreeMap::new(),
                 exit_requested_quantities: BTreeMap::new(),
+                exit_skim_pct: BTreeMap::new(),
+                skim_accruals: BTreeMap::new(),
             },
             Err(e) => return Err(format!("cannot recover position journal: {e}")),
         };
@@ -390,6 +504,8 @@ impl PositionBook {
             settled_exit_cids: Mutex::new(snapshot.settled_exit_cids.clone()),
             exit_requested_at: Mutex::new(snapshot.exit_requested_at.clone()),
             exit_requested_quantities: Mutex::new(snapshot.exit_requested_quantities.clone()),
+            exit_skim_pct: Mutex::new(snapshot.exit_skim_pct.clone()),
+            skim_accruals: Mutex::new(snapshot.skim_accruals.clone()),
             path,
             _lock: lock,
         };
@@ -427,6 +543,8 @@ impl PositionBook {
             *self.settled_exit_cids.lock() = next.settled_exit_cids;
             *self.exit_requested_at.lock() = next.exit_requested_at;
             *self.exit_requested_quantities.lock() = next.exit_requested_quantities;
+            *self.exit_skim_pct.lock() = next.exit_skim_pct;
+            *self.skim_accruals.lock() = next.skim_accruals;
             *positions = published;
             Ok(())
         })();
@@ -505,20 +623,37 @@ impl PositionBook {
     }
 
     /// Persist exact strategy identity before submitting this CID's SELL.
+    #[cfg(test)]
     pub fn stage_exit(&self, cid: String, position: ActivePosition) -> Result<(), String> {
         let requested_qty = position.quantity;
         self.stage_exit_quantity(cid, position, requested_qty)
     }
 
     /// The exact submitted SELL quantity may be smaller than the position.
+    #[cfg(test)]
     pub fn stage_exit_quantity(
         &self,
         cid: String,
         position: ActivePosition,
         requested_qty: f64,
     ) -> Result<(), String> {
+        self.stage_exit_quantity_with_skim(cid, position, requested_qty, 0.0)
+    }
+
+    /// Capture percentage before submission. Subsequent config changes cannot
+    /// change this exit's allocation. Legacy wrappers deliberately capture zero.
+    pub fn stage_exit_quantity_with_skim(
+        &self,
+        cid: String,
+        position: ActivePosition,
+        requested_qty: f64,
+        skim_pct: f64,
+    ) -> Result<(), String> {
         self.transact(|snapshot| {
             validate(&position)?;
+            if !skim_pct.is_finite() || !(0.0..=100.0).contains(&skim_pct) {
+                return Err("invalid skim percentage".into());
+            }
             if !requested_qty.is_finite()
                 || requested_qty <= 0.0
                 || requested_qty > position.quantity
@@ -550,6 +685,7 @@ impl PositionBook {
             snapshot
                 .exit_requested_quantities
                 .insert(cid.clone(), requested_qty);
+            snapshot.exit_skim_pct.insert(cid.clone(), skim_pct);
             snapshot.exit_intents.insert(cid, position);
             Ok(())
         })
@@ -583,14 +719,70 @@ impl PositionBook {
 
     /// Caller has durably applied the terminal SELL's actual remaining quantity.
     /// Retain the intent forever for historical strategy-to-order attribution.
+    #[cfg(test)]
     pub fn mark_exit_settled(&self, cid: &str) -> Result<(), String> {
         self.transact(|snapshot| {
             if !snapshot.exit_intents.contains_key(cid) {
                 return Err("missing exit intent".into());
             }
+            if snapshot.exit_skim_pct.get(cid).copied().unwrap_or(0.0) > 0.0 {
+                return Err("skim-enabled exit requires proven terminal profit".into());
+            }
             snapshot.settled_exit_cids.insert(cid.to_owned());
             Ok(())
         })
+    }
+
+    /// Caller has independently proved terminal fills, net fees and attributed
+    /// entry cost, and durably applied remaining inventory. Settlement and USD
+    /// accrual publish in one journal replacement; repeated identical CID is safe.
+    pub fn mark_exit_settled_with_profit(&self, cid: &str, realized_pnl_usd: f64) -> Result<(), String> {
+        self.transact(|snapshot| settle_with_profit(snapshot, cid, realized_pnl_usd))
+    }
+
+    /// Commit terminal inventory, settlement and cash accrual atomically.
+    /// Call BEFORE publishing balances, exposure or trade metrics. `consumed_btc`
+    /// includes signed base fees (gross SELL quantity minus signed BTC fee).
+    pub fn complete_exit_with_profit(&self, cid: &str, consumed_btc: f64, pnl: f64) -> Result<(), String> {
+        self.transact(|snapshot| {
+            let position = snapshot.exit_intents.get(cid).ok_or("missing exit intent")?.clone();
+            if !consumed_btc.is_finite() || consumed_btc <= 0.0 || consumed_btc > position.quantity
+                || !pnl.is_finite()
+            { return Err("invalid terminal inventory consumption or profit".into()); }
+            if let Some(old) = snapshot.skim_accruals.get(cid) {
+                return if old.consumed_btc == Some(consumed_btc) && old.realized_pnl_usd == pnl {
+                    Ok(())
+                } else { Err("terminal inventory/profit conflicts with recorded settlement".into()) };
+            }
+            if snapshot.settled_exit_cids.contains(cid) {
+                return Err("settled exit lacks atomic inventory evidence; use canonical recovery".into());
+            }
+            if snapshot.positions.iter().any(|p| p.position_id == position.position_id
+                && (p.exchange_order_id != position.exchange_order_id || p.quantity != position.quantity))
+            { return Err("position changed while exit was in flight".into()); }
+            snapshot.positions.retain(|p| p.position_id != position.position_id);
+            let remaining = position.quantity - consumed_btc;
+            if remaining > 0.0 {
+                let mut residual = position.clone();
+                residual.quantity = remaining;
+                residual.exposure_size *= remaining / position.quantity;
+                validate(&residual)?;
+                snapshot.positions.push(residual);
+            }
+            settle_with_profit(snapshot, cid, pnl)?;
+            // New live exits always captured a percentage, including zero.
+            // Legacy exits remain routed through canonical recovery.
+            snapshot.skim_accruals.get_mut(cid)
+                .ok_or("legacy exit requires canonical settlement")?.consumed_btc = Some(consumed_btc);
+            Ok(())
+        })
+    }
+
+    /// Cash reserved for future BTC acquisition, never a claim of BTC ownership.
+    /// No conversion/debit API exists until an independently verified purchase path.
+    pub fn pending_skim_usd(&self) -> f64 {
+        let _positions = self.positions.read();
+        self.skim_accruals.lock().values().map(|a| a.reserved_usd).sum()
     }
 
     /// Only explicit authenticated terminal zero-fill evidence permits this.
@@ -620,8 +812,7 @@ impl PositionBook {
                 // A proven zero execution leaves exactly that position to manage.
                 snapshot.positions.push(position);
             }
-            snapshot.settled_exit_cids.insert(cid.to_owned());
-            Ok(())
+            settle_with_profit(snapshot, cid, 0.0)
         })
     }
 
@@ -640,7 +831,7 @@ impl PositionBook {
 
     fn snapshot(&self, positions: &[ActivePosition]) -> Snapshot {
         Snapshot {
-            schema_version: 1,
+            schema_version: 2,
             positions: positions
                 .iter()
                 .filter(|p| !p.is_paper && !p.is_shadow)
@@ -652,6 +843,8 @@ impl PositionBook {
             settled_exit_cids: self.settled_exit_cids.lock().clone(),
             exit_requested_at: self.exit_requested_at.lock().clone(),
             exit_requested_quantities: self.exit_requested_quantities.lock().clone(),
+            exit_skim_pct: self.exit_skim_pct.lock().clone(),
+            skim_accruals: self.skim_accruals.lock().clone(),
         }
     }
 
@@ -660,6 +853,7 @@ impl PositionBook {
     }
 
     fn persist_snapshot(&self, snapshot: &Snapshot) -> Result<(), String> {
+        validate_skim(snapshot)?;
         for p in &snapshot.positions {
             validate(p)?;
         }
@@ -764,7 +958,7 @@ mod tests {
         p
     }
     fn order(id: i64, cid: &str, amount: &str, fee: &str, price: &str) -> Value {
-        json!({"order_id":id,"cid":cid,"exec_amount":amount,"base_fee":fee,"entry_price":price,"mts":1100})
+        json!({"order_id":id,"cid":cid,"exec_amount":amount,"base_fee":fee,"quote_fee":"0","entry_price":price,"mts":1100})
     }
     fn projection(qty: f64, orders: Vec<Value>) -> Value {
         json!({"status":"complete","sync":{"complete":true,"cursor_ms":2000},"orders":orders,"open_lots":if qty>0. {vec![json!({"order_id":999,"remaining_btc":qty.to_string()})]} else {vec![]} })
@@ -779,6 +973,237 @@ mod tests {
         let b = PositionBook::open(path, &empty()).unwrap();
         b.write().push(position());
     }
+    #[test]
+    fn atomic_exit_failure_cannot_settle_without_residual_and_reserve() {
+        let p = path();
+        seed(&p);
+        let b = PositionBook::open(&p, &bought()).unwrap();
+        b.stage_exit_quantity_with_skim("777".into(), position(), 1., 10.).unwrap();
+        b.write().clear();
+        let before = std::fs::read(&p).unwrap();
+        std::fs::create_dir(p.with_extension("tmp")).unwrap();
+        assert!(b.complete_exit_with_profit("777", 0.5, 5.).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert!(b.read().is_empty());
+        assert_eq!(b.unresolved_exits().len(), 1);
+        assert_eq!(b.pending_skim_usd(), 0.);
+        std::fs::remove_dir(p.with_extension("tmp")).unwrap();
+        b.complete_exit_with_profit("777", 0.5, 5.).unwrap();
+        b.complete_exit_with_profit("777", 0.5, 5.).unwrap();
+        assert_eq!(b.read().len(), 1);
+        assert_eq!(b.read()[0].quantity, 1.5);
+        assert_eq!(b.pending_skim_usd(), 0.5);
+        assert!(b.unresolved_exits().is_empty());
+        assert!(b.complete_exit_with_profit("777", 0.6, 5.).is_err());
+        assert_eq!(b.read()[0].quantity, 1.5);
+    }
+
+    #[test]
+    fn authenticated_fees_upgrade_legacy_gross_cost_without_guessing_missing_fees() {
+        let p = path();
+        seed(&p);
+        let mut report = projection(1.99, vec![order(123, "555", "2", "-0.01", "100")]);
+        report["orders"][0]["quote_fee"] = json!("-1");
+        {
+            let b = PositionBook::open(&p, &report).unwrap();
+            assert!((b.read()[0].entry_price - 201. / 1.99).abs() < 1e-10);
+            assert_eq!(b.read()[0].quantity, 1.99);
+        }
+        let before = std::fs::read(&p).unwrap();
+        report["orders"][0].as_object_mut().unwrap().remove("quote_fee");
+        assert!(PositionBook::open(&p, &report).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn skim_is_usd_durable_idempotent_and_rejects_conflicting_terminal_profit() {
+        let p = path();
+        seed(&p);
+        let closed = projection(0., vec![
+            order(123, "555", "2", "0", "100"),
+            order(456, "777", "-2", "0", "110"),
+        ]);
+        {
+            let b = PositionBook::open(&p, &bought()).unwrap();
+            b.stage_exit_quantity_with_skim("777".into(), position(), 2., 10.).unwrap();
+            b.write().clear();
+            assert!(b.mark_exit_settled("777").is_err());
+            b.mark_exit_settled_with_profit("777", 20.).unwrap();
+            b.mark_exit_settled_with_profit("777", 20.).unwrap();
+            assert_eq!(b.pending_skim_usd(), 2.);
+            let before = std::fs::read(&p).unwrap();
+            assert!(b.mark_exit_settled_with_profit("777", 21.).is_err());
+            assert_eq!(std::fs::read(&p).unwrap(), before);
+            assert_eq!(b.pending_skim_usd(), 2.);
+        }
+        let b = PositionBook::open(&p, &closed).unwrap();
+        assert_eq!(b.pending_skim_usd(), 2.);
+        b.reconcile(&closed).unwrap();
+        assert_eq!(b.pending_skim_usd(), 2.);
+        assert!(b.read().is_empty());
+    }
+
+    #[test]
+    fn recovery_blocks_missing_net_profit_then_accepts_proven_partial_fill() {
+        let p = path();
+        seed(&p);
+        {
+            let b = PositionBook::open(&p, &bought()).unwrap();
+            b.stage_exit_quantity_with_skim("777".into(), position(), 1., 25.).unwrap();
+            b.write().clear(); // crash before terminal publication
+        }
+        let partial = projection(1.5, vec![
+            order(123, "555", "2", "0", "100"),
+            order(456, "777", "-0.5", "0", "110"),
+        ]);
+        let b = PositionBook::open(&p, &partial).unwrap();
+        assert_eq!(b.read()[0].quantity, 1.5);
+        let before = std::fs::read(&p).unwrap();
+        assert!(b.reconcile(&partial).unwrap_err().contains("profit unresolved"));
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert_eq!(b.unresolved_exits().len(), 1);
+        assert_eq!(b.pending_skim_usd(), 0.);
+        // External terminal resolver proves net profit (including fees), not ACK.
+        b.mark_exit_settled_with_profit("777", 4.8).unwrap();
+        b.reconcile(&partial).unwrap();
+        assert_eq!(b.pending_skim_usd(), 1.2);
+        assert_eq!(b.read()[0].quantity, 1.5);
+    }
+
+    #[test]
+    fn skim_persistence_failure_publishes_neither_settlement_nor_cash() {
+        let p = path();
+        seed(&p);
+        let b = PositionBook::open(&p, &bought()).unwrap();
+        b.stage_exit_quantity_with_skim("777".into(), position(), 2., 10.).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        std::fs::create_dir(p.with_extension("tmp")).unwrap();
+        assert!(b.mark_exit_settled_with_profit("777", 20.).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert_eq!(b.pending_skim_usd(), 0.);
+        assert_eq!(b.unresolved_exits().len(), 1);
+    }
+
+    #[test]
+    fn zero_and_loss_never_create_skim_and_invalid_inputs_preserve_journal() {
+        let p = path();
+        seed(&p);
+        let b = PositionBook::open(&p, &bought()).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        for pct in [f64::NAN, f64::INFINITY, -1., 101.] {
+            assert!(b.stage_exit_quantity_with_skim("777".into(), position(), 2., pct).is_err());
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        b.stage_exit_quantity_with_skim("777".into(), position(), 2., 100.).unwrap();
+        for pnl in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(b.mark_exit_settled_with_profit("777", pnl).is_err());
+        }
+        b.mark_exit_settled_with_profit("777", -20.).unwrap();
+        assert_eq!(b.pending_skim_usd(), 0.);
+        b.stage_exit_quantity_with_skim("778".into(), position(), 2., 100.).unwrap();
+        b.complete_confirmed_zero("778").unwrap();
+        assert_eq!(b.pending_skim_usd(), 0.);
+        assert!(b.unresolved_exits().is_empty());
+    }
+
+    #[test]
+    fn legacy_journal_migrates_without_inventing_historical_skim() {
+        let p = path();
+        seed(&p);
+        {
+            let b = PositionBook::open(&p, &bought()).unwrap();
+            b.stage_exit("777".into(), position()).unwrap();
+        }
+        let mut old: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        old["schema_version"] = json!(1);
+        old.as_object_mut().unwrap().remove("exit_skim_pct");
+        old.as_object_mut().unwrap().remove("skim_accruals");
+        std::fs::write(&p, serde_json::to_vec(&old).unwrap()).unwrap();
+        let closed = projection(0., vec![
+            order(123, "555", "2", "0", "100"),
+            order(456, "777", "-2", "0", "110"),
+        ]);
+        let b = PositionBook::open(&p, &closed).unwrap();
+        b.reconcile(&closed).unwrap();
+        assert_eq!(b.pending_skim_usd(), 0.);
+        let current: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(current["schema_version"], 2);
+        assert!(current["skim_accruals"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn skim_roundtrip_preserves_exact_persisted_decimal_bits() {
+        let decoded: SkimAccrual = serde_json::from_str(
+            r#"{"realized_pnl_usd":1.233801149999998,"reserved_usd":0.12338011499999979,"consumed_btc":0.000465}"#,
+        ).unwrap();
+        assert_eq!(decoded.realized_pnl_usd.to_bits(), 1.233801149999998_f64.to_bits());
+        assert_eq!(decoded.reserved_usd.to_bits(), 0.12338011499999979_f64.to_bits());
+        assert_eq!(decoded.reserved_usd, decoded.realized_pnl_usd * 0.1);
+    }
+
+    #[test]
+    fn skim_roundtrip_reopens_fractional_profit_without_changing_reserve() {
+        for pnl in [1.2438377999999943, 1.233801149999998, 0.32561403000000055,
+            0.019282850000003293, 0.03805200000000042, 0.04215617999999921,
+            0.027521999999997604, 0.01728165999999476, 0.018654999999995425] {
+            let p = path();
+            seed(&p);
+            let expected: f64 = pnl * 0.1;
+            {
+                let b = PositionBook::open(&p, &bought()).unwrap();
+                b.stage_exit_quantity_with_skim("777".into(), position(), 2., 10.).unwrap();
+                b.write().clear();
+                b.mark_exit_settled_with_profit("777", pnl).unwrap();
+                assert_eq!(b.pending_skim_usd().to_bits(), expected.to_bits());
+            }
+            let closed = projection(0., vec![
+                order(123, "555", "2", "0", "100"),
+                order(456, "777", "-2", "0", "110"),
+            ]);
+            for _ in 0..3 {
+                let b = PositionBook::open(&p, &closed).unwrap();
+                assert_eq!(b.pending_skim_usd().to_bits(), expected.to_bits());
+                assert!(b.read().is_empty());
+                b.reconcile(&closed).unwrap();
+                assert_eq!(b.pending_skim_usd().to_bits(), expected.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn skim_roundtrip_still_rejects_one_bit_forged_reserve_without_rewrite() {
+        let p = path();
+        seed(&p);
+        {
+            let b = PositionBook::open(&p, &bought()).unwrap();
+            b.stage_exit_quantity_with_skim("777".into(), position(), 2., 10.).unwrap();
+            b.mark_exit_settled_with_profit("777", 20.).unwrap();
+        }
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        value["skim_accruals"]["777"]["reserved_usd"] = json!(f64::from_bits(2.0_f64.to_bits() + 1));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(PositionBook::open(&p, &bought()).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+    }
+
+    #[test]
+    fn forged_skim_totals_are_rejected_without_rewriting_disk() {
+        let p = path();
+        seed(&p);
+        {
+            let b = PositionBook::open(&p, &bought()).unwrap();
+            b.stage_exit_quantity_with_skim("777".into(), position(), 2., 10.).unwrap();
+            b.mark_exit_settled_with_profit("777", 20.).unwrap();
+        }
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        value["skim_accruals"]["777"]["reserved_usd"] = json!(200.);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(PositionBook::open(&p, &bought()).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+    }
+
     #[test]
     fn captured_active_ack_pending_buy_recovers_and_completes_sell_lifecycle() {
         // Portable regression for the production ACTIVE ACK followed by a fill.
@@ -800,7 +1225,7 @@ mod tests {
             b.stage_intent(cid.into(), requested).unwrap();
         }
         let buy = json!({"order_id":order_id,"cid":cid,"exec_amount":"0.000043",
-            "base_fee":"0","entry_price":"77125","mts":fill_mts});
+            "base_fee":"0","quote_fee":"0","entry_price":"77125","mts":fill_mts});
         let mut filled = projection(qty, vec![buy.clone()]);
         filled["sync"]["cursor_ms"] = json!(fill_mts + 1000);
         {
@@ -831,7 +1256,7 @@ mod tests {
                 buy,
                 json!({
                     "order_id":order_id + 1,"cid":exit_cid,"exec_amount":"-0.000043",
-                    "base_fee":"0","entry_price":"77142","mts":fill_mts + 2000
+                    "base_fee":"0","quote_fee":"0","entry_price":"77142","mts":fill_mts + 2000
                 }),
             ],
         );
@@ -968,8 +1393,9 @@ mod tests {
             let positions = b.read();
             assert_eq!(positions.len(), 1);
             assert_eq!(positions[0].quantity, 1.49);
-            assert_eq!(positions[0].entry_price, 104.);
-            assert_eq!(positions[0].sl_price, 99.);
+            let net_cost = 1.5 * 104. / 1.49;
+            assert!((positions[0].entry_price - net_cost).abs() < 1e-10);
+            assert!((positions[0].sl_price - (net_cost - 5.)).abs() < 1e-10);
             assert!((positions[0].exposure_size - 0.0149).abs() < 1e-12);
         }
         drop(b);
@@ -1207,9 +1633,11 @@ mod tests {
         let positions = b.read();
         let pos = &positions[0];
         assert_eq!(pos.quantity, 1.49);
-        assert_eq!(pos.entry_price, 104.);
-        assert_eq!(pos.tp_price, 114.);
-        assert_eq!(pos.sl_price, 99.);
+        // The base-currency fee reduces received inventory, not the USD paid.
+        let net_cost = (1.5 * 104.) / 1.49;
+        assert!((pos.entry_price - net_cost).abs() < 1e-10);
+        assert!((pos.tp_price - (net_cost + 10.)).abs() < 1e-10);
+        assert!((pos.sl_price - (net_cost - 5.)).abs() < 1e-10);
         assert!((pos.exposure_size - 0.0149).abs() < 1e-12);
     }
     #[test]

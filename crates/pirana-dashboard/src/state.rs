@@ -1,5 +1,6 @@
 use pirana_core::types::*;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
@@ -32,6 +33,10 @@ pub struct DashboardState {
     pub volatility: Arc<parking_lot::RwLock<f64>>,
     /// Spread
     pub spread: Arc<parking_lot::RwLock<f64>>,
+    /// F04: Recent trade IDs for deduplication (retains last 1000 unique IDs)
+    pub trade_dedup_ids: Arc<parking_lot::Mutex<VecDeque<u64>>>,
+    /// F01: WebSocket channel registry (chanId → ChannelKind)
+    pub channel_registry: Arc<parking_lot::Mutex<pirana_core::ws_registry::ChannelRegistry>>,
     /// Recent trades (last 100)
     pub recent_trades: Arc<parking_lot::RwLock<Vec<TradeView>>>,
     /// Open orders
@@ -71,6 +76,8 @@ pub struct DashboardState {
     pub locked_btc_reserve: Arc<parking_lot::RwLock<f64>>,
     /// Monotonically increasing lifetime skimmed BTC counter (for institutional audits)
     pub lifetime_skimmed_btc: Arc<parking_lot::RwLock<f64>>,
+    /// Durable USD earmark; not BTC acquired or accumulated.
+    pub pending_skim_usd: Arc<parking_lot::RwLock<f64>>,
     /// Binance BTC/USDT price
     pub binance_btc_price: Arc<parking_lot::RwLock<f64>>,
     /// Coinbase BTC-USD price
@@ -91,6 +98,8 @@ pub struct DashboardState {
     pub market_regime: Arc<parking_lot::RwLock<String>>,
     /// VPIN status / adverse selection alert
     pub vpin_status: Arc<parking_lot::RwLock<String>>,
+    /// Whether market data feed is available (set false on idle timeout)
+    pub market_data_available: Arc<parking_lot::RwLock<bool>>,
     /// [CASLAV v5.1] Kalibrovany rizikovy stav (sebekalibrace)
     pub calibration: Arc<parking_lot::RwLock<CalibrationView>>,
     /// Avellaneda-Stoikov reservation price
@@ -271,6 +280,8 @@ pub struct DashboardSnapshot {
     pub starting_equity: f64,
     pub locked_btc_reserve: f64,
     pub lifetime_skimmed_btc: f64,
+    pub pending_skim_usd: f64,
+    pub market_data_available: bool,
     pub binance_btc_price: f64,
     pub coinbase_btc_price: f64,
     pub lead_lag_disparity_usd: f64,
@@ -318,6 +329,8 @@ impl DashboardState {
             ofi: Arc::new(parking_lot::RwLock::new(0.0)),
             volatility: Arc::new(parking_lot::RwLock::new(0.0)),
             spread: Arc::new(parking_lot::RwLock::new(0.0)),
+            trade_dedup_ids: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(1000))),
+            channel_registry: Arc::new(parking_lot::Mutex::new(pirana_core::ws_registry::ChannelRegistry::new())),
             recent_trades: Arc::new(parking_lot::RwLock::new(Vec::new())),
             open_orders: Arc::new(parking_lot::RwLock::new(Vec::new())),
             recent_signals: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -342,6 +355,7 @@ impl DashboardState {
             starting_equity: Arc::new(parking_lot::RwLock::new(0.0)),
             locked_btc_reserve: Arc::new(parking_lot::RwLock::new(0.0)),
             lifetime_skimmed_btc: Arc::new(parking_lot::RwLock::new(0.0)),
+            pending_skim_usd: Arc::new(parking_lot::RwLock::new(0.0)),
             binance_btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
             coinbase_btc_price: Arc::new(parking_lot::RwLock::new(0.0)),
             lead_lag_disparity_usd: Arc::new(parking_lot::RwLock::new(0.0)),
@@ -352,6 +366,7 @@ impl DashboardState {
             vpin_score: Arc::new(parking_lot::RwLock::new(0.0)),
             market_regime: Arc::new(parking_lot::RwLock::new(String::new())),
             vpin_status: Arc::new(parking_lot::RwLock::new("Low Toxicity / Initializing".to_string())),
+            market_data_available: Arc::new(parking_lot::RwLock::new(false)),
             calibration: Arc::new(parking_lot::RwLock::new(CalibrationView::default())),
             reservation_price: Arc::new(parking_lot::RwLock::new(0.0)),
             as_spread_skew: Arc::new(parking_lot::RwLock::new(0.0)),
@@ -403,6 +418,8 @@ impl DashboardState {
             starting_equity: *self.starting_equity.read(),
             locked_btc_reserve: *self.locked_btc_reserve.read(),
             lifetime_skimmed_btc: *self.lifetime_skimmed_btc.read(),
+            pending_skim_usd: *self.pending_skim_usd.read(),
+            market_data_available: *self.market_data_available.read(),
             binance_btc_price: *self.binance_btc_price.read(),
             coinbase_btc_price: *self.coinbase_btc_price.read(),
             lead_lag_disparity_usd: *self.lead_lag_disparity_usd.read(),
@@ -468,6 +485,11 @@ impl DashboardState {
         if history.len() > 500 {
             history.remove(0);
         }
+    }
+
+    /// Set market data availability flag (false on idle timeout)
+    pub fn set_market_data_available(&self, available: bool) {
+        *self.market_data_available.write() = available;
     }
 }
 

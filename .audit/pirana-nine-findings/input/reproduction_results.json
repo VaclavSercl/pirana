@@ -1,0 +1,94 @@
+{
+  "repository": "VaclavSercl/pirana",
+  "commit": "dc613f41d1402577b49fd44928c92b1ef546146a",
+  "method": "Python reduced reproductions and deterministic event models; not native Rust tests",
+  "network_used": false,
+  "native_engine_run": false,
+  "tests_run": 9,
+  "reproductions_confirmed": true,
+  "findings": {
+    "01": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L1575-L1608",
+      "observed": {
+        "best_bid": 401597393.0,
+        "expected_bid_before_trade_snapshot": 7244.8,
+        "corrupted_level_survives_increment": true
+      }
+    },
+    "02": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L1380-L1455",
+      "observed": {
+        "trigger_allowed": true,
+        "submitted_type": "EXCHANGE MARKET",
+        "hypothetical_fill": 99980.0,
+        "pnl_usd": -0.2
+      }
+    },
+    "03": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L1730-L1818",
+      "observed": {
+        "received_sell_events": 20,
+        "ofi_updates": 20,
+        "flow_updates": 0,
+        "hawkes_updates": 0,
+        "vpin_updates": 0
+      }
+    },
+    "04": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L1680-L1818",
+      "observed": {
+        "unique_trade_ids": 1,
+        "flow_updates": 2,
+        "counted_volume_btc": 0.01,
+        "true_unique_volume_btc": 0.005
+      }
+    },
+    "05": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L1000-L1055",
+      "observed": {
+        "virtual_seconds_without_messages": 120,
+        "timeout_fired": false,
+        "watchdog_notifications": 24,
+        "note": "Deterministický model plánování; nikoli spuštění Tokio runtime."
+      }
+    },
+    "06": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L1630-L1720",
+      "observed": {
+        "dashboard_kappa": 0.3,
+        "quote_kappa": 1.5,
+        "actual_half_spread": 5.645385211375712,
+        "half_spread_with_dynamic_kappa": 7.87682072451781
+      }
+    },
+    "07": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L1430-L1500",
+      "observed": {
+        "wallet_btc_after_sale": 0.0,
+        "booked_locked_btc": 9.99000999000999e-07,
+        "realized_profit_usd": 1.0,
+        "active_after_reconciliation": 0.0,
+        "lifetime_skimmed_still_btc": 9.99000999000999e-07
+      }
+    },
+    "08": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/src/main.rs#L805-L815",
+      "observed": {
+        "actual_executions": 0,
+        "wallet_responses": 10,
+        "discarded_responses": 10,
+        "note": "Konkrétní možné pořadí událostí; četnost na serveru nebyla měřena."
+      }
+    },
+    "09": {
+      "source": "https://github.com/VaclavSercl/pirana/blob/dc613f41d1402577b49fd44928c92b1ef546146a/crates/pirana-core/src/order_book.rs#L104-L137",
+      "observed": {
+        "requested_btc": 0.01,
+        "available_btc": 0.001,
+        "returned_vwap": 100000.0,
+        "uncovered_quantity_btc": 0.009000000000000001,
+        "note": "Nejde o chybný skutečný fill; chyba je nerozlišené částečné pokrytí v odhadu."
+      }
+    }
+  }
+}
