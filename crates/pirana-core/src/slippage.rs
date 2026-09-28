@@ -41,9 +41,8 @@ pub enum SlippageDecision {
 ///
 /// `expected_fill_vwap` je VWAP ceny, které by market order reálně zaplatil
 /// (pro BUY: průchod ask stranou knihy; pro SELL: bid stranou).
-/// Když VWAP není k dispozici (prázdná kniha), guard je konzervativní
-/// a exekuci povolí — chybějící data nesmí zablokovat obchod (fail-open
-/// na straně exekuce, telemetrie zaznamená, že VWAP nebyl).
+/// Missing/invalid depth or signal data blocks execution. `Skip` uses finite
+/// f64::MAX bps and price 0 for unavailable evidence, never a fabricated quote.
 #[derive(Debug, Clone)]
 pub struct SlippageGuard {
     /// Maximální tolerovaný slippage v bps vůči signální ceně.
@@ -53,7 +52,7 @@ pub struct SlippageGuard {
 impl SlippageGuard {
     pub fn new(max_slippage_bps: f64) -> Self {
         Self {
-            max_slippage_bps: max_slippage_bps.max(0.0),
+            max_slippage_bps,
         }
     }
 
@@ -72,22 +71,19 @@ impl SlippageGuard {
         signal_price: f64,
         expected_fill_vwap: Option<f64>,
     ) -> SlippageDecision {
+        let unavailable = SlippageDecision::Skip {
+            slippage_bps: f64::MAX,
+            expected_fill_price: 0.0,
+        };
+        if !signal_price.is_finite() || signal_price <= 0.0
+            || !self.max_slippage_bps.is_finite() || self.max_slippage_bps < 0.0
+        {
+            return unavailable;
+        }
         let vwap = match expected_fill_vwap {
             Some(v) if v.is_finite() && v > 0.0 => v,
-            // Bez dat o knize neblokujeme — market order na BTC/USD
-            // s pozicí ~0,001 BTC má zanedbatelný impact.
-            _ => {
-                return SlippageDecision::Execute {
-                    expected_fill_price: signal_price,
-                }
-            }
+            _ => return unavailable,
         };
-
-        if !signal_price.is_finite() || signal_price <= 0.0 {
-            return SlippageDecision::Execute {
-                expected_fill_price: vwap,
-            };
-        }
 
         // Kladný slippage = zhoršení (BUY platí víc, SELL dostává míň).
         let slippage = match side {
@@ -96,6 +92,9 @@ impl SlippageGuard {
         };
         let slippage_bps = (slippage / signal_price) / BPS;
 
+        if !slippage_bps.is_finite() {
+            return unavailable;
+        }
         if slippage_bps > self.max_slippage_bps {
             SlippageDecision::Skip {
                 slippage_bps,
@@ -239,13 +238,22 @@ mod tests {
     }
 
     #[test]
-    fn guard_fails_open_without_vwap() {
-        // Prázdná kniha nesmí blokovat obchod.
+    fn guard_blocks_missing_invalid_or_insufficient_depth() {
         let g = SlippageGuard::new(5.0);
-        let d = g.check(Side::Buy, 80_000.0, None);
-        assert!(matches!(d, SlippageDecision::Execute { .. }));
-        let d = g.check(Side::Buy, 80_000.0, Some(f64::NAN));
-        assert!(matches!(d, SlippageDecision::Execute { .. }));
+        for side in [Side::Buy, Side::Sell] {
+            for price in [None, Some(f64::NAN), Some(f64::INFINITY), Some(0.0), Some(-1.0)] {
+                assert!(matches!(g.check(side, 80_000.0, price), SlippageDecision::Skip { .. }));
+            }
+            for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert!(matches!(g.check(side, bad, Some(80_000.0)), SlippageDecision::Skip { .. }));
+            }
+        }
+        let mut book = crate::order_book::OrderBook::new(crate::types::Symbol::new("tBTCUSD"), 0.01);
+        book.update_level(Side::Sell, 80_000.0, 0.1, 1);
+        assert!(matches!(g.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)), SlippageDecision::Skip { .. }));
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(SlippageGuard::new(bad).check(Side::Buy, 80_000.0, Some(80_000.0)), SlippageDecision::Skip { .. }));
+        }
     }
 
     #[test]
@@ -315,4 +323,32 @@ mod tests {
         }
         assert_eq!(t.sample_count(), 500);
     }
+    // Server regression retained, adapted to strict depth evidence. The old
+    // expectation that a partial quote must execute contradicted F09/A05.
+    #[test]
+    fn guard_uses_depth_price_and_rejects_partial_coverage() {
+        let guard = SlippageGuard::new(5.0);
+        let mut book = crate::order_book::OrderBook::new(crate::types::Symbol::new("tBTCUSD"), 0.01);
+        book.update_level(Side::Sell, 80_016.0, 1.0, 1);
+        assert_eq!(guard.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)),
+            SlippageDecision::Execute { expected_fill_price: 80_016.0 });
+        book.clear();
+        book.update_level(Side::Sell, 80_080.0, 1.0, 1);
+        match guard.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)) {
+            SlippageDecision::Skip { expected_fill_price, slippage_bps } => {
+                assert_eq!(expected_fill_price, 80_080.0);
+                assert!((slippage_bps - 10.0).abs() < 0.01);
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        book.clear();
+        book.update_level(Side::Sell, 80_016.0, 0.5, 1);
+        let quote = book.depth_quote(Side::Buy, 1.0, None).unwrap();
+        assert_eq!(quote.vwap, Some(80_016.0));
+        assert_eq!(quote.covered_quantity, 0.5);
+        assert!(!quote.fully_covered);
+        assert!(matches!(guard.check(Side::Buy, 80_000.0, book.vwap(Side::Buy, 1.0)),
+            SlippageDecision::Skip { .. }));
+    }
+
 }

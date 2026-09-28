@@ -46,6 +46,7 @@
 
 pub mod adaptive_baseline;
 pub mod engine;
+pub mod equity_risk;
 pub mod ledger_persistence;
 pub mod limits;
 pub mod persistence;

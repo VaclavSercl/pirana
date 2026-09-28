@@ -1,59 +1,27 @@
-//! # CASLAV DOCTOR — živá diagnostika obchodování + auto-fix
+//! CASLAV DOCTOR — diagnostics with fail-closed recovery escalation.
 //!
-//! [ROZHODNUTÍ OPERÁTORA 26. 8. 2026] „Doctor má hlídat, jestli systém
-//! obchoduje. Pokud ne, musí odhalit PROČ neobchoduje — jestli je panika
-//! na trhu, nebo chyba v systému. A chybu musí odstranit."
-//!
-//! ## Diagnostický řetězec
-//!
-//! | # | Kontrola | Selhání = |
-//! |---|---|---|
-//! | 1 | služba běží | 🔴 SYSTEM — restart |
-//! | 2 | API odpovídá | 🔴 SYSTEM — restart |
-//! | 3 | WS feed živý (btc_price > 0) | 🔴 SYSTEM — restart |
-//! | 4 | poslední obchod < 2 h (z recent_trades) | jinak diagnostika |
-//! | 5 | režim Active / Defensive(cooldown) / Halted | klasifikace |
-//! | 6 | trh: VPIN toxic + spread normal = MARKET-NORMAL | 🟢 konec |
-//! | 7 | journal: 502/503 maintenance, WS disconnect, panic | 🔴 SYSTEM |
-//! | 8 | journal: nonce ≥5, API err ≥5, rate limit | klasifikace |
-//! | 9 | bez příčiny → NEOVĚŘENO (stav ve doctor_state.json) | alert > 4 h |
-//!
-//! ## Auto-fix s circuit breakerem
-//!
-//! Max **2 restarty za 2 h** (perzistentní čítač). Překročení → HALT
-//! auto-fixu + alert operátorovi. Restart flapping při výpadku burzy
-//! tímto eliminován (nález oponentury P0).
-//!
-//! ## Selftest (offline)
-//!
-//! Integrační testy proti reálným typům: baseline fuzz, LKG, JSONL,
-//! VWAP sémantika, persistence round-trip, snapshot schema parity.
+//! Runtime health, trading activity and restart safety are distinct evidence.
+//! The snapshot has no authoritative fill history or exchange order/recovery
+//! attestation. Doctor therefore reports activity as unverified and escalates
+//! faults without restarting the trader. Recovery requires fresh order and
+//! position reconciliation plus a rollback plan outside this diagnostic tool.
+//! Historical journal errors are evidence for investigation, not restart proof.
 
-use std::fs;
 use std::process::Command;
-use std::time::Duration;
 
-/// Perzistentní stav doctoru (circuit breaker + 4h ticho tracker).
-const DOCTOR_STATE: &str = "/var/run/caslav/doctor_state.json";
-
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-struct DoctorState {
-    /// Timestampy restartů za posledních 2 h (circuit breaker).
-    restarts: Vec<i64>,
-    /// Kdy doctor poprvé zaznamenal nevyjasněné ticho (0 = žádné).
-    silence_since: i64,
-}
+const API_SNAPSHOT: &str = "http://127.0.0.1:8080/api/snapshot";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("check");
-
-    match mode {
-        "check" | "trading-check" => trading_check(),
+    match args.get(1).map(String::as_str).unwrap_or("check") {
+        "check" | "trading-check" => {
+            if trading_check().is_err() {
+                std::process::exit(2);
+            }
+        }
         "selftest" => selftest(),
         "--help" | "-h" | "help" => print_help(),
-        other => {
-            eprintln!("Neznámý mód: {other}");
+        _ => {
             print_help();
             std::process::exit(2);
         }
@@ -61,358 +29,175 @@ fn main() {
 }
 
 fn print_help() {
-    println!("caslav-doctor — živá diagnostika PIRANA");
-    println!();
-    println!("  check | trading-check   Živá kontrola obchodování + auto-fix (default)");
-    println!("  selftest               Offline integrační testy");
+    println!(
+        "caslav-doctor: check | trading-check — diagnostika; restart vyžaduje ověřenou obnovu"
+    );
+    println!("selftest — integrační testy včetně živé kontroly schématu API");
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  ŽIVÁ DIAGNOSTIKA
-// ═══════════════════════════════════════════════════════════════════
-
-const API_SNAPSHOT: &str = "http://127.0.0.1:8080/api/snapshot";
-
-#[derive(Debug, Default)]
+#[derive(Debug, serde::Deserialize)]
 struct Snapshot {
-    mode: String,
-    trades_today: u64,
-    last_trade_ts: i64,
+    system_mode: String,
+    market_data_available: bool,
     btc_price: f64,
-    ofi: f64,
-    spread: f64,
-    vpin_score: f64,
-    consecutive_losses: u32,
-    uptime_secs: u64,
+    uptime_seconds: u64,
+    execution_block_reason: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum FeedAssessment {
-    ReconciliationRequired,
-    RestartRequired,
+enum Health {
     Live,
+    Protected,
+    Unavailable,
+    Unknown,
 }
 
-fn assess_feed(mode: &str, btc_price: f64) -> FeedAssessment {
-    // Recovery halts intentionally precede feed startup. Restarting cannot
-    // reconcile the ledger and would obscure the reason for the safe halt.
-    if mode == "Halted" {
-        FeedAssessment::ReconciliationRequired
-    } else if btc_price <= 0.0 {
-        FeedAssessment::RestartRequired
-    } else {
-        FeedAssessment::Live
+fn assess_health(snap: &Snapshot) -> Health {
+    if snap.execution_block_reason.is_some()
+        || matches!(snap.system_mode.as_str(), "Halted" | "Defensive")
+    {
+        return Health::Protected;
     }
+    if snap.system_mode != "Active" {
+        return Health::Unknown;
+    }
+    if !snap.market_data_available || !snap.btc_price.is_finite() || snap.btc_price <= 0.0 {
+        return Health::Unavailable;
+    }
+    Health::Live
 }
 
-fn trading_check() {
-    println!("🔍 CASLAV DOCTOR — kontrola obchodování");
-    println!("{}", "─".repeat(50));
-
-    let state = load_state();
-
-    // 1. Služba běží?
-    if !systemctl_active("pirana.service") {
-        println!("🔴 [1/9] pirana.service NEBĚŽÍ");
-        auto_fix_restart("služba mrtvá", state);
-        return;
+fn parse_snapshot(bytes: &[u8]) -> Result<Snapshot, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| "neplatný JSON snapshotu".to_owned())?;
+    // Option alone would silently accept a removed schema field as unblocked.
+    if value.get("execution_block_reason").is_none() {
+        return Err("chybí execution_block_reason".into());
     }
-    println!("✅ [1/9] pirana.service active");
-
-    // 2. API odpovídá?
-    let snap = match fetch_snapshot() {
-        Some(s) => s,
-        None => {
-            println!("🔴 [2/9] API /api/snapshot neodpovídá");
-            auto_fix_restart("API mrtvé", state);
-            return;
-        }
-    };
-    println!("✅ [2/9] API odpovídá (uptime {} min)", snap.uptime_secs / 60);
-
-    // 3. Respect an explicit safety halt before diagnosing a missing feed.
-    match assess_feed(&snap.mode, snap.btc_price) {
-        FeedAssessment::ReconciliationRequired => {
-            println!("🔴 [3/9] Režim HALTED — vyžaduje kontrolu a reconciliaci");
-            alert_operator("HALTED", "systém v Halted — kontrola a reconciliace nutná");
-            return;
-        }
-        FeedAssessment::RestartRequired => {
-            println!("🔴 [3/9] btc_price <= 0 — WS feed mrtvý");
-            auto_fix_restart("WS feed mrtvý", state);
-            return;
-        }
-        FeedAssessment::Live => {
-            println!("✅ [3/9] WS feed živý (BTC {:.0} USD)", snap.btc_price);
-        }
-    }
-
-    // 4. Obchody — poslední z recent_trades (ne indikátor, reálná data)
-    let now = chrono::Utc::now().timestamp();
-    let mins_since_trade = if snap.last_trade_ts > 0 {
-        (now - snap.last_trade_ts) / 60
-    } else {
-        -1
-    };
-    if snap.trades_today > 0 && mins_since_trade >= 0 && mins_since_trade < 120 {
-        println!(
-            "✅ [4/9] Obchoduje: {} dnes, poslední před {} min",
-            snap.trades_today, mins_since_trade
-        );
-        let mut s = state;
-        s.silence_since = 0; // obchoduje → reset ticha
-        save_state(&s);
-        println!();
-        println!("🟢 ZDRAVÝ — systém aktivně obchoduje.");
-        return;
-    }
-    println!(
-        "⚠️ [4/9] Ticho: {} obchodů dnes, poslední před {} min — diagnostikuji příčinu",
-        snap.trades_today,
-        if mins_since_trade >= 0 {
-            mins_since_trade.to_string()
-        } else {
-            "neznámo".into()
-        }
-    );
-
-    // 5. Režim
-    let mut state = state;
-    match snap.mode.as_str() {
-        "Active" => println!("✅ [5/9] Režim Active"),
-        "Defensive" => {
-            println!(
-                "⚠️ [5/9] Režim Defensive ({} ztrát v řadě)",
-                snap.consecutive_losses
-            );
-            if snap.uptime_secs > 7200 {
-                println!("🔴 Defensive > 2 h uptime — podezření na stuck cooldown");
-                auto_fix_restart("stuck Defensive", state);
-                return;
-            }
-            println!("   → legitimní ochrana po ztrátové sérii (cooldown ~15 min)");
-        }
-        other => println!("⚠️ [5/9] Neznámý režim: {other}"),
-    }
-
-    // 6. Trh: toxicita + spread. [OPONENTURA] OFI ≈ 0 NENÍ omluvenka —
-    // vypadlé tickery vypadají stejně. Rozhoduje VPIN (toxicita) a spread
-    // (panika = široký spread). Toxicita + normální spread = čekání OK.
-    let vpin_toxic = snap.vpin_score > 0.65; // seed práh; kalibrace ho upřesní
-    let spread_panicky = snap.spread > 30.0; // USD; normál ~5-15
-    if vpin_toxic || spread_panicky {
-        let reason = if vpin_toxic && spread_panicky {
-            format!(
-                "panika na trhu (VPIN {:.2} > 0.65, spread ${:.0})",
-                snap.vpin_score, snap.spread
-            )
-        } else if vpin_toxic {
-            format!("toxický tok (VPIN {:.2} > 0.65)", snap.vpin_score)
-        } else {
-            format!("panika: spread ${:.0} (normál ~$5-15)", snap.spread)
-        };
-        println!("🟢 [6/9] MARKET-NORMAL: {reason}");
-        state.silence_since = 0; // legitimní ticho, ne bug
-        save_state(&state);
-        println!();
-        println!("🟢 ZDRAVÝ — ticho je správná reakce na trh.");
-        return;
-    }
-    println!(
-        "✅ [6/9] Trh bez paniky (VPIN {:.2}, spread ${:.0}) — hledám chybu v systému",
-        snap.vpin_score, snap.spread
-    );
-
-    // 7. Journal: infrastruktura (maintenance, WS, panic)
-    // [FIX false positive] Holé "502"/"503" se matchuje na časová razítka
-    // (např. 1787750503 obsahuje "503")! Patterny musí být kontextové.
-    let ws_errors = count_journal(&["WebSocket closed", "Connection reset", "tungstenite"], 10);
-    let maintenance = count_journal(
-        &["502 Bad Gateway", "503 Service", "temporarily unavailable", "maintenance mode"],
-        10,
-    );
-    let panics = count_journal(&["panicked at", "fatal runtime error"], 10);
-    if ws_errors >= 3 || maintenance >= 3 || panics >= 1 {
-        println!(
-            "🔴 [7/9] Infra chyby: ws={ws_errors}, maintenance={maintenance}, panic={panics}"
-        );
-        auto_fix_restart("infra chyby v logu", state);
-        return;
-    }
-    println!("✅ [7/9] Žádné infra chyby (ws/maintenance/panic)");
-
-    // 8. Journal: obchodní chyby
-    let nonce_errors = count_journal(&["nonce: small"], 10);
-    let api_errors = count_journal(&["Order rejected"], 10);
-    let rate_limit = count_journal(&["429", "rate limit"], 10);
-    if nonce_errors >= 5 {
-        println!("🔴 [8/9] {nonce_errors}× 'nonce: small' za 10 min");
-        auto_fix_restart("nonce kolize", state);
-        return;
-    }
-    if api_errors >= 5 {
-        println!("🔴 [8/9] {api_errors}× API odmítnutí za 10 min");
-        alert_operator(
-            "API-ERRORS",
-            &format!("{api_errors} odmítnutých orderů — kontrola logů"),
-        );
-        return;
-    }
-    println!(
-        "✅ [8/9] Obchodní chyby v normě (nonce={nonce_errors}, api={api_errors}, rl={rate_limit})"
-    );
-
-    // 9. Nevyjasněné ticho — sledovat ve stavu, alert po 4 h
-    println!("ℹ️ [9/9] Ticho bez jasné příčiny — tracking");
-    if state.silence_since == 0 {
-        state.silence_since = now;
-        save_state(&state);
-        println!("   → zahájeno sledování ticha");
-    } else {
-        let silent_h = (now - state.silence_since) / 3600;
-        if silent_h >= 4 {
-            println!("🔴 Ticho trvá {silent_h} h bez příčiny — alert");
-            alert_operator(
-                "UNEXPLAINED-SILENCE",
-                &format!("{silent_h} h bez obchodu bez tržní příčiny — pátrání nutné"),
-            );
-            state.silence_since = now; // re-alert každých 4 h
-            save_state(&state);
-        } else {
-            println!("   → ticho sledováno {} h (alert při 4 h)", silent_h);
-            save_state(&state);
-        }
-    }
+    serde_json::from_value(value).map_err(|_| "neúplné nebo neplatné schéma snapshotu".into())
 }
 
-// ── pomocné ──────────────────────────────────────────────────────
-
-fn systemctl_active(unit: &str) -> bool {
-    Command::new("systemctl")
-        .args(["is-active", unit])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn fetch_snapshot() -> Option<Snapshot> {
+fn fetch_snapshot() -> Result<Snapshot, String> {
     let output = Command::new("curl")
-        .args(["-s", "--max-time", "5", API_SNAPSHOT])
+        .args(["--fail", "--silent", "--max-time", "5", API_SNAPSHOT])
         .output()
-        .ok()?;
+        .map_err(|_| "nelze spustit kontrolu API".to_owned())?;
+    if !output.status.success() {
+        return Err("API požadavek selhal".into());
+    }
+    parse_snapshot(&output.stdout)
+}
+
+fn matching_lines(text: &str, patterns: &[&str]) -> usize {
+    text.lines()
+        .filter(|line| patterns.iter().any(|p| line.contains(p)))
+        .count()
+}
+
+#[derive(Debug, Default)]
+struct JournalCounts {
+    ws: usize,
+    maintenance: usize,
+    panics: usize,
+    nonce: usize,
+    rejected: usize,
+    rate_limit: usize,
+}
+
+impl JournalCounts {
+    fn needs_review(&self) -> bool {
+        self.panics > 0 || self.nonce >= 5 || self.rejected >= 5
+    }
+}
+
+fn journal_counts() -> Result<JournalCounts, String> {
+    let output = Command::new("journalctl")
+        .args([
+            "-u",
+            "pirana.service",
+            "--since",
+            "-10min",
+            "--no-pager",
+            "-q",
+        ])
+        .output()
+        .map_err(|_| "journal nedostupný".to_owned())?;
+    if !output.status.success() {
+        return Err("čtení journalu selhalo".into());
+    }
     let text = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-
-    // Poslední trade z recent_trades (reálná data, ne indikátor).
-    let last_ts = v
-        .get("recent_trades")
-        .and_then(|t| t.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .filter_map(|t| t.get("ts").and_then(|x| x.as_i64()))
-                .max()
-        })
-        .unwrap_or(0);
-
-    Some(Snapshot {
-        mode: v.get("system_mode")?.as_str()?.to_string(),
-        trades_today: v.get("trades_today").and_then(|x| x.as_u64()).unwrap_or(0),
-        last_trade_ts: last_ts,
-        btc_price: v.get("btc_price").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        ofi: v.get("ofi").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        spread: v.get("spread").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        vpin_score: v.get("vpin_score").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        consecutive_losses: v
-            .get("consecutive_losses")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        uptime_secs: v.get("uptime_seconds").and_then(|x| x.as_u64()).unwrap_or(0),
+    Ok(JournalCounts {
+        ws: matching_lines(&text, &["WebSocket closed", "Connection reset", "tungstenite"]),
+        maintenance: matching_lines(&text, &["502 Bad Gateway", "503 Service", "temporarily unavailable", "maintenance mode"]),
+        panics: matching_lines(&text, &["panicked at", "fatal runtime error"]),
+        nonce: matching_lines(&text, &["nonce: small"]),
+        rejected: matching_lines(&text, &["Order rejected"]),
+        rate_limit: matching_lines(&text, &["rate limit", "HTTP 429"]),
     })
 }
 
-fn count_journal(patterns: &[&str], minutes: u32) -> usize {
-    let since = format!("-{}min", minutes);
-    let output = Command::new("journalctl")
-        .args(["-u", "pirana.service", "--since", &since, "--no-pager"])
+fn recovery_blocked(reason: &str) -> Result<(), ()> {
+    alert_operator("BLOCKED", reason);
+    println!(
+        "Restart neproveden: chybí aktuální ověření příkazů na burze, obnovy pozic a plán návratu."
+    );
+    Err(())
+}
+
+fn trading_check() -> Result<(), ()> {
+    println!("CASLAV DOCTOR — provozní diagnostika");
+    let active = Command::new("systemctl")
+        .args(["is-active", "pirana.service"])
         .output();
-    match output {
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            patterns.iter().map(|p| text.matches(p).count()).sum()
+    match active {
+        Ok(output) if output.status.success() => (),
+        _ => {
+            return recovery_blocked("Služba není potvrzena jako active; nutná diagnostika obnovy")
         }
-        Err(_) => 0,
     }
-}
-
-// ── stav + circuit breaker ──────────────────────────────────────
-
-fn load_state() -> DoctorState {
-    fs::read_to_string(DOCTOR_STATE)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_state(state: &DoctorState) {
-    // /var/run je tmpfs — po rebootu se čistí, což je správně
-    // (circuit breaker se resetuje spolu se systémem).
-    if let Some(parent) = std::path::Path::new(DOCTOR_STATE).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(state) {
-        let _ = fs::write(DOCTOR_STATE, json);
-    }
-}
-
-/// Circuit breaker: max 2 restarty za 2 h. Překročení → jen alert.
-fn auto_fix_restart(reason: &str, mut state: DoctorState) {
-    println!();
-    let now = chrono::Utc::now().timestamp();
-    // vyčistit starší než 2 h
-    state.restarts.retain(|t| now - *t < 7200);
-
-    if state.restarts.len() >= 2 {
-        println!(
-            "🛑 CIRCUIT BREAKER: {} restartů za 2 h — další restart zakázán",
-            state.restarts.len()
-        );
-        alert_operator(
-            "CIRCUIT-BREAKER",
-            &format!("restart({reason}) odmítnut — opakující se selhání, ruční zásah nutný"),
-        );
-        return;
-    }
-
-    println!("🔧 AUTO-FIX: restart pirana.service (důvod: {reason})");
-    let ok = Command::new("sudo")
-        .args(["-n", "systemctl", "restart", "pirana.service"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if ok {
-        state.restarts.push(now);
-        save_state(&state);
-        println!("✅ Restart proveden. Ověřím za 20 s…");
-        std::thread::sleep(Duration::from_secs(20));
-        if systemctl_active("pirana.service") {
-            println!("✅ Služba opět aktivní.");
-            alert_operator("AUTO-FIX", &format!("restart({reason}) — služba obnovena"));
-        } else {
-            println!("🔴 Restart nepomohl — eskalace!");
-            alert_operator("AUTO-FIX-FAILED", &format!("restart({reason}) selhal"));
+    let snap = match fetch_snapshot() {
+        Ok(snap) => snap,
+        Err(_) => return recovery_blocked("Snapshot nedostupný nebo neplatný; stav NEOVĚŘENO"),
+    };
+    println!("Uptime {} min; obchodní aktivita NEOVĚŘENO — snapshot neobsahuje kanonickou historii plnění.", snap.uptime_seconds / 60);
+    match assess_health(&snap) {
+        Health::Protected => return recovery_blocked(
+            "Ochranný režim nebo blokace exekuce; zachovat ochrany a ověřit účetní synchronizaci",
+        ),
+        Health::Unavailable => {
+            return recovery_blocked(
+                "Tržní data nejsou dostupná; samotná poslední cena není důkaz živého spojení",
+            )
         }
-    } else {
-        println!("🔴 Restart selhal (sudo?) — eskalace!");
-        alert_operator("AUTO-FIX-FAILED", &format!("restart({reason}) nelze provést"));
+        Health::Unknown => {
+            return recovery_blocked(
+                "Režim není Active; inicializace ani stáří procesu neopravňují k restartu",
+            )
+        }
+        Health::Live => println!(
+            "Active; runtime hlásí dostupná tržní data, BTC {:.0} USD.",
+            snap.btc_price
+        ),
+    }
+    match journal_counts() {
+        Ok(counts) => {
+            println!("Události za 10 min: WS={}, maintenance={}, panic={}, nonce={}, rejected={}, rate_limit={}.",
+                counts.ws, counts.maintenance, counts.panics, counts.nonce, counts.rejected, counts.rate_limit);
+            if counts.needs_review() {
+                return recovery_blocked("Journal obsahuje chyby vyžadující kontrolu; živý runtime se automaticky nerestartuje");
+            }
+            if counts.ws > 0 || counts.maintenance > 0 {
+                println!("Runtime nyní hlásí dostupná data; historické výpadky nejsou důvodem k restartu.");
+            }
+            Ok(())
+        }
+        Err(_) => recovery_blocked("Journal nelze ověřit; počet chyb NEOVĚŘENO"),
     }
 }
 
 fn alert_operator(severity: &str, msg: &str) {
-    println!();
-    println!("🚨 [{severity}] {msg}");
-    // Telegram alert s timeoutem — blokování doctoru není možné.
-    let _ = Command::new("timeout")
+    println!("[{severity}] {msg}");
+    let result = Command::new("timeout")
         .args([
             "15",
             "python3",
@@ -420,6 +205,9 @@ fn alert_operator(severity: &str, msg: &str) {
             &format!("[{severity}] caslav-doctor: {msg}"),
         ])
         .output();
+    if !result.is_ok_and(|output| output.status.success()) {
+        eprintln!("BLOCKED: doručení upozornění nepotvrzeno; viz lokální journal.");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -612,11 +400,11 @@ fn test_vwap_taker_semantics() -> Result<(), String> {
 
     let buy_vwap = book.vwap(Side::Buy, 1.0).ok_or("VWAP Buy vrátil None")?;
     if (buy_vwap - 60_010.0).abs() > 1e-9 {
-        return Err(format!("taker BUY VWAP = {buy_vwap}, očekáváno ask 60_010 (strany prohozené?)"));
+        return Err(format!("taker BUY VWAP = {}, očekáváno ask 60_010 (strany prohozené?)", buy_vwap));
     }
     let sell_vwap = book.vwap(Side::Sell, 1.0).ok_or("VWAP Sell vrátil None")?;
     if (sell_vwap - 60_000.0).abs() > 1e-9 {
-        return Err(format!("taker SELL VWAP = {sell_vwap}, očekáváno bid 60_000"));
+        return Err(format!("taker SELL VWAP = {}, očekáváno bid 60_000", sell_vwap));
     }
     Ok(())
 }
@@ -650,72 +438,106 @@ fn test_persistence_roundtrip() -> Result<(), String> {
     Ok(())
 }
 
-/// [OPONENTURA] Schema parity: doctor musí číst pole, která API reálně
-/// publikuje. Když dashboard přejmenuje klíč, selftest to odhalí dřív,
-/// než doctor v produkci tiše použije výchozí hodnoty.
+/// Live schema check uses the same strict parser as diagnostics.
 fn test_snapshot_schema_parity() -> Result<(), String> {
-    let output = Command::new("curl")
-        .args(["-s", "--max-time", "5", API_SNAPSHOT])
-        .output()
-        .map_err(|e| format!("curl selhal: {e}"))?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    if text.trim().is_empty() {
-        return Err("API neodpovídá — parity test vyžaduje běžící službu".into());
-    }
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("snapshot není JSON: {e}"))?;
-
-    let required = [
-        "system_mode",
-        "trades_today",
-        "btc_price",
-        "ofi",
-        "spread",
-        "vpin_score",
-        "consecutive_losses",
-        "uptime_seconds",
-        "recent_trades",
-    ];
-    let missing: Vec<&str> = required
-        .iter()
-        .filter(|k| !v.get(**k).is_some_and(|x| !x.is_null()))
-        .copied()
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!("API postrádá pole: {missing:?} — doctor by tiše padl na výchozí hodnoty"));
-    }
-    Ok(())
+    fetch_snapshot().map(|_| ())
 }
 
 #[cfg(test)]
-mod feed_assessment_tests {
-    use super::{assess_feed, FeedAssessment};
-
-    #[test]
-    fn halted_requires_reconciliation_even_without_price() {
-        for price in [0.0, -1.0, 60_000.0] {
-            assert_eq!(
-                assess_feed("Halted", price),
-                FeedAssessment::ReconciliationRequired
-            );
+mod diagnostics_tests {
+    use super::*;
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            system_mode: "Active".into(),
+            market_data_available: true,
+            btc_price: 60_000.0,
+            uptime_seconds: 90_000,
+            execution_block_reason: None,
         }
     }
-
     #[test]
-    fn active_dead_feed_still_requires_restart() {
-        assert_eq!(assess_feed("Active", 0.0), FeedAssessment::RestartRequired);
+    fn original_trading_error_thresholds_are_preserved() {
+        assert!(!JournalCounts { nonce: 4, rejected: 4, rate_limit: 20, ..Default::default() }.needs_review());
+        for counts in [
+            JournalCounts { nonce: 5, ..Default::default() },
+            JournalCounts { rejected: 5, ..Default::default() },
+            JournalCounts { panics: 1, ..Default::default() },
+        ] {
+            assert!(counts.needs_review());
+        }
     }
-
     #[test]
-    fn initializing_dead_feed_preserves_existing_restart_policy() {
+    fn recovered_feed_is_live_despite_process_age() {
+        assert_eq!(assess_health(&snapshot()), Health::Live);
+    }
+    #[test]
+    fn stale_price_is_not_live_data() {
+        let mut s = snapshot();
+        s.market_data_available = false;
+        assert_eq!(assess_health(&s), Health::Unavailable);
+        s.market_data_available = true;
+        for price in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            s.btc_price = price;
+            assert_eq!(assess_health(&s), Health::Unavailable);
+        }
+    }
+    #[test]
+    fn explicit_protection_precedes_feed_and_uptime() {
+        for mode in ["Halted", "Defensive"] {
+            for price in [0.0, 60_000.0] {
+                let mut s = snapshot();
+                s.system_mode = mode.into();
+                s.btc_price = price;
+                assert_eq!(assess_health(&s), Health::Protected);
+            }
+        }
+        let mut s = snapshot();
+        s.execution_block_reason = Some("pending reconciliation".into());
+        assert_eq!(assess_health(&s), Health::Protected);
+    }
+    #[test]
+    fn initialization_and_unknown_mode_are_not_restart_evidence() {
+        for mode in ["Initializing", "future-mode", ""] {
+            let mut s = snapshot();
+            s.system_mode = mode.into();
+            assert_eq!(assess_health(&s), Health::Unknown);
+        }
+    }
+    #[test]
+    fn schema_rejects_absent_or_malformed_health_evidence() {
+        let value = serde_json::json!({"system_mode":"Active", "market_data_available":true,
+            "btc_price":60000.0, "uptime_seconds":123, "execution_block_reason":null});
+        assert!(parse_snapshot(&serde_json::to_vec(&value).unwrap()).is_ok());
+        for key in [
+            "system_mode",
+            "market_data_available",
+            "btc_price",
+            "uptime_seconds",
+            "execution_block_reason",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                parse_snapshot(&serde_json::to_vec(&missing).unwrap()).is_err(),
+                "{key}"
+            );
+        }
+        let mut wrong = value;
+        wrong["market_data_available"] = serde_json::json!("true");
+        assert!(parse_snapshot(&serde_json::to_vec(&wrong).unwrap()).is_err());
+    }
+    #[test]
+    fn journal_counts_events_once_not_overlapping_patterns() {
         assert_eq!(
-            assess_feed("Initializing", 0.0),
-            FeedAssessment::RestartRequired
+            matching_lines(
+                "tungstenite WebSocket closed Connection reset\nhealthy",
+                &["tungstenite", "WebSocket closed", "Connection reset"]
+            ),
+            1
         );
-    }
-
-    #[test]
-    fn active_positive_price_is_live() {
-        assert_eq!(assess_feed("Active", 60_000.0), FeedAssessment::Live);
+        assert_eq!(
+            matching_lines("1787750503", &["503 Service", "502 Bad Gateway"]),
+            0
+        );
     }
 }

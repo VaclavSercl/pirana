@@ -45,6 +45,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct RiskEngine {
     state: Arc<RwLock<RiskState>>,
+    equity_risk: Arc<Mutex<Option<crate::equity_risk::EquityRisk>>>,
     /// Kalibrovane rizikove parametry (seed z hard capu dokud neni dost vzorku).
     calibrated: Arc<RwLock<CalibratedRisk>>,
     /// Ucetni kniha realnych uzavrenych round-tripu.
@@ -58,6 +59,9 @@ pub struct RiskEngine {
 
 #[derive(Debug)]
 struct RiskState {
+    /// Marked-equity protection must be explicitly initialized with verified balances.
+    equity_required: bool,
+    equity_blocked: bool,
     /// Current system mode
     mode: SystemMode,
     /// Current aggregate exposure
@@ -151,6 +155,8 @@ impl RiskEngine {
     ) -> Self {
         Self {
             state: Arc::new(RwLock::new(RiskState {
+                equity_required: false,
+                equity_blocked: false,
                 mode: SystemMode::Initializing,
                 aggregate_exposure: 0.0,
                 daily_pnl: 0.0,
@@ -166,11 +172,67 @@ impl RiskEngine {
                 defensive_since: 0,
                 last_markout_1s_bps: f64::NAN, // dosud neměřeno
             })),
+            equity_risk: Arc::new(Mutex::new(None)),
             calibrated: Arc::new(RwLock::new(calibrated)),
             ledger: Arc::new(Mutex::new(TradeLedger::new())),
             state_path,
             brakes: Arc::new(Mutex::new(crate::trading_brakes::TradingBrakes::new())),
         }
+    }
+
+    /// Call before enabling production entries; initialization follows only
+    /// after verified wallet/price data are available.
+    pub fn require_equity_guard(&self) {
+        let mut state = self.state.write();
+        state.equity_required = true;
+        state.equity_blocked = true;
+    }
+
+    /// Initialize persistent period equity anchors only after a coherent wallet
+    /// snapshot and valid mark price. Missing state is first-start history.
+    /// Errors block new entries; never substitute guessed startup balances.
+    pub fn initialize_equity_guard(&self, path: PathBuf, equity: f64, utc_ms: i64) -> std::io::Result<()> {
+        let mut guard = self.equity_risk.lock();
+        {
+            let mut state = self.state.write();
+            state.equity_required = true;
+            state.equity_blocked = true;
+        }
+        let mut next = crate::equity_risk::EquityRisk::initialize(path, equity, utc_ms)?;
+        let (daily, weekly) = next.mark(equity, utc_ms)?;
+        *guard = Some(next);
+        let mut state = self.state.write();
+        state.daily_drawdown_pct = daily;
+        state.weekly_drawdown_pct = weekly;
+        state.equity_blocked = false;
+        Ok(())
+    }
+
+    /// Mark full wallet equity, including open holdings. Normal ticks do not
+    /// write disk; UTC anchor changes are durable before accepting the mark.
+    /// Failure latches an entry block until explicit successful initialization.
+    pub fn mark_equity(&self, equity: f64, utc_ms: i64) -> std::io::Result<()> {
+        let mut guard = self.equity_risk.lock();
+        let result = guard.as_mut().ok_or_else(|| std::io::Error::other("equity guard not initialized"))
+            .and_then(|guard| guard.mark(equity, utc_ms));
+        let mut state = self.state.write();
+        match result {
+            Ok((daily, weekly)) => {
+                state.daily_drawdown_pct = daily;
+                state.weekly_drawdown_pct = weekly;
+                Ok(())
+            }
+            Err(error) => {
+                state.equity_required = true;
+                state.equity_blocked = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn equity_drawdowns(&self) -> (f64, f64) {
+        let state = self.state.read();
+        (state.daily_drawdown_pct, state.weekly_drawdown_pct)
     }
 
     /// Cesta k perzistentnimu stavu, pokud engine nejakou ma.
@@ -685,6 +747,18 @@ impl RiskEngine {
 
         let mut state = self.state.write();
 
+        if state.equity_required && state.equity_blocked && signal.signal_type != SignalType::DistributionExit {
+            return Ok(RiskAssessment {
+                approved: false,
+                rejection_reason: Some("Marked equity unavailable or persistence failed".to_string()),
+                adjusted_position_size: 0.0,
+                current_exposure_pct: state.aggregate_exposure,
+                daily_drawdown_pct: state.daily_drawdown_pct,
+                weekly_drawdown_pct: state.weekly_drawdown_pct,
+                consecutive_losses: state.consecutive_losses,
+            });
+        }
+
         // HFT: Allow all signal types — we buy AND sell for profit
         // DistributionExit is valid — we sell when profitable
         // AccumulationEntry is valid — we buy on dips
@@ -903,10 +977,10 @@ impl RiskEngine {
         let daily_current = state.daily_start_balance + state.daily_pnl;
         let weekly_current = state.weekly_start_balance + state.weekly_pnl;
 
-        if state.daily_start_balance > 0.0 {
+        if !state.equity_required && state.daily_start_balance > 0.0 {
             state.daily_drawdown_pct = ((state.daily_start_balance - daily_current) / state.daily_start_balance).max(0.0);
         }
-        if state.weekly_start_balance > 0.0 {
+        if !state.equity_required && state.weekly_start_balance > 0.0 {
             state.weekly_drawdown_pct = ((state.weekly_start_balance - weekly_current) / state.weekly_start_balance).max(0.0);
         }
     }
@@ -992,7 +1066,7 @@ impl RiskEngine {
         let mut state = self.state.write();
         state.daily_start_balance = new_balance;
         state.daily_pnl = 0.0;
-        state.daily_drawdown_pct = 0.0;
+        if !state.equity_required { state.daily_drawdown_pct = 0.0; }
         state.trades_today = 0;
         info!("Daily risk counters reset");
     }
@@ -1006,6 +1080,10 @@ impl RiskEngine {
             return;
         }
         let mut state = self.state.write();
+        if state.equity_required {
+            warn!("Inferred capital-flow reanchor ignored for marked equity: explicit flow reconciliation required");
+            return;
+        }
         let ratio = if state.daily_start_balance > 0.0 {
             new_starting_equity / state.daily_start_balance
         } else {
@@ -1028,7 +1106,7 @@ impl RiskEngine {
         let mut state = self.state.write();
         state.weekly_start_balance = new_balance;
         state.weekly_pnl = 0.0;
-        state.weekly_drawdown_pct = 0.0;
+        if !state.equity_required { state.weekly_drawdown_pct = 0.0; }
         info!("Weekly risk counters reset");
     }
 
@@ -1659,4 +1737,28 @@ mod tests {
             "nesmyslny vstup nesmi expozici prepsat"
         );
     }
+    #[test]
+    fn marked_open_loss_not_erased_by_realized_profit_or_legacy_resets() {
+        let dir = std::env::temp_dir().join(format!("pirana-equity-engine-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let engine = RiskEngine::new(100.0);
+        engine.activate();
+        engine.require_equity_guard();
+        let signal = make_signal(0.01, 76000.0);
+        assert!(!engine.evaluate_trade(&signal, 76200.0).unwrap().approved);
+        engine.initialize_equity_guard(dir.join("equity.json"), 100.0, 1).unwrap();
+        engine.mark_equity(50.0, 2).unwrap();
+        assert!(!engine.evaluate_trade(&signal, 76200.0).unwrap().approved);
+        engine.record_trade_result(20.0);
+        engine.reset_daily(50.0);
+        engine.reset_weekly(50.0);
+        engine.reanchor_equity(500.0);
+        assert_eq!(engine.equity_drawdowns(), (0.5, 0.5));
+        assert!(!engine.evaluate_trade(&signal, 76200.0).unwrap().approved);
+        assert!(engine.mark_equity(f64::NAN, 3).is_err());
+        engine.mark_equity(100.0, 4).unwrap();
+        assert!(engine.state.read().equity_blocked, "successful mark must not clear an error latch");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }

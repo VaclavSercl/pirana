@@ -88,6 +88,52 @@ struct TerminalOrder {
 const SETTLEMENT_SCALE: i128 = 1_000_000_000_000_000_000;
 const SETTLEMENT_CLOCK_SKEW_MS: i64 = 5_000;
 
+/// Serialize a Bitfinex price at five significant digits without weakening a
+/// limit: BUY rounds down, SELL rounds up. Decimal-string construction avoids
+/// a second floating-point rounding step and is idempotent on serialized prices.
+/// Unsupported/non-finite prices fail closed before any network request.
+pub fn exchange_limit_price(price: f64, side: Side) -> PiranaResult<String> {
+    let bad = || BitfinexClient::history_error("Invalid exchange price precision");
+    if !price.is_finite() || price <= 0.0 {
+        return Err(bad());
+    }
+    let scientific = format!("{price:.4e}");
+    let (mantissa, exponent) = scientific.split_once('e').ok_or_else(bad)?;
+    let exponent = exponent.parse::<i32>().map_err(|_| bad())?;
+    let mut units = mantissa.replace('.', "").parse::<u32>().map_err(|_| bad())?;
+    let rounded = scientific.parse::<f64>().map_err(|_| bad())?;
+    match side {
+        Side::Sell if rounded < price => units += 1,
+        Side::Buy if rounded > price => units -= 1,
+        _ => {}
+    }
+    let digits = units.to_string();
+    let shift = exponent - 4;
+    let text = if shift >= 0 {
+        format!("{}{}", digits, "0".repeat(shift as usize))
+    } else {
+        let point = digits.len() as i32 + shift;
+        if point > 0 {
+            format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
+        } else {
+            format!("0.{}{}", "0".repeat((-point) as usize), digits)
+        }
+    };
+    let text = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text
+    };
+    let effective = text.parse::<f64>().map_err(|_| bad())?;
+    if !effective.is_finite() || effective <= 0.0
+        || (side == Side::Sell && effective < price)
+        || (side == Side::Buy && effective > price)
+    {
+        return Err(bad());
+    }
+    Ok(text)
+}
+
 /// Remove only floating-point arithmetic noise around a satoshi-grid value.
 /// Eight relative machine epsilons cover ordinary subtraction dust; the hard
 /// cap is one ten-thousandth of a satoshi, never economic quantity rounding.
@@ -497,9 +543,10 @@ impl BitfinexClient {
             OrderType::FOK => "EXCHANGE FOK",
         };
 
+        let serialized_price = exchange_limit_price(price, side)?;
         let mut body_str = format!(
-            r#"{{"type":"{}","symbol":"{}","amount":"{}","price":"{:.2}"}}"#,
-            type_str, symbol, amount, price
+            r#"{{"type":"{}","symbol":"{}","amount":"{}","price":"{}"}}"#,
+            type_str, symbol, amount, serialized_price
         );
 
         if let Some(cid) = cid {
@@ -1081,7 +1128,14 @@ impl BitfinexClient {
             status == name
                 || status
                     .strip_prefix(name)
-                    .is_some_and(|tail| tail.starts_with(" @ ") || tail.starts_with(" was "))
+                    .is_some_and(|tail| {
+                        tail.starts_with(" @ ") || tail.starts_with(" was ")
+                            // Observed Bitfinex terminal IOC after a partial fill.
+                            // Only this delimited prior-state form is added;
+                            // status text never substitutes for execution proof.
+                            || tail.strip_prefix(" was: PARTIALLY FILLED @ ")
+                                .is_some_and(|details| !details.is_empty())
+                    })
         };
         let executed = is_status("EXECUTED");
         let terminal = executed
@@ -1327,6 +1381,26 @@ fn side_str(side: Side) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn limit_serialization_preserves_direction_and_precision() {
+        assert_eq!(exchange_limit_price(80_059.95, Side::Sell).unwrap(), "80060");
+        assert_eq!(exchange_limit_price(80_059.95, Side::Buy).unwrap(), "80059");
+        assert_eq!(exchange_limit_price(0.00123456, Side::Sell).unwrap(), "0.0012346");
+        assert_eq!(exchange_limit_price(0.00123456, Side::Buy).unwrap(), "0.0012345");
+        for price in [0.000000123456, 0.999999, 9.99999, 9.99991, 99.9991, 99.9999, 999.999,
+            9999.99, 99999.9, 100_000.01, 80_000.0, 77_125.0, 123.45] {
+            for side in [Side::Buy, Side::Sell] {
+                let text = exchange_limit_price(price, side).unwrap();
+                let effective = text.parse::<f64>().unwrap();
+                assert!(match side { Side::Sell => effective >= price, Side::Buy => effective <= price });
+                assert_eq!(exchange_limit_price(effective, side).unwrap(), text);
+            }
+        }
+        for price in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(exchange_limit_price(price, Side::Sell).is_err());
+        }
+    }
+
     use super::*;
 
     /// [DOKONALÁ OPRAVA 26. 8. — nonce race test] Paralelní submity musí
@@ -2121,6 +2195,43 @@ mod settled_order_tests {
     }
 
     #[test]
+    fn observed_ioc_partial_cancel_requires_exact_complete_execution_evidence() {
+        let status = "IOC CANCELED was: PARTIALLY FILLED @ 81889.0(0.00012209)";
+        let o = parse_order(&order(status, 0.00034291, 0.000465, 1000), 1000);
+        assert!(o.terminal);
+        assert!(BitfinexClient::settle_executions(&o, &[]).unwrap().is_none());
+        let mut execution = fill(1978928058, 0.00012209, 1000);
+        execution[5] = json!(81889);
+        let records = parse_fills(json!([execution.clone()]));
+        let settled = BitfinexClient::settle_executions(&o, &records).unwrap().unwrap();
+        assert_eq!(settled.filled_qty, 0.00012209);
+        assert_eq!(settled.signed_original_qty, 0.000465);
+        assert!((settled.avg_fill_price - 81889.).abs() < 1e-8);
+        assert_eq!(settled.base_fee, 0.0);
+        execution[4] = json!(0.00012208);
+        assert!(BitfinexClient::settle_executions(&o, &parse_fills(json!([execution.clone()])))
+            .unwrap().is_none());
+        execution[4] = json!(0.00012210);
+        assert!(BitfinexClient::settle_executions(&o, &parse_fills(json!([execution]))).is_err());
+    }
+
+    #[test]
+    fn malformed_and_unknown_status_prefixes_never_become_terminal() {
+        for status in [
+            "ACTIVE was: IOC CANCELED", "PARTIALLY FILLED @ 81889.0(0.00012209)",
+            "UNKNOWN was: PARTIALLY FILLED @ 81889.0(0.00012209)",
+            "IOC CANCELEDish was: PARTIALLY FILLED @ 81889.0(0.00012209)",
+            "IOC CANCELEDwas: PARTIALLY FILLED @ 81889.0(0.00012209)",
+            "IOC CANCELED was:", "IOC CANCELED was: UNKNOWN",
+            "IOC CANCELED was: PARTIALLY FILLED @ ",
+        ] {
+            let order = parse_order(&order(status, 0.00034291, 0.000465, 1000), 1000);
+            assert!(!order.terminal, "{status}");
+            assert!(BitfinexClient::settle_executions(&order, &[]).unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn malformed_conflicting_and_wrong_identity_evidence_is_rejected() {
         let valid = order("EXECUTED", 0., 0.000043, 1000);
         for (index, value) in [
@@ -2272,6 +2383,23 @@ mod settled_order_tests {
     const TRADES: &str = "/v2/auth/r/order/tBTCUSD:700/trades";
 
     #[tokio::test]
+    async fn cid_recovery_resolves_observed_partial_ioc_cancellation() {
+        let stamp = chrono::Utc::now().timestamp_millis() - 1000;
+        let terminal = order("IOC CANCELED was: PARTIALLY FILLED @ 81889.0(0.00012209)",
+            0.00034291, 0.000465, stamp);
+        let mut execution = fill(1978928058, 0.00012209, stamp);
+        execution[5] = json!(81889);
+        let (client, server) = mock(vec![
+            (HISTORY, json!([terminal])), (TRADES, json!([execution])),
+        ]).await;
+        let settled = client.resolve_settled_order("tBTCUSD", None, 1234, stamp - 1, 0.000465)
+            .await.unwrap().unwrap();
+        assert_eq!(settled.filled_qty, 0.00012209);
+        assert!((settled.avg_fill_price - 81889.).abs() < 1e-8);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn active_ack_then_partial_index_then_terminal_full_fill() {
         let stamp = chrono::Utc::now().timestamp_millis() - 1000;
         let terminal = order("EXECUTED @ 77125", 0., 0.000043, stamp);
@@ -2385,6 +2513,23 @@ mod settled_order_tests {
         assert_eq!(settled.filled_qty, 0.000043);
         let bodies = server.await.unwrap();
         assert_eq!(bodies[1]["end"], stamp - 2499);
+    }
+
+    #[tokio::test]
+    async fn ioc_wire_price_cannot_weaken_the_requested_limit() {
+        let (client, server) = mock(vec![
+            ("/v2/auth/w/order/submit", json!([])),
+            ("/v2/auth/w/order/submit", json!([])),
+        ]).await;
+        for (side, quantity, cid) in [(Side::Buy, 0.001, 1234), (Side::Sell, -0.001, 1235)] {
+            client.submit_order_with_cid("tBTCUSD", side, OrderType::IOC,
+                quantity, 80_059.95, cid).await.unwrap();
+        }
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies[0]["price"], "80059");
+        assert_eq!(bodies[1]["price"], "80060");
+        assert_eq!(bodies[0]["type"], "EXCHANGE IOC");
+        assert_eq!(bodies[1]["type"], "EXCHANGE IOC");
     }
 
     #[tokio::test]

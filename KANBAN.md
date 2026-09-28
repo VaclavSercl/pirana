@@ -49,3 +49,12 @@ Replay na historii místo „nasadíme a doufáme".
   position_id robustní match; režimový inventářní strop 10/20/35 %; TP/SL asymetrie. `904ddd7`
 - **Konzistenční rolling brake** (29. 8.): WR < 10 % na 30 RT → engage; oponentura
   2× P0 (self-release mid-streak, rehydrate řazení). `9b0de07`
+
+## Codex audit continuation 2026-09-23
+
+| Phase | State | Acceptance evidence |
+|---|---|---|
+| Audit repairs and IOC recovery root cause | VERIFIED_NATIVE | 455 Rust tests, 210 Python tests, check and strict root Clippy passed on Caslav |
+| Container release and publication | IN_PROGRESS | Compose and exact-candidate Docker release passed; Git checkpoint/publication pending |
+| Production reconciliation | PENDING | Backup, exact binary digest, fresh accounting, pending-intent recovery and healthy service required |
+| Hourly oversight | CONFIGURED | Codex thread heartbeat; live authenticated baseline stored privately on server |

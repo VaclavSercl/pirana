@@ -67,6 +67,8 @@ pub struct AvellanedaStoikovModel {
     pub gamma: f64,
     /// Order book liquidity / arrival intensity parameter (kappa > 0.0)
     pub kappa: f64,
+    /// Base kappa (from config) used to reset effective kappa
+    base_kappa: f64,
     /// Normalized time horizon parameter (dt > 0.0)
     pub dt: f64,
 }
@@ -76,6 +78,7 @@ impl AvellanedaStoikovModel {
         Self {
             gamma: if gamma > 0.0 && !gamma.is_nan() { gamma } else { 0.10 },
             kappa: if kappa > 0.0 && !kappa.is_nan() { kappa } else { 1.50 },
+            base_kappa: if kappa > 0.0 && !kappa.is_nan() { kappa } else { 1.50 },
             dt: if dt > 0.0 && !dt.is_nan() { dt } else { 1.0 },
         }
     }
@@ -86,6 +89,11 @@ impl AvellanedaStoikovModel {
             config.order_book_liquidity_kappa,
             config.time_horizon_dt,
         )
+    }
+
+    /// Reset effective kappa back to the base (config) value.
+    pub fn reset_kappa_to_base(&mut self) {
+        self.kappa = self.base_kappa;
     }
 
     /// Cilovy inventar odvozeny z EQUITY, nikoli pevna konstanta v BTC.

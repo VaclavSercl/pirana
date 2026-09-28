@@ -2,6 +2,8 @@
 FROM rust:1.85.1-slim-bookworm AS builder
 
 WORKDIR /build
+# Keep release builds within the ARM host memory budget.
+ARG CARGO_BUILD_JOBS=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     make pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
