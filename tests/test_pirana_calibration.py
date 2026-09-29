@@ -266,3 +266,35 @@ def test_initial_oversized_equity_rejected(tmp_path):
     path=tmp_path/f"equity-{NOW//DAY}.jsonl"
     with path.open('wb') as stream:stream.truncate(16*1024*1024+1)
     with pytest.raises(ValueError,match='evidence_size_limit'):cal._equity(tmp_path,NOW)
+
+
+def test_fully_settled_archived_position_is_not_open_inventory(tmp_path):
+    # PositionBook retains closed metadata in recovery_candidates after settlement.
+    con,path,equity=sources(tmp_path,positions={"recovery_candidates":[pos()]})
+    try:
+        first=cal.build_calibration(con,path,equity,NOW)
+        again=cal.build_calibration(con,path,equity,NOW)
+        assert first==again
+        assert first["roundtrip_count"]==1
+        assert first["trades"][0]["provenance"]["pnl_usd"]=="10"
+        assert first["trades"][0]["provenance"]["consumed_btc"]=="1"
+        assert first["status"]=="WARMUP" and first["complete_day_count"]==0
+        assert len(json.loads(path.read_text())["recovery_candidates"])==1
+    finally:con.close()
+
+
+@pytest.mark.parametrize("mode",["partial","unsettled","current","synthetic","shadow"])
+def test_archival_metadata_does_not_bypass_closure_and_provenance(tmp_path,mode):
+    position=pos();rows=[fill(1,101,"1","100",NOW-2000,"100"),fill(2,201,"-1","110",NOW-1000,"200")]
+    journal={"recovery_candidates":[position],"exit_intents":{"200":position}}
+    if mode=="partial":rows[1]["exec_amount"]="-0.5"
+    if mode=="unsettled":journal["settled_exit_cids"]=[]
+    if mode=="current":journal["positions"]=[position]
+    if mode=="synthetic":rows[0]["trade_id"]=999999999999
+    if mode=="shadow":position["is_shadow"]=True
+    con,path,equity=sources(tmp_path,rows,journal)
+    try:
+        result=cal.build_calibration(con,path,equity,NOW)
+        assert result["trades"]==[] and result["roundtrip_count"]==0
+        assert result["status"]=="WARMUP"
+    finally:con.close()

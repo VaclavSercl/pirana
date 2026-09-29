@@ -118,7 +118,12 @@ def _roundtrips(fills, journal, now):
     current = set()
     for key in ("positions", "recovery_candidates"):
         if not isinstance(journal.get(key), list): raise ValueError("invalid_current_positions")
-        for position in journal[key]: current.add(_position(position,now)[0])
+        for position in journal[key]:
+            pid, _, _ = _position(position, now)
+            # Recovery candidates retain exited metadata for replay; only the
+            # live positions list denotes inventory still held. Settlement and
+            # exact authenticated fee-adjusted closure are checked below.
+            if key == "positions": current.add(pid)
     intents, settled = journal.get("exit_intents"), journal.get("settled_exit_cids")
     if not isinstance(intents, dict) or not isinstance(settled, list) or len(settled) != len(set(settled)):
         raise ValueError("invalid_exit_journal")
