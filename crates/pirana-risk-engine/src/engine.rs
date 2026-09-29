@@ -52,6 +52,7 @@ pub struct RiskEngine {
     ledger: Arc<Mutex<TradeLedger>>,
     /// Cesta k perzistentnimu `risk_state.json`. `None` = jen RAM (testy).
     state_path: Option<PathBuf>,
+    verified_calibration: Arc<Mutex<crate::verified_calibration::VerifiedCalibration>>,
     /// [TRADING BRAKES 27. 8.] Tři daty podložené brzdy vstupu —
     /// loss-cooldown, VPIN deadzone, rolling brake. Entry-only.
     brakes: Arc<Mutex<crate::trading_brakes::TradingBrakes>>,
@@ -176,6 +177,9 @@ impl RiskEngine {
             calibrated: Arc::new(RwLock::new(calibrated)),
             ledger: Arc::new(Mutex::new(TradeLedger::new())),
             state_path,
+            verified_calibration: Arc::new(Mutex::new(
+                crate::verified_calibration::VerifiedCalibration::default(),
+            )),
             brakes: Arc::new(Mutex::new(crate::trading_brakes::TradingBrakes::new())),
         }
     }
@@ -396,7 +400,25 @@ impl RiskEngine {
 
     /// Pocet uzavrenych round-tripu v ucetni knize.
     pub fn ledger_len(&self) -> usize {
-        self.ledger.lock().len()
+        let verified = self.verified_calibration.lock();
+        if verified.required {
+            verified.count(chrono::Utc::now().timestamp_millis())
+        } else {
+            self.ledger.lock().len()
+        }
+    }
+
+    /// Production calibration must use canonical executions and observed equity only.
+    pub fn require_verified_calibration(&self) {
+        self.verified_calibration.lock().require();
+    }
+    pub fn update_verified_calibration(&self, report: serde_json::Value, now_ms: i64) {
+        self.verified_calibration.lock().update(report, now_ms);
+    }
+    pub fn calibration_evidence(&self) -> serde_json::Value {
+        self.verified_calibration
+            .lock()
+            .evidence(chrono::Utc::now().timestamp_millis())
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -461,12 +483,35 @@ impl RiskEngine {
         let now = chrono::Utc::now().timestamp();
         let current = self.calibrated.read().clone();
 
-        let stats: TradingStats = self.ledger.lock().build_stats(
-            equity_usd,
-            price_usd,
-            current.vpin_toxicity_threshold.value,
-            now,
-        )?;
+        let verified_ledger = {
+            let verified = self.verified_calibration.lock();
+            if verified.required {
+                Some(
+                    verified
+                        .ready_ledger(chrono::Utc::now().timestamp_millis())
+                        .map_err(|_| {
+                            RiskError::OutOfRange("verified_calibration_not_ready", 0.0)
+                        })?,
+                )
+            } else {
+                None
+            }
+        };
+        let stats: TradingStats = if let Some(ledger) = verified_ledger {
+            ledger.build_stats(
+                equity_usd,
+                price_usd,
+                current.vpin_toxicity_threshold.value,
+                now,
+            )?
+        } else {
+            self.ledger.lock().build_stats(
+                equity_usd,
+                price_usd,
+                current.vpin_toxicity_threshold.value,
+                now,
+            )?
+        };
 
         let equity_sats = TradeLedger::equity_sats(equity_usd, price_usd);
         if equity_sats <= 0.0 {
@@ -1761,4 +1806,22 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+}
+
+#[cfg(test)]
+mod verified_projection_tests {
+    use super::*;
+    #[test]
+    fn required_projection_never_falls_back_to_legacy_ledger() {
+        let engine = RiskEngine::new(1000.0);
+        engine.require_verified_calibration();
+        assert_eq!(engine.ledger_len(), 0);
+        assert!(engine.recalibrate_now(1000.0, 100000.0).is_err());
+        let now = chrono::Utc::now().timestamp_millis();
+        engine.update_verified_calibration(serde_json::json!({"schema_version":1,"source":crate::verified_calibration::SOURCE,"status":"WARMUP","reasons":["missing_daily_equity"],"generated_at_ms":now,"sync_cursor_ms":now,"trades":[],"days":[],"roundtrip_count":0,"complete_day_count":0}), now);
+        assert_eq!(engine.calibration_evidence()["status"], "WARMUP");
+        assert!(engine.recalibrate_now(1000.0, 100000.0).is_err());
+        engine.update_verified_calibration(serde_json::json!({}), now);
+        assert_eq!(engine.calibration_evidence()["status"], "BLOCKED");
+    }
 }

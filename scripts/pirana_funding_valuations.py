@@ -10,6 +10,7 @@ import re
 from urllib.parse import parse_qs, urlsplit
 
 CLASSIFICATION = "funding_date_market_valuation"
+OWNER_CLASSIFICATION = "owner_declared_cost_basis"
 METHOD = "last completed 1m BTCUSD candle close before deposit"
 MAX_BYTES = 2 * 1024 * 1024
 
@@ -48,6 +49,33 @@ def candle(value):
     if low > min(opened, close) or high < max(opened, close) or low > high:
         raise ValueError("invalid OHLC range")
     return [mts, opened, close, high, low, volume]
+
+
+def validate_owner_entry(entry):
+    """Validate a declaration, not independent proof of original purchase cost."""
+    if (not isinstance(entry, dict) or type(entry.get("schema_version")) is not int
+            or entry["schema_version"] != 1 or entry.get("classification") != OWNER_CLASSIFICATION
+            or entry.get("actual_acquisition_basis") != "UNKNOWN"):
+        raise ValueError("invalid owner declaration schema")
+    for key in ("owner_approval", "owner_reference"):
+        if not isinstance(entry.get(key), str) or not entry[key].strip() or len(entry[key]) > 1000:
+            raise ValueError("missing or oversized owner declaration reference")
+    # A declaration cannot masquerade as venue candle evidence.
+    if any(key in entry for key in ("candle", "response_utf8", "response_sha256", "source_uri")):
+        raise ValueError("owner declaration contains market evidence fields")
+    deposited, ledger = integer(entry["deposit_mts"]), integer(entry["ledger_id"])
+    declared = datetime.fromisoformat(entry["declared_at"])
+    if declared.tzinfo is None or declared.timestamp() * 1000 < deposited:
+        raise ValueError("invalid declaration timestamp")
+    qty, price = decimal(entry["quantity_btc"]), decimal(entry["price_usd"])
+    return dict(ledger_id=ledger, deposit_mts=deposited, quantity_btc=format(qty, "f"),
+                quantity_sats=format(qty * 100000000, "f"), price_usd=format(price, "f"),
+                starting_valuation_usd=format(qty * price, "f"),
+                owner_declared_cost_basis_usd=format(qty * price, "f"),
+                owner_approval=entry["owner_approval"], owner_reference=entry["owner_reference"],
+                declared_at=declared.isoformat(), source="owner_declaration",
+                classification=OWNER_CLASSIFICATION, actual_acquisition_basis="UNKNOWN",
+                label="Owner-declared cost basis; not independently verified purchase cost or market candle")
 
 
 def validate_entry(entry):
@@ -106,21 +134,23 @@ def validate_entry(entry):
 
 def validate_envelope(value):
     if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
-            or value["schema_version"] != 1 or value.get("classification") != CLASSIFICATION
+            or value["schema_version"] != 1 or value.get("classification") not in (CLASSIFICATION, OWNER_CLASSIFICATION)
             or value.get("actual_acquisition_basis") != "UNKNOWN"):
         raise ValueError("invalid funding valuation envelope")
     entries = value.get("entries")
     if not isinstance(entries, list) or not 1 <= len(entries) <= 1000:
         raise ValueError("invalid entries")
-    validated = [validate_entry(x) for x in entries]
+    is_owner = value["classification"] == OWNER_CLASSIFICATION
+    validated = [(validate_owner_entry if is_owner else validate_entry)(x) for x in entries]
     if len({x["ledger_id"] for x in validated}) != len(validated):
         raise ValueError("duplicate ledger identity")
-    return dict(status="VALUED_NOT_COST_BASIS", classification=CLASSIFICATION,
+    return dict(status="OWNER_DECLARED_NOT_VENUE_VERIFIED" if is_owner else "VALUED_NOT_COST_BASIS",
+                classification=value["classification"],
                 actual_acquisition_basis="UNKNOWN", entries=validated,
                 total_funding_btc=format(sum((Decimal(x["quantity_btc"]) for x in validated), Decimal(0)), "f"),
                 total_starting_valuation_usd=format(sum((Decimal(x["starting_valuation_usd"]) for x in validated), Decimal(0)), "f"),
                 historical_fifo_status="UNCHANGED",
-                limitation="Funding-date market marks are owner-approved starting valuations, not actual acquisition costs. Full historical performance still requires every BTC/UST/USD flow, other-pair trade, withdrawal, fee and opening balance; these marks never fill canonical FIFO gaps.")
+                limitation=("Owner-declared basis is an explicit assumption, not venue evidence. No canonical FIFO or historical gap is repaired. " if is_owner else "") + "Funding-date market marks are owner-approved starting valuations, not actual acquisition costs. Full historical performance still requires every BTC/UST/USD flow, other-pair trade, withdrawal, fee and opening balance; these marks never fill canonical FIFO gaps.")
 
 
 def load_valuations(path):

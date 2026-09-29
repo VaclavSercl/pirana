@@ -12,7 +12,9 @@ NOW = 1790668800
 
 
 def calibration():
-    data = dict(generation=48, sample_size=1000, calibrated_at=NOW-100)
+    data = dict(generation=48, sample_size=1000, calibrated_at=NOW-100,
+                evidence=dict(schema_version=1, source="authenticated_strategy_position_roundtrips", status="READY",
+                    roundtrip_count=50, complete_day_count=5, generated_at_ms=NOW*1000, sync_cursor_ms=NOW*1000, reasons=[]))
     for name in report.FIELDS:
         data[name] = dict(value=0.1, computed_at=NOW-100, formula="fixture", inputs="fixture")
     return data
@@ -120,3 +122,34 @@ def test_telegram_api_error_body_and_url_are_not_disclosed():
             "sys.stderr", new_callable=io.StringIO) as out:
         assert report.send_telegram("fake", "fake", "fixture") is False
         assert "SECRET" not in out.getvalue()
+
+
+def test_calibration_evidence_cannot_claim_readiness_from_old_or_missing_data():
+    for change in (None, {}, dict(status="READY"), dict(generated_at_ms=(NOW-121)*1000),
+                   dict(sync_cursor_ms=(NOW+1)*1000), dict(roundtrip_count=49),
+                   dict(complete_day_count=4), dict(source="legacy_runtime"), dict(schema_version=True)):
+        snap = snapshot()
+        if change is None: snap["calibration"].pop("evidence")
+        elif change == {}: snap["calibration"]["evidence"] = {}
+        elif change == dict(status="READY"): snap["calibration"]["evidence"] = change
+        else: snap["calibration"]["evidence"].update(change)
+        _, status = report.build_calibration_report(snap, None, (True, "fixture"), NOW)
+        assert status == 2
+    _, status = report.build_calibration_report(snapshot(), None, (True, "fixture"), NOW)
+    assert status == 0
+
+
+def test_calibration_warmup_is_explicit_without_claiming_trading_stopped():
+    snap = snapshot()
+    snap["calibration"]["evidence"].update(status="WARMUP", complete_day_count=0, reasons=["missing_daily_equity"])
+    text, status = report.build_calibration_report(snap, None, (True, "fixture"), NOW)
+    assert status == 0 and "WARMUP" in text and "missing_daily_equity" in text
+    assert "samo o sobě neznamená zastavené obchodování" in text
+
+
+def test_subsecond_evidence_uses_precise_postfetch_time_without_future_tolerance():
+    snap = snapshot()
+    snap["calibration"]["evidence"].update(generated_at_ms=NOW*1000+300, sync_cursor_ms=NOW*1000+299)
+    assert report.build_calibration_report(snap, None, (True, "fixture"), NOW, now_ms=NOW*1000+400)[1] == 0
+    assert report.build_calibration_report(snap, None, (True, "fixture"), NOW, now_ms=NOW*1000+200)[1] == 2
+    assert report.build_calibration_report(snap, None, (True, "fixture"), NOW, now_ms=NOW*1000+1000)[1] == 2

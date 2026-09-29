@@ -54,3 +54,5 @@ pub mod self_calibration;
 pub mod tick_recorder;
 pub mod trade_ledger;
 pub mod trading_brakes;
+
+pub mod verified_calibration;

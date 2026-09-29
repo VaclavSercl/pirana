@@ -93,3 +93,43 @@ def test_benchmark_sidecar_missing_corrupt_valid(tmp_path):
     assert m.read_benchmarks(path)['7']['side']=='Buy'
     path.write_text('{}')
     with pytest.raises(ValueError):m.read_benchmarks(path)
+
+
+def test_canonical_typed_provenance_is_checked_before_measurement(tmp_path):
+    import sqlite3
+    from scripts import pirana_accounting as accounting
+    db = tmp_path / "ledger.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE fills(payload TEXT)")
+    con.execute("CREATE TABLE sync(id INTEGER,cursor_ms INTEGER,coverage_start_ms INTEGER,complete INTEGER)")
+    con.execute("INSERT INTO sync VALUES(1,2000,0,1)")
+    con.execute("INSERT INTO fills VALUES(?)", (json.dumps(fill()),))
+    con.commit();con.close()
+    fs, sync, provenance = m.canonical_fills(db)
+    assert len(fs) == 1 and sync == (2000,0,1) and not provenance['excluded_records']
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE fill_provenance(trade_id INTEGER,order_id INTEGER,kind TEXT,digest TEXT,reference TEXT)")
+    con.execute("INSERT INTO fill_provenance VALUES(1,8,'operator_adjustment','wrong','fixture')")
+    con.commit();con.close()
+    with pytest.raises(ValueError): m.canonical_fills(db)
+
+
+def test_owner_basis_report_never_clears_history(tmp_path, monkeypatch, capsys):
+    owner = dict(schema_version=1, classification='owner_declared_cost_basis',
+        actual_acquisition_basis='UNKNOWN', entries=[dict(schema_version=1,
+        classification='owner_declared_cost_basis', actual_acquisition_basis='UNKNOWN',
+        ledger_id=1, deposit_mts=1000, quantity_btc='0.001', price_usd='99999',
+        owner_reference='fixture instruction', owner_approval='explicit fixture approval',
+        declared_at='2026-09-29T20:00:00+00:00')])
+    path = tmp_path / 'owner.json';path.write_text(json.dumps(owner))
+    monkeypatch.setattr(m, 'canonical_fills', lambda _: ([fill(qty='-1')],(2000,0,1),dict(excluded_records=[])))
+    monkeypatch.setattr(m, 'read_equity', lambda _: ([],[]))
+    monkeypatch.setattr(m, 'read_benchmarks', lambda _: {})
+    monkeypatch.setattr('sys.argv', ['measurement','--db','unused','--positions','unused',
+        '--equity-dir','unused','--start-ms','0','--end-ms','2000','--funding-valuations',str(path)])
+    assert m.main() == 0
+    result=json.loads(capsys.readouterr().out)
+    assert result['status']=='INCOMPLETE' and result['history']['gaps']
+    assert result['funding_valuation_semantics']['kind']=='owner_declared_cost_basis'
+    assert result['funding_valuations']['entries'][0]['owner_declared_cost_basis_usd']=='99.999'
+    assert result['funding_valuation_semantics']['canonical_fifo']=='UNCHANGED'

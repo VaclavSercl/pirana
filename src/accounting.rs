@@ -33,7 +33,11 @@ impl AccountingSync {
         }
     }
 
-    async fn helper(&self, command: &str, input: Option<Value>) -> Result<Value, String> {
+    pub(crate) async fn helper(
+        &self,
+        command: &str,
+        input: Option<Value>,
+    ) -> Result<Value, String> {
         let mut child = tokio::process::Command::new("python3")
             .arg(&self.script)
             .arg("--db")
@@ -203,7 +207,7 @@ fn page_boundary(
     Ok((last, false))
 }
 
-fn atomic_publish(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_publish(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path
         .parent()

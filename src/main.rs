@@ -37,6 +37,7 @@ mod config;
 use config::StrategyConfig;
 
 mod accounting;
+mod calibration;
 mod operational_recovery;
 mod execution_recovery;
 mod position_persistence;
@@ -225,6 +226,7 @@ fn build_calibration_view(
     CalibrationView {
         generation: snap.calibration_generation,
         sample_size: engine.ledger_len(),
+        evidence: engine.calibration_evidence(),
         max_aggregate_exposure: view_of(
             &snap.max_aggregate_exposure,
             engine.max_aggregate_exposure(),
@@ -550,6 +552,7 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         if initial_balance > 0.0 { initial_balance } else { 1000.0 },
         risk_state_path,
     );
+    risk_engine.require_verified_calibration();
     risk_engine.require_equity_guard();
     risk_engine.activate();
     POSITION_PERSISTENCE_OK.store(active_positions.pending_entries().is_empty() && active_positions.unresolved_exits().is_empty(), std::sync::atomic::Ordering::Release);
@@ -768,9 +771,9 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                         let btc = *state_for_watchdog.btc_balance.read();
                         let usd = *state_for_watchdog.usd_balance.read();
                         let msg = format!(
-                            "🚨 <b>ČÁSLAV :: INACTIVITY ALERT</b>\n\n\
-                             Systém je v Active režimu {} h bez obchodu (poslední: {}).\n\
-                             Pravděpodobný deadlock (inventory / pozice).\n\n\
+                            "ℹ️ <b>ČÁSLAV :: ČEKÁNÍ NA OBCHOD</b>\n\n\
+                             Diagnostický čítač procesu hlásí {} h bez obchodu (poslední: {}).\n\
+                             Samotná neaktivita není důkaz poruchy; ověř aktuální signály a ochrany.\n\n\
                              • BTC: <code>{:.8}</code>\n• USD: <code>{:.2}</code>\n\
                              Zkontroluj: journalctl -u pirana.service | grep -E \"skipping|REBALANCE\"",
                             idle_secs / 3600,
@@ -786,13 +789,18 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                                 "text": msg,
                                 "parse_mode": "HTML",
                             });
-                            if let Err(e) = http.post(&url).json(&payload).send().await {
-                                tracing::error!("[INACTIVITY WATCHDOG] Telegram alert selhal: {}", e);
+                            let delivered = match http.post(&url).json(&payload).send().await {
+                                Ok(response) if response.status().is_success() => response.json::<serde_json::Value>().await
+                                    .ok().is_some_and(|value| value["ok"] == true),
+                                _ => false,
+                            };
+                            if !delivered {
+                                tracing::error!("[INACTIVITY WATCHDOG] Telegram delivery unconfirmed; sensitive transport details suppressed");
                             }
                         } else {
                             tracing::error!("[INACTIVITY WATCHDOG] TELEGRAM_BOT_TOKEN neni nastaven — alert jen do logu");
                         }
-                        tracing::warn!("[INACTIVITY WATCHDOG] Alert odeslán — Active bez obchodu {} h", idle_secs / 3600);
+                        tracing::warn!("[INACTIVITY WATCHDOG] Pozorování neaktivity {} h; samo nepotvrzuje poruchu ani doručení", idle_secs / 3600);
                     }
                 } else if idle_secs < INACTIVITY_THRESHOLD_SECS {
                     // System zase obchoduje — reset flagu.
@@ -947,6 +955,21 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                             }).is_none() { continue; }
                         }
 
+                        // Refresh independently of accepted calibration generation. Never reuse
+                        // an older successful input after helper failure or stale evidence.
+                        if tick == 1 || tick % 4 == 0 {
+                            let input = match calibration::read_verified_inputs(&accounting::AccountingSync::configured()).await
+                            {
+                                Ok(input) => input,
+                                Err(_) => {
+                                    serde_json::json!({"status":"BLOCKED","reasons":["calibration_helper_unavailable"]})
+                                }
+                            };
+                            risk_engine_for_reconciliation.update_verified_calibration(
+                                input,
+                                chrono::Utc::now().timestamp_millis(),
+                            );
+                        }
                         if tick % RECALIBRATION_EVERY_N_TICKS == 0 { risk_engine_for_reconciliation.recalibrate_and_log(equity_usd, btc_price); }
 
                         // Publikace kalibrovaneho stavu do dashboardu (/api/risk_state).
@@ -2932,13 +2955,16 @@ async fn process_ws_message(
                                                 // Look for an existing tracked live (non-paper, non-shadow) BUY position
                                                 let tracked_pos_opt = {
                                                     let positions = active_positions.read();
-                                                    positions.iter().find(|p| p.side == Side::Buy && !p.is_paper && !p.is_shadow).cloned()
+                                                    signal_exit::select_tradable_exit(
+                                                        positions.iter().enumerate().filter(|(_, p)| p.side == Side::Buy && !p.is_paper && !p.is_shadow).map(|(i,p)| (i,p.quantity)),
+                                                        final_trade_size, MIN_ORDER_SIZE_BTC,
+                                                    ).map(|(i,qty)| (positions[i].clone(),qty))
                                                 };
 
                                                 let (closed_pos, sell_ioc_limit) = match tracked_pos_opt {
-                                                    Some(candidate_pos) => {
+                                                    Some((candidate_pos, eligible_quantity)) => {
                                                         // Attribute this exit only to inventory owned by this position.
-                                                        final_trade_size = final_trade_size.min(candidate_pos.quantity);
+                                                        final_trade_size = eligible_quantity;
                                                         if final_trade_size < MIN_ORDER_SIZE_BTC {
                                                             state.add_signal(signal_view);
                                                             return;

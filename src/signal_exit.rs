@@ -52,6 +52,28 @@ impl SignalExitDecision {
     }
 }
 
+/// Select the first size-eligible inventory lot, preserving caller order.
+/// The caller filters identity/side/paper/shadow eligibility before this scan.
+/// Dust and invalid lot quantities never hide a later tradable lot. This only
+/// selects size: profitability, fresh depth, fee, reserve and submission guards
+/// must still run against the selected lot and the returned exact quantity.
+pub fn select_tradable_exit(
+    quantities: impl IntoIterator<Item = (usize, f64)>,
+    available: f64,
+    minimum: f64,
+) -> Option<(usize, f64)> {
+    if !available.is_finite() || !minimum.is_finite() || minimum <= 0.0 || available < minimum {
+        return None;
+    }
+    quantities.into_iter().find_map(|(index, quantity)| {
+        if !quantity.is_finite() || quantity <= 0.0 {
+            return None;
+        }
+        let executable = quantity.min(available);
+        (executable >= minimum).then_some((index, executable))
+    })
+}
+
 /// Build the shared protected SELL IOC floor. Existing positive-profit policy
 /// remains conservative: even the unrounded slippage limit must exceed entry.
 /// This function does not authorize execution or certify book/fee freshness.
@@ -133,6 +155,72 @@ mod tests {
             book.update_level(Side::Buy, price, qty, 1);
         }
         book
+    }
+
+    #[test]
+    fn dust_first_does_not_hide_tradable_inventory() {
+        let available = 0.00046253 * 0.99;
+        let chosen = select_tradable_exit([(0, 0.00000453), (1, 0.000458)], available, 0.00004);
+        assert_eq!(chosen, Some((1, available)));
+        assert_eq!(
+            select_tradable_exit([(0, 0.00000453)], available, 0.00004),
+            None
+        );
+        assert_eq!(select_tradable_exit([], available, 0.00004), None);
+    }
+
+    #[test]
+    fn selection_rejects_invalid_sizes_and_preserves_order_and_caps() {
+        let lots = [
+            (0, f64::NAN),
+            (1, f64::INFINITY),
+            (2, -1.0),
+            (3, 0.0),
+            (4, 0.00004),
+            (5, 0.001),
+        ];
+        assert_eq!(
+            select_tradable_exit(lots, 0.001, 0.00004),
+            Some((4, 0.00004))
+        );
+        assert_eq!(
+            select_tradable_exit([(7, 0.001)], 0.00004, 0.00004),
+            Some((7, 0.00004))
+        );
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 0.0, 0.000039] {
+            assert_eq!(select_tradable_exit(lots, invalid, 0.00004), None);
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            assert_eq!(select_tradable_exit(lots, 0.001, invalid), None);
+        }
+    }
+
+    #[test]
+    fn selected_lot_still_requires_profit_and_full_depth() {
+        let lots = [(0, 0.00000453), (1, 0.000458)];
+        let (_, quantity) = select_tradable_exit(lots, 0.00046253 * 0.99, 0.00004).unwrap();
+        assert!(matches!(
+            evaluate_signal_exit(84_368.0, quantity, 84_266.0, 5.0, &book(&[(84_260.0, 1.0)])),
+            SignalExitDecision::RejectUnprofitable { .. }
+        ));
+        assert!(matches!(
+            evaluate_signal_exit(
+                80_000.0,
+                quantity,
+                80_100.0,
+                5.0,
+                &book(&[(80_090.0, quantity / 2.0)])
+            ),
+            SignalExitDecision::RejectInvalidInputs { .. }
+        ));
+        assert!(evaluate_signal_exit(
+            80_000.0,
+            quantity,
+            80_100.0,
+            5.0,
+            &book(&[(80_090.0, quantity)])
+        )
+        .is_allowed());
     }
 
     #[test]

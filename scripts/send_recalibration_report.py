@@ -147,7 +147,9 @@ def check_risk_state_file(now=None):
         return False, "NEOVĚŘENO: chybějící, nečitelný nebo neplatný JSON/schema/čas"
 
 
-def build_calibration_report(snap, last, risk_result, now):
+def build_calibration_report(snap, last, risk_result, now, *, now_ms=None):
+    observed_ms = now * 1000 if now_ms is None else now_ms
+    precise_clock = type(observed_ms) is int and now * 1000 <= observed_ms < (now + 1) * 1000
     calib = snap.get("calibration") if isinstance(snap, dict) else None
     if not isinstance(calib, dict):
         return "KALIBRAČNÍ POZOROVÁNÍ — NEOVĚŘENO: API/kalibrace nedostupná", 2
@@ -168,6 +170,30 @@ def build_calibration_report(snap, last, risk_result, now):
             lines.append("STARÁ KALIBRACE: více než 24 h; frekvence pokusů není důkaz nového výpočtu.")
     else:
         lines.append("Čas a stáří výpočtu: " + UNKNOWN)
+    evidence = calib.get("evidence")
+    evidence_healthy = False
+    if isinstance(evidence, dict):
+        state = evidence.get("status")
+        counts = [evidence.get(k) for k in ("roundtrip_count", "complete_day_count")]
+        times = [evidence.get(k) for k in ("generated_at_ms", "sync_cursor_ms")]
+        valid_evidence = (precise_clock and type(evidence.get("schema_version")) is int
+            and evidence["schema_version"] == 1
+            and evidence.get("source") == "authenticated_strategy_position_roundtrips"
+            and state in ("READY", "WARMUP", "BLOCKED")
+            and all(type(v) is int and 0 <= v <= limit for v, limit in zip(counts, (1000, 365)))
+            and all(type(v) is int and 0 < v <= observed_ms and observed_ms - v <= 120000 for v in times)
+            and times[1] <= times[0])
+        evidence_healthy = valid_evidence and (state == "WARMUP" or (state == "READY" and counts[0] >= 50 and counts[1] >= 5))
+        lines.append("Podklady kalibrace: " + (state if valid_evidence else UNKNOWN))
+        if valid_evidence:
+            lines.append(f"Ověřené roundtripy / úplné dny: {counts[0]} / {counts[1]}")
+            if state == "WARMUP":
+                lines.append("Čekání na dostatek skutečných dat; samo o sobě neznamená zastavené obchodování.")
+        reasons = evidence.get("reasons", [])
+        if isinstance(reasons, list) and len(reasons) <= 1000 and all(isinstance(x, str) and len(x) <= 512 for x in reasons):
+            lines.append("Důvod: " + "; ".join(reasons[:20]))
+    else:
+        lines.append("Podklady kalibrace: NEOVĚŘENO — chybí původ a úplnost vzorku.")
     old_time = timestamp(last.get("observed_at"), now) if isinstance(last, dict) else None
     if old_time is not None:
         lines.append(f"Interval pozorování: {iso(old_time)} až {iso(now)} ({now - old_time} s)")
@@ -184,7 +210,7 @@ def build_calibration_report(snap, last, risk_result, now):
                   "Monotonicita P(ruin) vůči expozici: NEOVĚŘENO — jeden skalár ji nedokazuje.",
                   "risk_state.json: " + risk_result[1],
                   "PŮVOD DAT: místní runtime API a disk; žádná změna parametrů."])
-    healthy = valid_counts and valid_values and age is not None and age <= FRESHNESS_SECONDS and risk_result[0]
+    healthy = evidence_healthy and valid_counts and valid_values and age is not None and age <= FRESHNESS_SECONDS and risk_result[0]
     return "\n".join(lines), 0 if healthy else 2
 
 
@@ -245,7 +271,9 @@ def main(argv=None):
         text, status = daily_observation()
     else:
         snap = get_snapshot()
-        text, status = build_calibration_report(snap, load_last_state(), check_risk_state_file(now), now)
+        observed_ms = int(time.time() * 1000)  # sampled after API fetch, no whole-second truncation
+        now = observed_ms // 1000
+        text, status = build_calibration_report(snap, load_last_state(), check_risk_state_file(now), now, now_ms=observed_ms)
     if args.dry_run:
         print(text)
         print(f"OBSERVATION_STATUS={status}; DELIVERY=NOT_REQUESTED")

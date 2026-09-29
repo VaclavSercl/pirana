@@ -228,6 +228,9 @@ impl Default for DerivedParamView {
 /// z `RiskState` dela `main.rs`, ktery vidi na obe strany.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CalibrationView {
+    /// Freshness and provenance of the independent calibration inputs.
+    #[serde(default)]
+    pub evidence: serde_json::Value,
     /// Generace kalibrace; 0 = jeste nikdy nekalibrovano.
     pub generation: u64,
     /// Pocet uzavrenych round-tripu v ucetni knize.

@@ -81,3 +81,18 @@ reserve migration needs a separately reviewed typed adjustment implementation;
 the old synthetic-fill writer must not be reused as proof of acquisition or
 current owner authorization. Operational projection metadata explicitly labels
 its preserved opening reference as legacy-script input, not a confirmed cost.
+
+
+## Recovery and calibration provenance (2026-09-29)
+
+Raw canonical fill rows are retained. `fill_provenance` classifies immutable known operator entries using payload digests; `operational_opening_lots` holds separately typed, owner-authorized inventory references. Neither a typed lot nor an owner-declared acquisition reference is an authenticated venue execution. `pirana_accounting_repair.py` defaults to an in-memory preview and requires an exclusive backup for `--apply`; callers must stop writers and independently verify venue evidence, pending intents and inventory. Historical reports with incomplete basis remain unverified. Never remove a real venue execution to make a projection balance.
+
+`pirana_calibration.py` reconstructs strategy roundtrips from authenticated entry orders, settled exit CIDs, signed fees and the position journal. Daily returns use actual opening equity observations with complete consecutive UTC-day coverage. Runtime independently validates the projection; stale or malformed input cannot fall back to the legacy diagnostic ledger. Existing brakes remain intact. WARMUP means the existing 50-roundtrip/5-day requirements have not been met; it does not prove that trading is broken. Accepted older risk settings are not retroactively certified by a fresh input report. Calibration does not invent historical VPIN, cashflow-adjusted account returns or missing price benchmarks.
+
+The production helper runs from the separate 15-second wallet reconciliation task (every fourth reconciliation), outside the market WebSocket task. The helper is an asynchronous subprocess with a timeout; source evidence is published atomically. Completed-day alignment is pinned to report generation time; freshness is rechecked at use time. Equity files may append while a fixed validated prefix is read; changed/truncated prefixes remain invalid.
+
+`funding_valuations.json` supports explicitly labeled owner-declared reference basis (including the owner's 99,999 USD reference). This is not venue proof of original purchase cost, a candle quotation, or repair of missing cashflow history.
+
+The optional research capture is separate from the live execution feed. `scripts/research/hft_capture.py` is the tracked source of the installed collector. Its bounded asynchronous enqueue preserves raw frame order and receive timestamps during transient writer stalls; persistent stalls still fail visibly. Existing queue, storage and fsync limits are retained. Historical capture gaps remain gaps. Tests use fake stores/transports, not live exchange or Telegram requests.
+
+A deployment must verify a fresh no-pending-order snapshot, current wallet/position reconciliation, an additive accounting preview against a consistent backup, and actual journal recovery before one controlled restart. Restore only the old executable if rollback is needed; never roll back newer fills or positions. Tests include an explicit private-fixture recovery check (`PIRANA_RECOVERY_FIXTURE`, ignored in ordinary public CI because it contains no public account data).

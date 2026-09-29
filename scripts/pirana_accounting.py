@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 
 SCHEMA = 1  # Public projection contract.
 DB_SCHEMA = 2
+OPENING_LOTS_DDL = 'CREATE TABLE IF NOT EXISTS operational_opening_lots(adjustment_id TEXT PRIMARY KEY, epoch_id TEXT NOT NULL, payload TEXT NOT NULL)'
+PROVENANCE_DDL = 'CREATE TABLE IF NOT EXISTS fill_provenance(trade_id INTEGER NOT NULL, order_id INTEGER NOT NULL, classification TEXT NOT NULL, payload_sha256 TEXT NOT NULL, evidence_reference TEXT NOT NULL, PRIMARY KEY(trade_id,order_id))'
 EPOCH_DDL = 'CREATE TABLE IF NOT EXISTS trading_epoch(id INTEGER PRIMARY KEY CHECK(id=1), name TEXT NOT NULL, start_ms INTEGER NOT NULL, opening_reserved_btc TEXT NOT NULL)'
 PERIOD_DDL = 'CREATE TABLE IF NOT EXISTS reporting_period(id INTEGER PRIMARY KEY CHECK(id=1), period_id TEXT NOT NULL, start_ms INTEGER NOT NULL)'
 SCAN_DDL = 'CREATE TABLE IF NOT EXISTS scan(id INTEGER PRIMARY KEY CHECK(id=1), start_ms INTEGER NOT NULL, next_ms INTEGER NOT NULL, target_ms INTEGER NOT NULL)'
@@ -305,7 +307,7 @@ def execution_provenance(fills):
     """
     excluded = []
     for index, fill in enumerate(fills):
-        if not (str(fill.get('trade_id')) == '1978200001'
+        if not (str(fill.get('trade_id')) in ('1978200001','999999999999')
                 or str(fill.get('order_id')) == '244505000001'
                 or str(fill.get('cid')) == '28638000000001'):
             continue
@@ -332,6 +334,80 @@ def execution_provenance(fills):
                 limitation='Known adjustment classification only; absence of a marker is not an independent authentication audit.')
 
 
+def validate_opening_lot(item):
+    required={'schema_version','adjustment_id','epoch_id','kind','order_id','cid','mts','quantity_btc','reference_price_usd','basis','source_reference','approval_reference'}
+    if (not isinstance(item,dict) or set(item)!=required or type(item['schema_version']) is not int
+            or item['schema_version']!=1 or item['kind']!='operational_opening_lot'
+            or item['basis']!='legacy_activation_reference_not_acquisition_cost'):
+        raise ValueError('invalid operational opening lot schema/provenance')
+    for key in ('adjustment_id','epoch_id','cid','source_reference','approval_reference'):
+        if not isinstance(item[key],str) or not item[key].strip() or len(item[key])>1000:
+            raise ValueError('invalid opening lot reference')
+    integer(item['order_id'],1);integer(item['mts'],1)
+    if decimal(item['quantity_btc'])<=0 or decimal(item['reference_price_usd'])<=0:
+        raise ValueError('invalid opening lot amount')
+    return item
+
+
+def operational_opening_lots(con, epoch):
+    """Only the selected epoch owns these recovery references, never executions."""
+    if not epoch or con is None or not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operational_opening_lots'").fetchone():
+        return []
+    records=[]
+    cursor=state(con)['cursor_ms']
+    for identity, epoch_id, payload in con.execute(
+            'SELECT adjustment_id,epoch_id,payload FROM operational_opening_lots WHERE epoch_id=?',(epoch['id'],)):
+        item=validate_opening_lot(json.loads(payload))
+        if item['adjustment_id']!=identity or item['epoch_id']!=epoch_id:
+            raise ValueError('invalid operational opening lot identity')
+        if not epoch['start_ms']<=item['mts']<=cursor:
+            raise ValueError('invalid operational opening lot time')
+        records.append(item)
+    if len({x['order_id'] for x in records})!=len(records) or len({x['cid'] for x in records})!=len(records):
+        raise ValueError('duplicate operational opening lot order/CID')
+    return records
+
+
+def operational_provenance(raw, provenance, epoch, adjustments):
+    scoped=[]; missing=[]
+    for record in provenance['excluded_records']:
+        fill=raw[record['fill_index']]
+        # The known replacement retained this activation identity but assigned
+        # an unrelated January timestamp. Scope by original activation evidence.
+        activation_identity=(fill['order_id']==244505000001 and str(fill.get('cid'))=='28638000000001')
+        effective_mts=1789840720819 if activation_identity and fill['trade_id']==999999999999 else fill['mts']
+        if effective_mts<epoch['start_ms']:
+            continue
+        scoped.append(dict(record,effective_mts=effective_mts))
+        matches=[lot for lot in adjustments if lot['order_id']==fill['order_id']
+                 and lot['cid']==str(fill.get('cid')) and lot['mts']==effective_mts
+                 and decimal(lot['quantity_btc'])==decimal(fill['exec_amount'])]
+        if len(matches)!=1:
+            missing.append(record['trade_id'])
+    return dict(provenance, excluded_records=scoped,
+                status='MIXED_UNVERIFIED' if scoped else 'NO_KNOWN_ADJUSTMENT',
+                source='mixed_execution_and_operator_adjustments' if scoped else 'authenticated_bitfinex_fills'),missing
+
+
+def execution_fills(con):
+    """Preserve storage; expose venue executions excluding typed/known adjustments."""
+    raw=[] if con is None else [json.loads(r[0]) for r in con.execute('SELECT payload FROM fills')]
+    marked=set()
+    if con is not None and con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fill_provenance'").fetchone():
+        by_id={(x['trade_id'],x['order_id']):x for x in raw}
+        for tid,oid,kind,digest,reference in con.execute('SELECT * FROM fill_provenance'):
+            item=by_id.get((tid,oid))
+            if (kind!='operator_adjustment' or not item or not isinstance(reference,str) or not reference.strip() or len(reference)>1000 or
+                    not execution_provenance([item])['excluded_records'] or
+                    hashlib.sha256(json.dumps(item,sort_keys=True,separators=(',',':')).encode()).hexdigest()!=digest):
+                raise ValueError('invalid immutable fill provenance')
+            marked.add((tid,oid))
+    known=execution_provenance(raw)
+    excluded={x['fill_index'] for x in known['excluded_records']}
+    authentic=[f for i,f in enumerate(raw) if i not in excluded and (f['trade_id'],f['order_id']) not in marked]
+    return raw,authentic,known
+
+
 def snapshot(con, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     if now.tzinfo is None:
@@ -341,17 +417,18 @@ def snapshot(con, now=None):
         return _snapshot(con, now)
 
 def _snapshot(con, now):
-    fills = [] if con is None else [json.loads(r[0]) for r in con.execute('SELECT payload FROM fills')]
+    raw_fills,fills,provenance = execution_fills(con)
     fills.sort(key=lambda f:(f['mts'],f['trade_id'],decimal(f['exec_amount']) < 0,f['order_id']))
     period=reporting_period(con)
     result=_projection(con,now,fills,period)
-    result['execution_provenance'] = execution_provenance(fills)
+    result['execution_provenance'] = provenance
     result['source'] = result['execution_provenance']['source']
     epoch=trading_epoch(con)
     result['operational']=None
     if epoch:
         operational_fills=[f for f in fills if f['mts']>=epoch['start_ms']]
-        scoped=_projection(con,now,operational_fills,dict(period) if period else None)
+        adjustments=operational_opening_lots(con,epoch)
+        scoped=_projection(con,now,operational_fills,dict(period) if period else None,adjustments)
         if scoped['sync']['cursor_ms']<epoch['start_ms']:
             scoped['issues'].append('epoch_history_coverage_incomplete')
             scoped['status']='incomplete'
@@ -360,7 +437,19 @@ def _snapshot(con, now):
                     total[key]=None
         operational={key:scoped[key] for key in ('status','issues','sync','daily','lifetime','open_lots','orders','fill_count')}
         operational.update(epoch,scope='operational:tBTCUSD:excludes_opening_reserve')
-        operational['execution_provenance'] = execution_provenance(operational_fills)
+        scoped_provenance, missing_adjustments=operational_provenance(raw_fills,provenance,epoch,adjustments)
+        operational['execution_provenance'] = scoped_provenance
+        operational['financial_status']='UNVERIFIED' if operational['status']!='complete' else 'AUTHENTICATED_EXECUTIONS'
+        operational['opening_lot_adjustments'] = adjustments
+        if missing_adjustments:
+            operational['status']='incomplete'
+            operational['issues']=sorted(set(operational['issues']+['operational_opening_lot_missing']))
+            operational['financial_status']='UNVERIFIED'
+        if adjustments:
+            operational['financial_status']='UNVERIFIED_MANUAL_BASIS'
+            for total in (operational['daily'],operational['lifetime']):
+                for key in ('gross_pnl_usd','net_pnl_usd','fees_usd','closed_count','win_count','loss_count'):
+                    total[key]=None
         result['operational']=operational
         # Reporting may adopt this basis only if no executions fall into the
         # gap excluded by the operational epoch. The original boundary persists.
@@ -372,7 +461,8 @@ def _snapshot(con, now):
                 for key in ('gross_pnl_usd','net_pnl_usd','fees_usd','closed_count','win_count','loss_count'):
                     candidate[key]=None
             result['active_period']=candidate
-    if result['execution_provenance']['excluded_records']:
+    if result['execution_provenance']['excluded_records'] or (result['operational'] and result['operational']['opening_lot_adjustments']):
+        result['source']='mixed_execution_and_operator_adjustments'
         # Public financial claims fail closed; operational recovery is unchanged.
         result['status'] = 'incomplete'
         result['issues'] = sorted(set(result['issues'] + ['manual_reserve_basis_unverified']))
@@ -387,7 +477,7 @@ def _snapshot(con, now):
     return result
 
 
-def _projection(con, now, fills, period):
+def _projection(con, now, fills, period, adjustments=()):
     # Both scopes use the same FIFO implementation with explicitly selected fills.
     sync = state(con)
     period = dict(period) if period else None
@@ -400,11 +490,21 @@ def _projection(con, now, fills, period):
     if int(now.timestamp()*1000)-sync['cursor_ms']>120000:
         issues.append('history_sync_stale')
     period_orders = {f['order_id'] for f in fills if period and f['mts']>=period['start_ms']}
+    events=list(fills)
+    actual_orders={f['order_id'] for f in fills}
+    actual_cids={f['cid'] for f in fills if f.get('cid')}
+    for item in adjustments:
+        if item['order_id'] in actual_orders or item['cid'] in actual_cids:
+            raise ValueError('opening lot collides with authenticated order/CID')
+        events.append(dict(trade_id=None,order_id=item['order_id'],cid=item['cid'],mts=item['mts'],
+            exec_amount=item['quantity_btc'],exec_price=item['reference_price_usd'],fee='0',fee_currency='USD',
+            source='operational_opening_lot',adjustment_id=item['adjustment_id']))
+    events.sort(key=lambda f:(f['mts'],f['trade_id'] or 0,decimal(f['exec_amount'])<0,f['order_id']))
     orders = {}
-    for f in fills:
+    for f in events:
         qty, price, fee = (decimal(f[k]) for k in ('exec_amount','exec_price','fee'))
         oid = f['order_id']
-        order = orders.setdefault(oid, dict(order_id=oid,cid=f.get('cid'),exec_amount=Decimal(0),base_fee=Decimal(0),quote_fee=Decimal(0),cost=Decimal(0),volume=Decimal(0),mts=f['mts']))
+        order = orders.setdefault(oid, dict(order_id=oid,cid=f.get('cid'),exec_amount=Decimal(0),base_fee=Decimal(0),quote_fee=Decimal(0),cost=Decimal(0),volume=Decimal(0),mts=f['mts'],source=f.get('source','authenticated_exchange')))
         if order['cid'] != f.get('cid') or order['exec_amount'] * qty < 0:
             issues.append('ambiguous_order:'+str(oid))
             if oid in period_orders:
@@ -419,7 +519,7 @@ def _projection(con, now, fills, period):
         order_views.append(dict(order_id=order['order_id'],cid=order['cid'],mts=order['mts'],
             exec_amount=number(order['exec_amount']),base_fee=number(order['base_fee']),
             quote_fee=number(order['quote_fee']),
-            entry_price=number(order['cost']/order['volume'])))
+            entry_price=number(order['cost']/order['volume']),source=order['source']))
     lots=[]
     today=now.astimezone(ZoneInfo('Europe/Prague')).date()
     def totals():
@@ -430,7 +530,7 @@ def _projection(con, now, fills, period):
         issues.append(message)
         if period and f['mts']>=period['start_ms']:
             period_issues.append(message)
-    for f in fills:
+    for f in events:
         qty,price,fee=(decimal(f[k]) for k in ('exec_amount','exec_price','fee'))
         in_period=bool(period and f['mts']>=period['start_ms'])
         period_sells=period_sells or (in_period and qty<0)
@@ -578,6 +678,7 @@ def main():
     report=commands.add_parser('report')
     report.add_argument('--now')
     commands.add_parser('state')
+    commands.add_parser('calibration')
     period=commands.add_parser('start-period')
     period.add_argument('--start-ms',type=int,required=True)
     period.add_argument('--id',required=True)
@@ -601,6 +702,11 @@ def main():
         elif args.command=='start-trading-epoch': start_trading_epoch(con,args.id,args.start_ms,args.reserved_btc)
         elif args.command=='backup': backup(con,args.path)
         if con: con.execute('BEGIN')  # coherent projection across concurrent writers
+        if args.command=='calibration':
+            from pirana_calibration import build_calibration
+            paths=json.load(sys.stdin)
+            result=build_calibration(con,paths['positions'],paths['equity_dir'],int(dt.datetime.now(dt.timezone.utc).timestamp()*1000))
+            print(json.dumps(result,sort_keys=True));return 0
         result=state(con) if args.command=='state' else snapshot(con,dt.datetime.fromisoformat(args.now.replace('Z','+00:00')) if getattr(args,'now',None) else None)
         print(json.dumps(result,sort_keys=True))
         return 0

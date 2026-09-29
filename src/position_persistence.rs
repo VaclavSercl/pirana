@@ -2067,4 +2067,41 @@ mod tests {
         assert!(result.is_err());
         assert!(!submitted.load(Ordering::SeqCst));
     }
+
+    /// Extra real-fixture integration check. Private account data is never tracked.
+    #[test]
+    #[ignore = "requires owner-provided private recovery fixture directory"]
+    fn external_snapshot_recovery_preserves_inventory() {
+        let source = std::path::PathBuf::from(
+            std::env::var("PIRANA_RECOVERY_FIXTURE").expect("private fixture"),
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(source.join("candidate-projection.json")).unwrap(),
+        )
+        .unwrap();
+        let temp = std::env::temp_dir().join(format!(
+            "pirana-external-recovery-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        let path = temp.join("positions.json");
+        std::fs::copy(source.join("positions.json"), &path).unwrap();
+        let book = PositionBook::open(&path, &report["operational"]).expect(
+            "full journal must recover from typed operational lot plus authenticated fills",
+        );
+        let quantity: f64 = book.read().iter().map(|p| p.quantity).sum();
+        let wallet: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("expected-wallet.json")).unwrap())
+                .unwrap();
+        let expected = wallet["btc"].as_str().unwrap().parse::<f64>().unwrap();
+        assert!((quantity - expected).abs() < 1e-12);
+        assert!(book.pending_entries().is_empty());
+        assert!(book.unresolved_exits().is_empty());
+        drop(book);
+        let again = PositionBook::open(&path, &report["operational"]).unwrap();
+        assert!((again.read().iter().map(|p| p.quantity).sum::<f64>() - quantity).abs() < 1e-12);
+        drop(again);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
 }

@@ -30,7 +30,21 @@ def integer(value):
 def canonical_fills(db):
     with sqlite3.connect(Path(db).resolve().as_uri() + '?mode=ro', uri=True) as con:
         con.execute('BEGIN')
-        fills = [json.loads(row[0]) for row in con.execute('SELECT payload FROM fills')]
+        try:
+            from scripts.pirana_accounting import execution_fills
+        except ImportError:
+            from pirana_accounting import execution_fills
+        raw, fills, provenance = execution_fills(con)
+        actual_ids = {(f['trade_id'], f['order_id']) for f in fills}
+        excluded_indexes = {x['fill_index'] for x in provenance['excluded_records']}
+        for index, f in enumerate(raw):
+            if (f['trade_id'], f['order_id']) not in actual_ids and index not in excluded_indexes:
+                provenance['excluded_records'].append(dict(fill_index=index,
+                    trade_id=f['trade_id'], order_id=f['order_id'], cid=f.get('cid'),
+                    classification='typed_operator_adjustment',
+                    reason='Immutable fill provenance identifies a non-execution adjustment'))
+        if provenance['excluded_records']:
+            provenance.update(status='MIXED_UNVERIFIED', source='mixed_execution_and_operator_adjustments')
         sync = con.execute('SELECT cursor_ms,coverage_start_ms,complete FROM sync WHERE id=1').fetchone()
     seen = set()
     for f in fills:
@@ -42,7 +56,7 @@ def canonical_fills(db):
         if f['symbol'] != 'tBTCUSD' or not dec(f['exec_amount']) or dec(f['exec_price']) <= 0:
             raise ValueError('invalid execution')
         dec(f['fee'])
-    return sorted(fills, key=lambda f: (f['mts'], f['trade_id'], f['order_id'])), sync
+    return sorted(fills, key=lambda f: (f['mts'], f['trade_id'], f['order_id'])), sync, provenance
 
 
 def historical_gaps(fills):
@@ -188,19 +202,13 @@ def main():
     p.add_argument('--benchmarks', help='default: sibling positions.benchmarks.json')
     p.add_argument('--equity-dir', required=True); p.add_argument('--start-ms', type=int, required=True)
     p.add_argument('--end-ms', type=int, default=None)
-    p.add_argument('--funding-valuations', help='optional owner-approved funding-date marks; never changes FIFO')
+    p.add_argument('--funding-valuations', help='optional funding-date market marks or owner-declared basis; never changes FIFO')
     args = p.parse_args()
     end = args.end_ms if args.end_ms is not None else int(time.time() * 1000)
     if args.start_ms < 0 or end < args.start_ms:
         p.error('invalid interval')
-    fills, sync = canonical_fills(args.db)
-    try:
-        from scripts.pirana_accounting import execution_provenance
-    except ImportError:
-        from pirana_accounting import execution_provenance
-    provenance = execution_provenance(fills)
-    excluded = {entry['fill_index'] for entry in provenance['excluded_records']}
-    fills = [fill for index, fill in enumerate(fills) if index not in excluded]
+    fills, sync, provenance = canonical_fills(args.db)
+    excluded = provenance['excluded_records']
     benchmarks = read_benchmarks(args.benchmarks or Path(args.positions).with_suffix('.benchmarks.json'))
     samples, sources = read_equity(args.equity_dir)
     fresh = bool(sync and sync[2] == 1 and sync[1] == 0 and 0 <= end - sync[0] <= 120000)
@@ -217,6 +225,12 @@ def main():
             except ImportError:
                 from scripts.pirana_funding_valuations import load_valuations
             report['funding_valuations'] = load_valuations(args.funding_valuations)
+            owner_basis = report['funding_valuations']['classification'] == 'owner_declared_cost_basis'
+            report['funding_valuation_semantics'] = dict(
+                kind='owner_declared_cost_basis' if owner_basis else 'funding_date_market_valuation',
+                label='Owner-declared purchase basis, not independently verified' if owner_basis else 'Owner-approved funding-date market valuation, not purchase cost',
+                historical_performance='UNVERIFIED: declaration or mark does not establish complete flows or strategy attribution',
+                canonical_fifo='UNCHANGED')
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
             report['funding_valuations'] = dict(status='UNVERIFIED', actual_acquisition_basis='UNKNOWN',
                                                reason='invalid funding valuation evidence')

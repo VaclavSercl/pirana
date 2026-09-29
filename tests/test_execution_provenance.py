@@ -34,30 +34,21 @@ def test_known_adjustment_and_any_identity_collision_are_unverified():
     assert accounting.execution_provenance([ordinary])["excluded_records"] == []
 
 
-def test_snapshot_preserves_operational_projection_and_database_rows(tmp_path):
+def test_snapshot_excludes_synthetic_execution_and_preserves_database_rows(tmp_path):
     con = accounting.connect(tmp_path/"fixture.sqlite3", True)
     try:
         accounting.ingest(con, dict(fills=[synthetic()], sync=dict(start_ms=0, end_ms=NOW, complete=True)))
         con.execute(accounting.EPOCH_DDL)
         con.execute("INSERT INTO trading_epoch VALUES (1, 'fixture', ?, '0')", (NOW-3000,))
         accounting.start_period(con, "fixture", NOW-3000)
-        rows_before = con.execute("SELECT * FROM fills").fetchall()
-        now = dt.datetime.fromtimestamp(NOW/1000, dt.timezone.utc)
-        actual = accounting.snapshot(con, now)
-        no_marker = dict(status="NO_KNOWN_ADJUSTMENT", source="authenticated_bitfinex_fills", excluded_records=[])
-        with patch.object(accounting, "execution_provenance", return_value=no_marker):
-            prior = accounting.snapshot(con, now)
-        op = actual["operational"].copy()
-        before_op = prior["operational"].copy()
-        assert op.pop("execution_provenance")["status"] == "MIXED_UNVERIFIED"
-        before_op.pop("execution_provenance")
-        assert op == before_op
-        assert op["status"] == "complete"
-        assert op["open_lots"][0]["remaining_btc"] == "0.00051"
-        assert actual["source"] == "mixed_execution_and_operator_adjustments"
-        assert actual["active_period"]["net_pnl_usd"] is None
-        assert actual["active_period"]["status"] == "incomplete"
-        assert con.execute("SELECT * FROM fills").fetchall() == rows_before
+        before = con.execute("SELECT * FROM fills").fetchall()
+        actual = accounting.snapshot(con, dt.datetime.fromtimestamp(NOW/1000, dt.timezone.utc))
+        assert actual['fill_count']==0
+        assert actual['operational']['status']=='incomplete'
+        assert 'operational_opening_lot_missing' in actual['operational']['issues']
+        assert actual['operational']['open_lots']==[]
+        assert actual['active_period']['net_pnl_usd'] is None
+        assert con.execute("SELECT * FROM fills").fetchall()==before
     finally:
         con.close()
 
@@ -85,7 +76,7 @@ def test_measurements_lists_exclusion_without_counting_it_as_execution(capsys):
     fills = [synthetic(), real]
     with patch("sys.argv", ["measurements", "--db", "unused", "--positions", "unused",
             "--equity-dir", "unused", "--start-ms", str(NOW-5000), "--end-ms", str(NOW)]), patch.object(
-            measurements, "canonical_fills", return_value=(fills, (NOW, 0, 1))), patch.object(
+            measurements, "canonical_fills", return_value=([real], (NOW, 0, 1), accounting.execution_provenance(fills))), patch.object(
             measurements, "read_benchmarks", return_value={}), patch.object(measurements, "read_equity", return_value=([], [])):
         assert measurements.main() == 0
     result = json.loads(capsys.readouterr().out)
