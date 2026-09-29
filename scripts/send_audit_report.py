@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Čáslav :: Odeslání forenzního auditního reportu v5.1 na Telegram.
+Čáslav :: Aktuální kanonický a provozní report na Telegram.
 Rozdělí report na části podle limitu Telegramu (4096 znaků) a odešle je v pořadí.
 """
 
+import argparse
+import html
+import json
+import subprocess
 import os
 import sys
 import time
@@ -26,161 +30,52 @@ def load_env():
     return env
 
 
-PARTS = [
-# ── ČÁST 1 ────────────────────────────────────────────────────────────
-"""🔍 <b>FORENZNÍ AUDIT — PIRANA / ČÁSLAV v5.1</b>
-📅 <code>23. 08. 2026 12:45 CEST</code>
-━━━━━━━━━━━━━━━━━━━━━━
+def probe(argv):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=8, check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
-<b>1. VERDIKT ÚVODEM</b>
 
-Nasazení je <b>reálné a konzistentní</b>. Git, binárka i běžící proces sedí na sebe. Testy prochází. Dvě ze tří klíčových oprav v5.1 jsou prokazatelně funkční v produkci.
+def runtime_evidence():
+    head = probe(["git", "-C", "/home/wwwenda/workspace/pirana", "rev-parse", "HEAD"])
+    args = ["systemctl", "show", "pirana.service", "--property=MainPID,ActiveState,NRestarts,ExecMainStartTimestamp"]
+    before = probe(args)
+    fields = dict(line.split("=", 1) for line in (before or "").splitlines() if "=" in line)
+    digest = None
+    pid = fields.get("MainPID", "")
+    if pid.isascii() and pid.isdecimal() and int(pid) > 0:
+        digest = probe(["sha256sum", "/proc/" + pid + "/exe"])
+        digest = digest.split()[0] if digest else None
+        if not digest or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            digest = None
+    if probe(args) != before:
+        digest = None
+    return "\n".join([
+        "Checkout HEAD: " + (head or "NEOVĚŘENO"),
+        "Binárka SHA-256: " + (digest or "NEOVĚŘENO"),
+        "Služba: " + fields.get("ActiveState", "NEOVĚŘENO") + "; PID: " + fields.get("MainPID", "NEOVĚŘENO"),
+        "Start: " + fields.get("ExecMainStartTimestamp", "NEOVĚŘENO") + "; NRestarts: " + fields.get("NRestarts", "NEOVĚŘENO"),
+        "HEAD a hash jsou samostatné údaje; shoda sestavení není doložena."])
 
-Ale nalezl jsem <b>jeden zásadní rozpor</b> mezi tím, co commit tvrdí, a tím, co systém dělá — a jednu riskantní změnu, která se ještě nestihla projevit.
 
-━━━━━━━━━━━━━━━━━━━━━━
-<b>2. INTEGRITA NASAZENÍ</b> ✅
+def chunks(text):
+    return [html.escape(text[i:i+3000]) for i in range(0, len(text), 3000)]
 
-• Lokální HEAD: <code>a320e891fc1a0b6c...</code>
-• origin/main: <code>a320e891fc1a0b6c...</code> ✅ <b>shodné</b>
-• Pracovní strom: 0 změn ✅ čistý
-• Commit rozsah: 7 souborů, +1377 / −11
-• Binárka: 12:16:01 ✅ novější než všechny zdrojáky
-• <code>pirana.service</code>: active od 12:17:47, <b>NRestarts=0</b> ✅
-• <code>pirana-exporter</code>: active ✅
-• Paměť: 28,3 MB ✅
-• <code>cargo test --workspace</code>: <b>59/59 passed</b> ✅
-• <code>cargo build --release</code>: 0 varování ✅
-• SHA-256 master promptu: <code>96b717b5...b3d18</code> ✅ sedí s CHANGELOGem
 
-Chronologie bezchybná: zdrojáky (12:15–12:19) → build (12:16) → commit (12:22) → služba běží od 12:17 bez restartu. <b>Žádný drift.</b>""",
-
-# ── ČÁST 2 ────────────────────────────────────────────────────────────
-"""<b>3. CO SKUTEČNĚ FUNGUJE</b> ✅
-<i>(ověřeno v produkci)</i>
-
-<b>3.1 Win-rate: matematicky opraveno</b>
-
-Kód <code>main.rs:1025-1036</code> je korektní — otevírací fill s PnL==0 se do statistiky nepočítá.
-
-Živá data poprvé v historii souhlasí:
-<pre>closed_trades  = 8
-winning_trades = 4
-win_rate       = 0.5   ✅ přesně 4/8</pre>
-
-Dřív dashboard hlásil 57 % proti 35,7 % na burze. Rozpor je pryč. Zároveň <code>trades_today == closed_trades</code>, takže oprava z Fáze 1 zůstala zachována — <b>obě opravy do sebe zapadly bez konfliktu</b>.
-
-<b>3.2 VPIN guard: aktivní a reálně blokuje</b>
-
-<pre>12:19:27 WARN ⚠️ [VPIN HIGH TOXICITY]
-VPIN=65.2% >= 65%
-Adverse selection guard active,
-skipping standard noise entries</pre>
-
-Aktuální VPIN <b>75,2 %</b> — nad emergency prahem. Logika je promyšlená: blokuje šumové vstupy, ale propustí signál potvrzený lead-lag nebo Hawkes kaskádou.
-
-<b>3.3 Opravy z Fáze 1 &amp; 2 přežily</b>
-
-Fill-price accounting, <code>reanchor_equity()</code>, governance gate i <code>update_order()</code> jsou netknuté. Commit v5.1 na ně navázal, nepřepsal je.""",
-
-# ── ČÁST 3 ────────────────────────────────────────────────────────────
-"""🔴 <b>4. KRITICKÝ NÁLEZ</b>
-<b><code>self_calibration.rs</code> je mrtvý kód</b>
-
-Commit <code>a320e89</code> prohlašuje:
-<i>„Limity nejsou konstanty, ale funkce odvozené z měřených dat… Brána P(ruin) jako FUNKCE EXPOZICE… Rate limit +30 %/cyklus"</i>
-
-<b>Realita:</b> modul o 730 řádcích je v <code>lib.rs</code> deklarován, ale <b>nikde se nevolá</b>:
-
-<pre>grep -rn "recalibrate|SelfCalibration|
-TradingStats|DerivedParam" src/ crates/
-→ jediné výskyty jsou uvnitř
-  self_calibration.rs samotného</pre>
-
-Risk engine dál používá <b>staré tvrdé konstanty</b>:
-• <code>MAX_AGGREGATE_EXPOSURE = 0.90</code> → engine.rs:194
-• <code>MAX_SINGLE_TRADE_RISK = 0.05</code> → engine.rs:176
-• <code>CONSECUTIVE_LOSS_THRESHOLD = 5</code> → engine.rs:133
-• <code>MAX_DAILY_DRAWDOWN = 0.03</code> → engine.rs:95
-
-<b>Dopad:</b> Kelly sizing, volatility targeting, adaptivní drawdown, kalibrovaný VPIN práh ani opravená brána P(ruin) <b>nemají v ostrém provozu žádný efekt</b>. Systém běží na stejné statické konfiguraci jako před v5.1.
-
-Je to dobře napsaný a otestovaný modul (18 testů vč. regrese <code>v50_bug_derisking...</code>) — ale zatím jen knihovna na polici. Chybí sběr <code>TradingStats</code> a periodické volání <code>recalibrate()</code>.
-
-<i>Ironie: modul zavádí princip „hodnota bez vzorce je neplatná a runtime ji odmítne". Runtime ji neodmítá, protože tento typ vůbec nezná.</i>""",
-
-# ── ČÁST 4 ────────────────────────────────────────────────────────────
-"""🟠 <b>5. VYSOKÉ RIZIKO</b>
-<b>20× větší pozice bez aktivní kalibrace</b>
-
-<pre>position_size_pct     1.0 → 20.0  (20×)
-min_position_size_pct 1.0 → 5.0   (5×)
-max_position_size_pct 15.0 → 25.0 (+67%)</pre>
-
-Živá data: velikost obchodu vyskočila <b>14×</b>, z 0.000052 na <b>0.000726 BTC</b>. Expozice <b>69,98 %</b>.
-
-Odůvodnění v commitu je věcně správné („89 % kapitálu leželo ladem"). <b>Problém je načasování:</b> tento skok měl být krytý právě Kelly sizingem a volatility targetingem ze <code>self_calibration.rs</code>. Ty ale neběží (§4).
-
-Výsledek = <b>nejagresivnější konfigurace v historii systému bez samoregulační smyčky</b>.
-
-Konkrétní čísla:
-• Nejhorší dnešní obchod: <b>−0.0378 USD</b>
-  (dřív typicky −0.0015 → <b>25× větší</b>)
-• Nejlepší: +0.0807 USD
-• Denní PnL: <b>+0.1134 USD</b> ✅ zatím pozitivní
-• <code>consecutive_losses = 1</code> (práh Defensive = 5)
-
-Pojistky formálně existují, ale jsou to statické konstanty, ne kalibrované hodnoty. Při VPIN 75 % a 70% expozici si to zaslouží dohled.""",
-
-# ── ČÁST 5 ────────────────────────────────────────────────────────────
-"""<b>6. DALŠÍ ZJIŠTĚNÍ</b>
-
-# P1 vyreseno 24.8. — stary master_system_prompt.md byl odstranen z disku.
-
-🟡 <b>P2</b> — <code>Cargo.toml.example</code> deklaruje verzi <code>5.0.0</code>, zatímco vše ostatní je v5.1.
-
-🟡 <b>P2</b> — <code>daily_loss_limit_usd = 50.0</code> zůstává v USD, ačkoli doktrína v5.1 nařizuje účtování v satoshi.
-
-🟡 <b>P2</b> — Nálezy z mého auditu stále otevřené: OFI z ticker cen, A-S target inventory, mrtvý <code>PiranaConfig</code>.
-
-ℹ️ <code>Ai-komunikace.json</code> — 329 zpráv, 1,2 MB. Doložený audit trail vzniku v5.1.
-
-━━━━━━━━━━━━━━━━━━━━━━
-<b>7. ZÁVĚREČNÉ HODNOCENÍ</b>
-
-• Integrita nasazení — ✅ bezchybná
-• Kvalita kódu v5.1 — ✅ výborná (59/59, 0 warn)
-• Win-rate oprava — ✅ ověřena v produkci
-• VPIN guard — ✅ aktivní
-• Samokalibrační smyčka — 🔴 napsaná, nezapojená
-• Risk/reward konfigurace — 🟠 agresivní bez pojistky
-• Soulad commit ↔ realita — 🔴 commit slibuje víc
-
-<b>Shrnutí jednou větou:</b>
-<i>v5.1 je poctivě odvedená práce s jednou nedodělanou spojkou — samokalibrační motor je postavený a otestovaný, ale není připojený k převodovce, přičemž plyn byl mezitím přidán na dvacetinásobek.</i>""",
-
-# ── ČÁST 6 ────────────────────────────────────────────────────────────
-"""<b>8. DOPORUČENÉ POŘADÍ NÁPRAVY</b>
-
-<b>1. P0 — Zapojit <code>self_calibration.rs</code></b>
-Sběr <code>TradingStats</code> z uzavřených round-tripů + periodické <code>recalibrate()</code> (např. každých 50 obchodů nebo 1×/h), s aplikací <code>RiskState</code> do risk engine místo statických konstant.
-
-<b>2. P0/dočasně — Snížit sizing</b>
-Než kalibrace poběží, zvážit <code>position_size_pct</code> z 20 na ~8–10 jako přechodový kompromis. Aktuální VPIN 75 % tomu nahrává.
-
-<b>3. P1 — Vyjasnit master prompt</b>
-Odstranit/archivovat <code>master_system_prompt.md</code>, aby bylo jednoznačné, co se načítá.
-
-<b>4. P2 — Dokončit satoshi doktrínu</b>
-<code>daily_loss_limit_usd</code> → <code>daily_loss_limit_sats</code>.
-
-<b>5. P2 — Uzavřít zbylé nálezy</b>
-OFI trade flow, A-S target inventory, <code>PiranaConfig</code>.
-
-━━━━━━━━━━━━━━━━━━━━━━
-👑 <b>ČÁSLAV :: KONEC REPORTU</b>
-<i>Audit provedl Hermes Agent — ověřeno proti živému systému, gitu i GitHubu.</i>""",
-]
+def build_report():
+    from datetime import datetime, timezone
+    try:
+        from scripts.pirana_report import generate_report_data, format_text_report
+    except ModuleNotFoundError:
+        from pirana_report import generate_report_data, format_text_report
+    now = datetime.now(timezone.utc)
+    data = generate_report_data(include_runtime=True, now_arg=now.isoformat())
+    return ("Aktuální kontrola Pirana\nUTC: " + now.isoformat() + "\n"
+            + runtime_evidence() + "\n" + format_text_report(data)
+            + "\nTýdenní výkonnost, drawdown a skluz: NEOVĚŘENO pro přesné týdenní období."
+            + "\nTesty a audit kódu nebyly touto kontrolou spuštěny.")
 
 
 def send(token, chat_id, text, idx, total):
@@ -193,32 +88,43 @@ def send(token, chat_id, text, idx, total):
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
-        ok = resp.status == 200
+        ok = resp.status == 200 and json.loads(resp.read(65536)).get("ok") is True
         print(f"[{'OK' if ok else 'FAIL'}] část {idx}/{total} "
               f"({len(text)} znaků) status={resp.status}")
         return ok
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    report = build_report()
+    if args.dry_run:
+        print(report)
+        return 0
     env = load_env()
-    token = env.get("TELEGRAM_BOT_TOKEN")
-    chat_id = env.get("TELEGRAM_CHAT_ID", "1076582576")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", env.get("TELEGRAM_BOT_TOKEN"))
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", env.get("TELEGRAM_CHAT_ID"))
 
-    if not token:
+    if not token or not chat_id:
         print("[ERROR] TELEGRAM_BOT_TOKEN není v .env", file=sys.stderr)
         return 1
 
-    total = len(PARTS)
+    parts = chunks(report)
+    total = len(parts)
     sent = 0
-    for i, part in enumerate(PARTS, start=1):
+    for i, part in enumerate(parts, start=1):
         if len(part) > 4096:
             print(f"[WARN] část {i} má {len(part)} znaků — nad limit!",
                   file=sys.stderr)
         try:
             if send(token, chat_id, part, i, total):
                 sent += 1
+            else:
+                return 1
         except Exception as e:
-            print(f"[ERROR] část {i} selhala: {e}", file=sys.stderr)
+            print(f"[ERROR] část {i}: delivery failed or uncertain", file=sys.stderr)
+            return 1
         time.sleep(1.2)  # rate limit Telegramu
 
     print(f"\nOdesláno {sent}/{total} částí na chat_id={chat_id}")

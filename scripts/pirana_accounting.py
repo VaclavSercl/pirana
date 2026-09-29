@@ -296,6 +296,42 @@ def ingest(con, batch):
         con.rollback()
         raise
 
+def execution_provenance(fills):
+    """Classify known legacy reserve adjustments without mutating accounting.
+
+    These identities originate in unlock_btc_reserve.py, not authenticated venue
+    responses. Any partial identity collision is unverified, not a real fill.
+    Absence of a known marker is not an independent authentication audit.
+    """
+    excluded = []
+    for index, fill in enumerate(fills):
+        if not (str(fill.get('trade_id')) == '1978200001'
+                or str(fill.get('order_id')) == '244505000001'
+                or str(fill.get('cid')) == '28638000000001'):
+            continue
+        exact = (type(fill.get('trade_id')) is int and fill['trade_id'] == 1978200001
+                 and type(fill.get('order_id')) is int and fill['order_id'] == 244505000001
+                 and str(fill.get('cid')) == '28638000000001'
+                 and fill.get('symbol') == 'tBTCUSD' and fill.get('fee_currency') == 'USD')
+        try:
+            exact = exact and decimal(fill.get('exec_amount')) == Decimal('0.00051')
+            exact = exact and decimal(fill.get('exec_price')) == Decimal('81500')
+            exact = exact and decimal(fill.get('fee')) == 0
+        except (ValueError, TypeError, ArithmeticError):
+            exact = False
+        excluded.append(dict(fill_index=index,
+            trade_id=fill.get('trade_id'), order_id=fill.get('order_id'), cid=fill.get('cid'),
+            classification='legacy_reserve_activation' if exact else 'reserved_identity_collision',
+            reason='Identity declared by scripts/unlock_btc_reserve.py; not authenticated execution evidence',
+            documented_quantity_btc='0.00051', documented_reference_price_usd='81500',
+            actual_acquisition_basis='UNKNOWN', owner_authorization='NOT_ESTABLISHED',
+            reference_price_semantics='legacy_script_input_not_confirmed_acquisition'))
+    return dict(status='MIXED_UNVERIFIED' if excluded else 'NO_KNOWN_ADJUSTMENT',
+                source='mixed_execution_and_operator_adjustments' if excluded else 'authenticated_bitfinex_fills',
+                excluded_records=excluded,
+                limitation='Known adjustment classification only; absence of a marker is not an independent authentication audit.')
+
+
 def snapshot(con, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     if now.tzinfo is None:
@@ -309,6 +345,8 @@ def _snapshot(con, now):
     fills.sort(key=lambda f:(f['mts'],f['trade_id'],decimal(f['exec_amount']) < 0,f['order_id']))
     period=reporting_period(con)
     result=_projection(con,now,fills,period)
+    result['execution_provenance'] = execution_provenance(fills)
+    result['source'] = result['execution_provenance']['source']
     epoch=trading_epoch(con)
     result['operational']=None
     if epoch:
@@ -322,6 +360,7 @@ def _snapshot(con, now):
                     total[key]=None
         operational={key:scoped[key] for key in ('status','issues','sync','daily','lifetime','open_lots','orders','fill_count')}
         operational.update(epoch,scope='operational:tBTCUSD:excludes_opening_reserve')
+        operational['execution_provenance'] = execution_provenance(operational_fills)
         result['operational']=operational
         # Reporting may adopt this basis only if no executions fall into the
         # gap excluded by the operational epoch. The original boundary persists.
@@ -333,6 +372,18 @@ def _snapshot(con, now):
                 for key in ('gross_pnl_usd','net_pnl_usd','fees_usd','closed_count','win_count','loss_count'):
                     candidate[key]=None
             result['active_period']=candidate
+    if result['execution_provenance']['excluded_records']:
+        # Public financial claims fail closed; operational recovery is unchanged.
+        result['status'] = 'incomplete'
+        result['issues'] = sorted(set(result['issues'] + ['manual_reserve_basis_unverified']))
+        for key in ('daily', 'lifetime', 'active_period'):
+            if isinstance(result.get(key), dict):
+                unknown = dict(result[key])
+                for field in ('gross_pnl_usd', 'net_pnl_usd', 'fees_usd', 'closed_count', 'win_count', 'loss_count'):
+                    unknown[field] = None
+                unknown['status'] = 'incomplete'
+                unknown['issues'] = sorted(set(unknown.get('issues', []) + ['manual_reserve_basis_unverified']))
+                result[key] = unknown
     return result
 
 

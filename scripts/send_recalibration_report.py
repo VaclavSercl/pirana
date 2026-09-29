@@ -1,201 +1,267 @@
 #!/usr/bin/env python3
+"""Read-only calibration observations and deterministic morning report.
+
+A generation counter is not a calibration event log. No risk changes, agents,
+registry publication or exchange requests are performed by this entrypoint.
 """
-Pirana Daily Calibration Audit (CASLAV §8.2)
-============================================
-
-Spouští se denně v 06:00 (hodinu před ranním auditem).
-AUDITUJE, co kalibrace SKUTEČNĚ udělala za posledních 24 hodin.
-
-Logika:
-1. Načte aktuální stav kalibrace z API
-2. Porovná s uloženým stavem z předchozího dne (/var/lib/pirana/last_calibration.json)
-3. Reportuje DELTA — co se skutečně změnilo
-4. Ověří invarianty (P(ruin) roste s expozicí, risk_state.json na disku)
-
-NEvolá rekalibraci — tu dělá Rust engine každých 15 min (main.rs:410).
-"""
-
-import os
-import sys
+import argparse
+from datetime import datetime, timezone
+import html
 import json
-import subprocess
-import urllib.request
-import urllib.parse
+import math
+import os
 from pathlib import Path
-from datetime import datetime
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
 
 ENV_FILE = Path("/home/wwwenda/workspace/pirana/.env")
 LAST_STATE_FILE = Path("/var/lib/pirana/last_calibration.json")
-SNAPSHOT_URLS = [
-    "http://127.0.0.1:8080/api/snapshot",
-    "http://127.0.0.1:80/api/snapshot",
-]
-# [FILL TRUTH pro risk state] Runtime (pirana-risk-engine/persistence.rs)
-# používá /opt/caslav/risk/risk_state.json — viz DEFAULT_RISK_STATE_PATH.
-# Kontrola na .toml byla falešná (master prompt §8.4 mluví o TOML, ale
-# implementace perzistuje JSON; soubor .toml nikdy neexistoval).
 RISK_STATE_FILE = Path("/opt/caslav/risk/risk_state.json")
+SNAPSHOT_URLS = ["http://127.0.0.1:8080/api/snapshot", "http://127.0.0.1:80/api/snapshot"]
+FIELDS = ("max_aggregate_exposure", "max_single_trade_risk", "vpin_toxicity_threshold", "p_ruin_1y")
+# Reporting freshness classification only; never an instruction to recalibrate.
+FRESHNESS_SECONDS = 86400
+UNKNOWN = "NEOVĚŘENO"
+
+
+def strict_json(text):
+    def reject(_):
+        raise ValueError("non-finite JSON")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+    return json.loads(text, parse_constant=reject, object_pairs_hook=unique)
+
+
+def number(value, maximum=1.0):
+    if type(value) not in (int, float) or not 0 <= value <= maximum or not math.isfinite(value):
+        return None
+    return value
+
+
+def timestamp(value, now):
+    return value if type(value) is int and 0 < value <= now else None
+
+
+def iso(value):
+    return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
 def load_env():
-    env = {}
-    if ENV_FILE.exists():
+    keys = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+    result = {key: os.environ[key] for key in keys if os.environ.get(key)}
+    if len(result) == len(keys):
+        return result
+    try:
         for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"').strip("'")
-    return env
+            key, sep, value = line.partition("=")
+            if sep and key.strip() in keys and key.strip() not in result:
+                result[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass  # Missing configuration is reported explicitly by main.
+    return result
 
 
 def get_snapshot():
     for url in SNAPSHOT_URLS:
         try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                if resp.status == 200:
-                    return json.loads(resp.read().decode())
-        except Exception:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                raw = response.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    continue
+                value = strict_json(raw.decode())
+                if response.status == 200 and isinstance(value, dict):
+                    return value
+        except (OSError, ValueError):
             continue
     return None
 
 
 def load_last_state():
-    """Načte stav kalibrace z předchozího dne."""
-    if not LAST_STATE_FILE.exists():
-        return None
     try:
-        return json.loads(LAST_STATE_FILE.read_text())
-    except Exception:
+        value = strict_json(LAST_STATE_FILE.read_text())
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
         return None
 
 
-def save_current_state(calib):
-    """Uloží aktuální stav pro zítřejší porovnání."""
+def save_current_state(calib, now=None):
+    now = int(time.time()) if now is None else now
+    state = {"schema_version": 2, "observed_at": now,
+             "generation": calib.get("generation"), "sample_size": calib.get("sample_size"),
+             "calibrated_at": calib.get("calibrated_at")}
+    temporary = None
     try:
-        LAST_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        state = {
-            "date": datetime.now().isoformat(),
-            "generation": calib.get("generation", 0),
-            "sample_size": calib.get("sample_size", 0),
-            "max_aggregate_exposure": calib.get("max_aggregate_exposure", {}).get("value", 0.0),
-            "max_single_trade_risk": calib.get("max_single_trade_risk", {}).get("value", 0.0),
-            "vpin_toxicity_threshold": calib.get("vpin_toxicity_threshold", {}).get("value", 0.0),
-            "p_ruin_1y": calib.get("p_ruin_1y", {}).get("value", 0.0),
-        }
-        LAST_STATE_FILE.write_text(json.dumps(state, indent=2))
+        if LAST_STATE_FILE.is_symlink() or not LAST_STATE_FILE.parent.is_dir():
+            return False
+        with tempfile.NamedTemporaryFile(mode="w", dir=LAST_STATE_FILE.parent, delete=False) as out:
+            temporary = Path(out.name)
+            json.dump(state, out, allow_nan=False)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, LAST_STATE_FILE)
         return True
-    except Exception as e:
-        print(f"Cannot save state: {e}", file=sys.stderr)
+    except (OSError, ValueError, TypeError):
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        print("Calibration baseline persistence failed", file=sys.stderr)
         return False
 
 
-def check_risk_state_file():
-    """Ověří, že risk_state.json existuje a je čitelný."""
-    if not RISK_STATE_FILE.exists():
-        return None, "soubor neexistuje"
+def check_risk_state_file(now=None):
+    now = int(time.time()) if now is None else now
     try:
-        content = RISK_STATE_FILE.read_text()
-        if "max_aggregate_exposure" in content:
-            return True, "OK"
-        return False, "neobsahuje max_aggregate_exposure"
-    except Exception as e:
-        return False, str(e)
+        with RISK_STATE_FILE.open("rb") as source:
+            raw = source.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return False, "NEOVĚŘENO: soubor překračuje limit"
+        value = strict_json(raw.decode())
+        if not isinstance(value, dict):
+            raise ValueError("object required")
+        calibrated = timestamp(value.get("calibrated_at"), now)
+        generation = value.get("calibration_generation")
+        if calibrated is None or type(generation) is not int or generation < 0:
+            raise ValueError("invalid calibration identity")
+        for key in FIELDS:
+            entry = value.get(key)
+            if not isinstance(entry, dict) or number(entry.get("value")) is None:
+                raise ValueError("invalid parameter")
+            if timestamp(entry.get("computed_at"), now) != calibrated:
+                raise ValueError("parameter age differs")
+            if not all(isinstance(entry.get(k), str) and entry[k].strip() for k in ("formula", "inputs")):
+                raise ValueError("missing provenance")
+        age = now - calibrated
+        label = f"JSON a vybrané parametry validní; generace {generation}; stáří {age // 3600} h"
+        if age > FRESHNESS_SECONDS:
+            return False, label + "; STARÉ (více než 24 h)"
+        return True, label + "; nejde o důkaz správnosti vzorců ani shody runtime"
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return False, "NEOVĚŘENO: chybějící, nečitelný nebo neplatný JSON/schema/čas"
+
+
+def build_calibration_report(snap, last, risk_result, now):
+    calib = snap.get("calibration") if isinstance(snap, dict) else None
+    if not isinstance(calib, dict):
+        return "KALIBRAČNÍ POZOROVÁNÍ — NEOVĚŘENO: API/kalibrace nedostupná", 2
+    gen = calib.get("generation")
+    sample = calib.get("sample_size")
+    valid_counts = all(type(v) is int and 0 <= v <= 10**12 for v in (gen, sample))
+    calibrated = timestamp(calib.get("calibrated_at"), now)
+    age = now - calibrated if calibrated is not None else None
+    lines = ["KALIBRAČNÍ POZOROVÁNÍ", "Pozorováno UTC: " + iso(now),
+             "Generace v runtime: " + (str(gen) if valid_counts else UNKNOWN),
+             "Vzorků v runtime: " + (str(sample) if valid_counts else UNKNOWN)]
+    uptime = number(snap.get("uptime_seconds"), 10**12)
+    if calibrated is not None:
+        lines.append(f"Výpočet UTC: {iso(calibrated)}; stáří {age // 3600} h {age % 3600 // 60} min")
+        if uptime is not None and calibrated < now - uptime:
+            lines.append("Generace předchází startu procesu: obnovený historický stav, nikoli nový výpočet.")
+        if age > FRESHNESS_SECONDS:
+            lines.append("STARÁ KALIBRACE: více než 24 h; frekvence pokusů není důkaz nového výpočtu.")
+    else:
+        lines.append("Čas a stáří výpočtu: " + UNKNOWN)
+    old_time = timestamp(last.get("observed_at"), now) if isinstance(last, dict) else None
+    if old_time is not None:
+        lines.append(f"Interval pozorování: {iso(old_time)} až {iso(now)} ({now - old_time} s)")
+    lines.append("Počet rekalibrací a změna za 24 h: NEOVĚŘENO — chybí úplný deník událostí v okně.")
+    valid_values = True
+    for key in FIELDS:
+        entry = calib.get(key)
+        value = number(entry.get("value")) if isinstance(entry, dict) else None
+        computed = timestamp(entry.get("computed_at"), now) if isinstance(entry, dict) else None
+        valid = value is not None and computed is not None and computed == calibrated
+        valid_values &= valid
+        lines.append(key + ": " + (format(value, ".8g") if valid else UNKNOWN))
+    lines.extend(["P(ruin) je modelový bodový odhad, ne naměřená pravděpodobnost ani bezpečnostní certifikát.",
+                  "Monotonicita P(ruin) vůči expozici: NEOVĚŘENO — jeden skalár ji nedokazuje.",
+                  "risk_state.json: " + risk_result[1],
+                  "PŮVOD DAT: místní runtime API a disk; žádná změna parametrů."])
+    healthy = valid_counts and valid_values and age is not None and age <= FRESHNESS_SECONDS and risk_result[0]
+    return "\n".join(lines), 0 if healthy else 2
 
 
 def send_telegram(token, chat_id, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }).encode()
-    req = urllib.request.Request(url, data=payload)
+    # Never print exception strings: urllib errors may contain the credential URL.
+    request = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage",
+        data=urllib.parse.urlencode({"chat_id": chat_id, "text": html.escape(text),
+                                   "parse_mode": "HTML", "disable_web_page_preview": True}).encode())
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"Telegram error: {e}", file=sys.stderr)
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = strict_json(response.read(65537).decode())
+            return response.status == 200 and isinstance(result, dict) and result.get("ok") is True
+    except (OSError, ValueError):
+        print("Telegram delivery failed", file=sys.stderr)
         return False
 
 
-def main():
-    env = load_env()
-    token = env.get("TELEGRAM_BOT_TOKEN")
-    chat_id = env.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required", file=sys.stderr)
-        return 1
+def daily_observation():
+    try:
+        from scripts.pirana_report import generate_report_data, format_text_report
+    except ImportError:
+        from pirana_report import generate_report_data, format_text_report
+    status = 0
+    try:
+        result = subprocess.run(["systemctl", "is-active", "pirana.service"],
+                                capture_output=True, text=True, timeout=10, check=False)
+        active = result.returncode == 0 and result.stdout.strip() == "active"
+        service = "active (samo nepotvrzuje obchodování)" if active else "NEOVĚŘENO / není active"
+        if not active:
+            status = 2
+    except (OSError, subprocess.TimeoutExpired):
+        service, status = "NEOVĚŘENO: kontrola služby selhala", 2
+    try:
+        data = generate_report_data(include_runtime=True)
+        financial = format_text_report(data)
+        accounting = data.get("accounting", {})
+        runtime = data.get("runtime") or {}
+        if (accounting.get("status") != "complete" or not runtime
+                or runtime.get("execution_block_reason")
+                or runtime.get("market_data_available") is not True):
+            status = 2
+    except Exception:
+        # Preserve failure as status, not raw diagnostics containing private data.
+        financial, status = "Finanční report NEOVĚŘENO: sestavení selhalo.", 2
+    text = (financial + "\n\nPROVOZNÍ POZOROVÁNÍ (pouze čtení)\nSlužba: " + service
+            + "\nNejde o kompletní audit strategie ani důkaz zisku. Žádné zásahy, změny rizika ani publikace registru.")
+    return text, status
 
-    snap = get_snapshot()
-    if not snap:
-        send_telegram(token, chat_id,
-                      "⚠️ <b>ČÁSLAV :: KALIBRAČNÍ AUDIT</b>\n\nAPI nedostupné — zkontroluj pirana.service")
-        return 1
 
-    mode = snap.get("system_mode", "?")
-    calib = snap.get("calibration", {})
-    gen = calib.get("generation", 0)
-    sample = calib.get("sample_size", 0)
-    exposure = calib.get("max_aggregate_exposure", {}).get("value", 0.0)
-    risk = calib.get("max_single_trade_risk", {}).get("value", 0.0)
-    vpin = calib.get("vpin_toxicity_threshold", {}).get("value", 0.0)
-    p_ruin = calib.get("p_ruin_1y", {}).get("value", 0.0)
-    if p_ruin is None or (isinstance(p_ruin, float) and p_ruin != p_ruin):
-        p_ruin = 0.0
-
-    # ── AUDIT: porovnání s předchozím dnem ────────────────────────────────
-    last = load_last_state()
-    risk_ok, risk_msg = check_risk_state_file()
-
-    delta_gen = ""
-    delta_sample = ""
-    if last:
-        gen_diff = gen - last.get("generation", 0)
-        sample_diff = sample - last.get("sample_size", 0)
-        delta_gen = f" ({'+' if gen_diff >= 0 else ''}{gen_diff})"
-        delta_sample = f" ({'+' if sample_diff >= 0 else ''}{sample_diff})"
-
-        if gen_diff > 0:
-            status_icon = "🟢"
-            status_text = f"Kalibrace proběhla {gen_diff}× za 24h"
-        elif gen_diff == 0 and sample < 50:
-            status_icon = "🟡"
-            missing = 50 - sample
-            status_text = f"Čeká se na data — zbývá {missing} round-tripů"
-        else:
-            status_icon = "🟠"
-            status_text = "Žádná rekalibrace za 24h — zkontroluj risk engine"
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--daily-audit", action="store_true")
+    args = parser.parse_args(argv)
+    now = int(time.time())
+    snap = None
+    if args.daily_audit:
+        text, status = daily_observation()
     else:
-        status_icon = "ℹ️"
-        status_text = "První běh auditu — ukládám baseline"
-
-    # ── INVARIANT: P(ruin) musí růst s expozicí ───────────────────────────
-    p_ruin_ok = "✅" if p_ruin <= 0.01 else "⚠️"
-    risk_file_ok = "✅" if risk_ok else "❌"
-
-    msg = (
-        f"🔬 <b>ČÁSLAV :: KALIBRAČNÍ AUDIT</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{status_icon} <b>{status_text}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• Režim: <code>{mode}</code>\n"
-        f"• Generace: <code>{gen}</code>{delta_gen}\n"
-        f"• Vzorků: <code>{sample}</code>{delta_sample}\n"
-        f"• Max expozice: <code>{exposure:.2%}</code>\n"
-        f"• Riziko/obchod: <code>{risk:.3%}</code>\n"
-        f"• VPIN práh: <code>{vpin:.3f}</code>\n"
-        f"• P(ruin): <code>{p_ruin:.6f}</code> {p_ruin_ok}\n"
-        f"• risk_state.json: <code>{risk_msg}</code> {risk_file_ok}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Audit každý den v 06:00. Rust engine rekalibruje každých 15 min.</i>"
-    )
-
-    # Uložíme stav pro zítřek
-    save_current_state(calib)
-
-    ok = send_telegram(token, chat_id, msg)
-    return 0 if ok else 1
+        snap = get_snapshot()
+        text, status = build_calibration_report(snap, load_last_state(), check_risk_state_file(now), now)
+    if args.dry_run:
+        print(text)
+        print(f"OBSERVATION_STATUS={status}; DELIVERY=NOT_REQUESTED")
+        return status
+    env = load_env()
+    token, chat_id = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("Telegram configuration missing; observation_status=" + str(status), file=sys.stderr)
+        return 1
+    # Split at safe plain-text boundaries before HTML escaping. Preserve all evidence.
+    delivered = all(send_telegram(token, chat_id, text[i:i+3500]) for i in range(0, len(text), 3500))
+    saved = True
+    if snap is not None and isinstance(snap.get("calibration"), dict):
+        saved = save_current_state(snap["calibration"], now)
+    print(f"OBSERVATION_STATUS={status}; DELIVERY={'OK' if delivered else 'FAILED'}; BASELINE={'OK' if saved else 'FAILED'}")
+    return 1 if not delivered else (2 if not saved else status)
 
 
 if __name__ == "__main__":

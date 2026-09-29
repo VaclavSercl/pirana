@@ -156,38 +156,34 @@ def test_monthly_main_has_no_exchange_query_or_invented_metrics():
     assert '99.98' not in text and '393.56' not in text
 
 
-def test_daily_timeout_fallback_uses_canonical_report_and_single_delivery(tmp_path):
+def test_daily_readonly_entrypoint_preserves_reporter_exit_status(tmp_path):
     import subprocess
     from pathlib import Path
     script = Path('scripts/daily_check.sh').read_text()
     stub_dir = tmp_path/'bin'
     stub_dir.mkdir()
-    (stub_dir/'timeout').write_text('#!/bin/sh\nexit 124\n')
-    (stub_dir/'python3').write_text('''#!/bin/sh
-if [ "$1" = "-c" ]; then
-  cat > "$CAPTURE_REPORT"
-  echo delivery >> "$CAPTURE_SENDS"
-  exit "${DELIVERY_EXIT:-0}"
-fi
-printf 'CANONICAL FINANCIAL FIXTURE\\n'
-''')
-    for path in stub_dir.iterdir():
-        path.chmod(0o755)
+    stub = stub_dir/'python3'
+    stub.write_text("#!/bin/sh\n" +
+        'printf "%s\\n" "$@" > "$CAPTURE_ARGS"\n' +
+        'printf "CANONICAL FINANCIAL FIXTURE\\n"\n' +
+        'exit "$REPORT_EXIT"\n')
+    stub.chmod(0o755)
     script = script.replace('/home/wwwenda/workspace/pirana', str(tmp_path))
-    script = script.replace('export PATH="', 'export PATH="'+str(stub_dir)+':', 1)
     path = tmp_path/'daily.sh'
     path.write_text(script)
-    env = dict(os.environ, TELEGRAM_BOT_TOKEN='fixture', TELEGRAM_CHAT_ID='123',
-               CAPTURE_REPORT=str(tmp_path/'report'), CAPTURE_SENDS=str(tmp_path/'sends'))
-    result = subprocess.run(['bash', str(path)], env=env, capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    text = (tmp_path/'report').read_text()
-    assert 'CANONICAL FINANCIAL FIXTURE' in text and 'TIMEOUT' in text
-    assert 'NEOVĚŘENÉ KVALITATIVNÍ HODNOCENÍ' in text
-    assert (tmp_path/'sends').read_text() == 'delivery\n'
-    assert '100% stabilní a ziskový' not in script
-    env['DELIVERY_EXIT'] = '1'
-    assert subprocess.run(['bash', str(path)], env=env, capture_output=True).returncode == 1
+    env = dict(os.environ, PATH=str(stub_dir)+':'+os.environ['PATH'],
+               TELEGRAM_BOT_TOKEN='fixture', TELEGRAM_CHAT_ID='123',
+               CAPTURE_ARGS=str(tmp_path/'args'))
+    for code in (0, 1, 2):
+        env['REPORT_EXIT'] = str(code)
+        result = subprocess.run(['bash', str(path), '--dry-run'], env=env,
+                                capture_output=True, text=True)
+        assert result.returncode == code, result.stderr
+        assert result.stdout == 'CANONICAL FINANCIAL FIXTURE\n'
+        assert (tmp_path/'args').read_text().splitlines() == [
+            str(tmp_path/'scripts/send_recalibration_report.py'), '--daily-audit', '--dry-run']
+    assert 'sync_ai_trader_strategy.py' not in script
+    assert 'REPORT_OUTPUT=' not in script
 
 
 # Preserve the production /status handler regression coverage.

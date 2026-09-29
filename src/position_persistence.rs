@@ -13,6 +13,70 @@ use std::{
     sync::atomic::Ordering,
 };
 
+/// Immutable local decision-time last-trade benchmark; not a BBO/executable quote.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionBenchmark {
+    pub decision_mts: i64,
+    pub reference_price: f64,
+    pub requested_quantity: f64,
+    pub side: pirana_core::types::Side,
+    pub benchmark_kind: String,
+}
+impl DecisionBenchmark {
+    pub fn signal(price: f64, quantity: f64, side: pirana_core::types::Side) -> Self {
+        Self { decision_mts: chrono::Utc::now().timestamp_millis(), reference_price: price,
+            requested_quantity: quantity, side, benchmark_kind: "signal_last_trade".into() }
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.decision_mts <= 0 || self.decision_mts > chrono::Utc::now().timestamp_millis()
+            || !self.reference_price.is_finite() || self.reference_price <= 0.0
+            || !self.requested_quantity.is_finite() || self.requested_quantity <= 0.0
+            || self.benchmark_kind != "signal_last_trade" {
+            return Err("invalid decision benchmark".into());
+        }
+        Ok(())
+    }
+}
+fn validate_benchmarks(snapshot: &Snapshot) -> Result<(), String> {
+    for (cid, b) in &snapshot.decision_benchmarks {
+        validate_cid(cid)?;
+        b.validate()?;
+        if let Some(p) = snapshot.pending_intents.get(cid) {
+            if b.side != pirana_core::types::Side::Buy || b.requested_quantity != p.quantity {
+                return Err("benchmark conflicts with entry intent".into());
+            }
+        }
+        if snapshot.exit_intents.contains_key(cid)
+            && (b.side != pirana_core::types::Side::Sell
+                || snapshot.exit_requested_quantities.get(cid) != Some(&b.requested_quantity)) {
+            return Err("benchmark conflicts with exit intent".into());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchmarkJournal {
+    schema_version: u32,
+    decision_benchmarks: BTreeMap<String, DecisionBenchmark>,
+}
+fn load_benchmarks(path: &Path) -> Result<BTreeMap<String, DecisionBenchmark>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("benchmark metadata failed: {e}")),
+        Ok(m) if !m.is_file() || m.file_type().is_symlink() || m.len() > 64 * 1024 * 1024 =>
+            return Err("unsafe or oversized benchmark journal".into()),
+        Ok(_) => {}
+    }
+    let bytes=std::fs::read(path).map_err(|e|e.to_string())?;
+    let journal: BenchmarkJournal=serde_json::from_slice(&bytes).map_err(|e|format!("invalid benchmark journal: {e}"))?;
+    if journal.schema_version != 1 { return Err("unsupported benchmark schema".into()); }
+    for (cid,b) in &journal.decision_benchmarks { validate_cid(cid)?; b.validate()?; }
+    Ok(journal.decision_benchmarks)
+}
+
 /// USD earmarked from a proven terminal SELL, not owned or purchased BTC.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +109,44 @@ struct Snapshot {
     exit_skim_pct: BTreeMap<String, f64>,
     #[serde(default)]
     skim_accruals: BTreeMap<String, SkimAccrual>,
+    // Internal transaction data only: older binaries must still read positions.json.
+    #[serde(skip)]
+    decision_benchmarks: BTreeMap<String, DecisionBenchmark>,
+}
+
+/// Own the flock, not merely one descriptor reference to its open-file description.
+/// A concurrent fork can inherit that description until exec/exit; owner Drop
+/// must unlock explicitly. A fork-child destructor must never unlock the parent.
+struct JournalLock {
+    file: File,
+    owner_pid: u32,
+}
+impl JournalLock {
+    fn acquire(file: File) -> Result<Self, String> {
+        unsafe extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
+        if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+            return Err("position journal already locked".into());
+        }
+        Ok(Self { file, owner_pid: std::process::id() })
+    }
+}
+impl AsRawFd for JournalLock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd { self.file.as_raw_fd() }
+}
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        if self.owner_pid != std::process::id() { return; }
+        unsafe extern "C" { fn flock(fd: i32, operation: i32) -> i32; }
+        loop {
+            if unsafe { flock(self.file.as_raw_fd(), 8) } == 0 { break; }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                tracing::error!(error = %error, "position journal unlock failed");
+                break;
+            }
+        }
+        // File then closes normally; never unlink/replace the lock inode.
+    }
 }
 
 pub struct PositionBook {
@@ -57,8 +159,9 @@ pub struct PositionBook {
     exit_requested_quantities: Mutex<BTreeMap<String, f64>>,
     exit_skim_pct: Mutex<BTreeMap<String, f64>>,
     skim_accruals: Mutex<BTreeMap<String, SkimAccrual>>,
+    decision_benchmarks: Mutex<BTreeMap<String, DecisionBenchmark>>,
     path: PathBuf,
-    _lock: File,
+    _lock: JournalLock,
 }
 
 fn validate(p: &ActivePosition) -> Result<(), String> {
@@ -259,6 +362,7 @@ fn recover(
         }
     }
     validate_skim(&snapshot)?;
+    validate_benchmarks(&snapshot)?;
     let mut by_id = BTreeMap::new();
     for p in snapshot.recovery_candidates {
         validate(&p)?;
@@ -433,6 +537,7 @@ fn recover(
         exit_requested_quantities,
         exit_skim_pct,
         skim_accruals,
+        decision_benchmarks: snapshot.decision_benchmarks,
     })
 }
 
@@ -464,13 +569,9 @@ impl PositionBook {
             .write(true)
             .open(lock_path)
             .map_err(|e| e.to_string())?;
-        // flock is released by the kernel on crash; never unlink the lock inode.
-        unsafe extern "C" {
-            fn flock(fd: i32, operation: i32) -> i32;
-        }
-        if unsafe { flock(lock.as_raw_fd(), 2 | 4) } != 0 {
-            return Err("position journal already locked".into());
-        }
+        // Create the guard immediately: parse/recovery/persistence errors below
+        // must release ownership even when another process inherited this FD.
+        let lock = JournalLock::acquire(lock)?;
         let snapshot = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<Snapshot>(&bytes)
                 .map_err(|e| format!("invalid position journal: {e}"))?,
@@ -485,9 +586,12 @@ impl PositionBook {
                 exit_requested_quantities: BTreeMap::new(),
                 exit_skim_pct: BTreeMap::new(),
                 skim_accruals: BTreeMap::new(),
+                decision_benchmarks: BTreeMap::new(),
             },
             Err(e) => return Err(format!("cannot recover position journal: {e}")),
         };
+        let mut snapshot = snapshot;
+        snapshot.decision_benchmarks = load_benchmarks(&path.with_extension("benchmarks.json"))?;
         let snapshot = recover(snapshot, projection, false)?;
         let book = Self {
             positions: RwLock::new(snapshot.positions.clone()),
@@ -506,6 +610,7 @@ impl PositionBook {
             exit_requested_quantities: Mutex::new(snapshot.exit_requested_quantities.clone()),
             exit_skim_pct: Mutex::new(snapshot.exit_skim_pct.clone()),
             skim_accruals: Mutex::new(snapshot.skim_accruals.clone()),
+            decision_benchmarks: Mutex::new(snapshot.decision_benchmarks.clone()),
             path,
             _lock: lock,
         };
@@ -545,6 +650,7 @@ impl PositionBook {
             *self.exit_requested_quantities.lock() = next.exit_requested_quantities;
             *self.exit_skim_pct.lock() = next.exit_skim_pct;
             *self.skim_accruals.lock() = next.skim_accruals;
+            *self.decision_benchmarks.lock() = next.decision_benchmarks;
             *positions = published;
             Ok(())
         })();
@@ -603,10 +709,16 @@ impl PositionBook {
     }
 
     /// Must succeed durably before submitting the corresponding exchange BUY.
+    #[cfg(test)]
     pub fn stage_intent(&self, cid: String, position: ActivePosition) -> Result<(), String> {
+        self.stage_intent_measured(cid, position, None)
+    }
+
+    pub fn stage_intent_measured(&self, cid: String, position: ActivePosition, benchmark: Option<DecisionBenchmark>) -> Result<(), String> {
         self.transact(|snapshot| {
             validate_intent(&cid, &position)?;
-            if snapshot.exit_intents.contains_key(&cid)
+            if snapshot.decision_benchmarks.contains_key(&cid)
+                || snapshot.exit_intents.contains_key(&cid)
                 || snapshot.pending_intents.contains_key(&cid)
                 || snapshot
                     .pending_intents
@@ -617,6 +729,7 @@ impl PositionBook {
             {
                 return Err("duplicate pending intent identity".into());
             }
+            if let Some(b) = benchmark { snapshot.decision_benchmarks.insert(cid.clone(), b); }
             snapshot.pending_intents.insert(cid, position);
             Ok(())
         })
@@ -642,12 +755,18 @@ impl PositionBook {
 
     /// Capture percentage before submission. Subsequent config changes cannot
     /// change this exit's allocation. Legacy wrappers deliberately capture zero.
-    pub fn stage_exit_quantity_with_skim(
+    #[cfg(test)]
+    pub fn stage_exit_quantity_with_skim(&self, cid: String, position: ActivePosition, requested_qty: f64, skim_pct: f64) -> Result<(), String> {
+        self.stage_exit_measured(cid, position, requested_qty, skim_pct, None)
+    }
+
+    pub fn stage_exit_measured(
         &self,
         cid: String,
         position: ActivePosition,
         requested_qty: f64,
         skim_pct: f64,
+        benchmark: Option<DecisionBenchmark>,
     ) -> Result<(), String> {
         self.transact(|snapshot| {
             validate(&position)?;
@@ -661,7 +780,8 @@ impl PositionBook {
                 return Err("invalid requested exit quantity".into());
             }
             validate_cid(&cid)?;
-            if snapshot.pending_intents.contains_key(&cid)
+            if snapshot.decision_benchmarks.contains_key(&cid)
+                || snapshot.pending_intents.contains_key(&cid)
                 || snapshot.exit_intents.contains_key(&cid)
             {
                 return Err("duplicate exit intent CID".into());
@@ -686,6 +806,7 @@ impl PositionBook {
                 .exit_requested_quantities
                 .insert(cid.clone(), requested_qty);
             snapshot.exit_skim_pct.insert(cid.clone(), skim_pct);
+            if let Some(b) = benchmark { snapshot.decision_benchmarks.insert(cid.clone(), b); }
             snapshot.exit_intents.insert(cid, position);
             Ok(())
         })
@@ -845,6 +966,7 @@ impl PositionBook {
             exit_requested_quantities: self.exit_requested_quantities.lock().clone(),
             exit_skim_pct: self.exit_skim_pct.lock().clone(),
             skim_accruals: self.skim_accruals.lock().clone(),
+            decision_benchmarks: self.decision_benchmarks.lock().clone(),
         }
     }
 
@@ -852,11 +974,39 @@ impl PositionBook {
         self.persist_snapshot(&self.snapshot(positions))
     }
 
+    /// Sidecar precedes the intent commit. A crash may leave an unsubmitted CID,
+    /// never a submitted order without evidence. Old binaries ignore this file.
+    fn persist_benchmarks(&self, next: &BTreeMap<String, DecisionBenchmark>) -> Result<(), String> {
+        let path=self.path.with_extension("benchmarks.json");
+        let existing=load_benchmarks(&path)?;
+        if existing.iter().any(|(cid,b)|next.get(cid)!=Some(b)) {
+            return Err("immutable benchmark journal changed".into());
+        }
+        if existing == *next { return Ok(()); }
+        let bytes=serde_json::to_vec(&BenchmarkJournal { schema_version:1, decision_benchmarks:next.clone() }).map_err(|e|e.to_string())?;
+        if bytes.len()>64*1024*1024 { return Err("benchmark journal size bound exceeded".into()); }
+        let temporary=path.with_extension("tmp");
+        let result=(|| -> std::io::Result<()> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary,&path)?;
+            File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()
+        })();
+        // On an uncertain failure never overwrite or discard recovery evidence.
+        result.map_err(|e|format!("benchmark persistence failed: {e}"))?;
+        *self.decision_benchmarks.lock()=next.clone();
+        Ok(())
+    }
+
     fn persist_snapshot(&self, snapshot: &Snapshot) -> Result<(), String> {
         validate_skim(snapshot)?;
+        validate_benchmarks(snapshot)?;
         for p in &snapshot.positions {
             validate(p)?;
         }
+        self.persist_benchmarks(&snapshot.decision_benchmarks)?;
         let bytes = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
         let temporary = self.path.with_extension("tmp");
         let parent = self
@@ -973,6 +1123,117 @@ mod tests {
         let b = PositionBook::open(path, &empty()).unwrap();
         b.write().push(position());
     }
+    #[test]
+    fn measured_benchmarks_survive_completion_restart_and_reject_reuse() {
+        let p = path();
+        let b = PositionBook::open(&p, &empty()).unwrap();
+        let buy = DecisionBenchmark::signal(100., 2., pirana_core::types::Side::Buy);
+        b.stage_intent_measured("555".into(), intent(), Some(buy.clone())).unwrap();
+        b.complete_entry("555", position()).unwrap();
+        let sell = DecisionBenchmark::signal(110., 0.5, pirana_core::types::Side::Sell);
+        b.stage_exit_measured("777".into(), position(), 0.5, 0., Some(sell.clone())).unwrap();
+        b.complete_confirmed_zero("777").unwrap();
+        drop(b);
+        let b = PositionBook::open(&p, &bought()).unwrap();
+        assert_eq!(b.decision_benchmarks.lock().get("555"), Some(&buy));
+        assert_eq!(b.decision_benchmarks.lock().get("777"), Some(&sell));
+        assert!(b.stage_exit_measured("777".into(), position(), 0.5, 0., Some(sell)).is_err());
+    }
+
+    #[test]
+    fn additive_sidecar_keeps_old_snapshot_schema_and_failure_blocks_intent() {
+        let p=path(); let b=PositionBook::open(&p,&empty()).unwrap();
+        let original=std::fs::read(&p).unwrap();
+        let sidecar=p.with_extension("benchmarks.json");
+        std::fs::create_dir(&sidecar).unwrap();
+        let benchmark=DecisionBenchmark::signal(100.,2.,pirana_core::types::Side::Buy);
+        assert!(b.stage_intent_measured("555".into(),intent(),Some(benchmark.clone())).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(),original);
+        assert!(b.pending_entries().is_empty());
+        std::fs::remove_dir(&sidecar).unwrap();
+        b.stage_intent_measured("555".into(),intent(),Some(benchmark)).unwrap();
+        let bytes=std::fs::read(&p).unwrap();
+        let value:Value=serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("decision_benchmarks").is_none());
+        let old_reader:Snapshot=serde_json::from_slice(&bytes).unwrap();
+        assert!(old_reader.decision_benchmarks.is_empty());
+        assert_eq!(serde_json::to_value(old_reader).unwrap(),value);
+        b.complete_confirmed_zero("555").unwrap();
+        drop(b);
+        let b=PositionBook::open(&p,&empty()).unwrap();
+        assert!(b.decision_benchmarks.lock().contains_key("555"));
+    }
+
+    #[test]
+    fn crash_window_orphan_benchmark_reserves_cid_without_inventing_fill() {
+        let p=path(); let b=PositionBook::open(&p,&empty()).unwrap();
+        let temporary=p.with_extension("tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        let benchmark=DecisionBenchmark::signal(100.,2.,pirana_core::types::Side::Buy);
+        assert!(b.stage_intent_measured("555".into(),intent(),Some(benchmark.clone())).is_err());
+        assert!(b.pending_entries().is_empty());
+        assert_eq!(b.decision_benchmarks.lock().get("555"),Some(&benchmark));
+        drop(b);
+        std::fs::remove_dir(&temporary).unwrap();
+        let b=PositionBook::open(&p,&empty()).unwrap();
+        assert!(b.read().is_empty());
+        assert!(b.pending_entries().is_empty());
+        assert!(b.stage_intent_measured("555".into(),intent(),Some(benchmark)).is_err());
+    }
+
+    #[test]
+    fn partial_exit_recovery_retains_original_decision_quantity() {
+        let p=path(); seed(&p);
+        let b=PositionBook::open(&p, &bought()).unwrap();
+        let benchmark=DecisionBenchmark::signal(105., 0.5, pirana_core::types::Side::Sell);
+        b.stage_exit_measured("777".into(),position(),0.5,0.,Some(benchmark.clone())).unwrap();
+        let partial=projection(1.5,vec![order(123,"555","2","0","100"),order(456,"777","-0.5","0","105")]);
+        b.reconcile(&partial).unwrap();
+        drop(b);
+        let b=PositionBook::open(&p,&partial).unwrap();
+        assert_eq!(b.read()[0].quantity,1.5);
+        assert_eq!(b.decision_benchmarks.lock().get("777"),Some(&benchmark));
+    }
+
+    #[test]
+    fn invalid_measurement_preserves_durable_bytes_and_legacy_stays_unknown() {
+        let p = path();
+        let b = PositionBook::open(&p, &empty()).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        let good = DecisionBenchmark::signal(100., 2., pirana_core::types::Side::Buy);
+        let mut bads = Vec::new();
+        for price in [0., -1., f64::NAN, f64::INFINITY] { let mut v=good.clone(); v.reference_price=price; bads.push(v); }
+        let mut v=good.clone(); v.side=pirana_core::types::Side::Sell; bads.push(v);
+        let mut v=good.clone(); v.decision_mts=0; bads.push(v);
+        let mut v=good.clone(); v.decision_mts=i64::MAX; bads.push(v);
+        let mut v=good.clone(); v.requested_quantity=1.; bads.push(v);
+        for bad in bads {
+            assert!(b.stage_intent_measured("555".into(), intent(), Some(bad)).is_err());
+            assert_eq!(std::fs::read(&p).unwrap(), before);
+        }
+        b.stage_intent("555".into(), intent()).unwrap();
+        b.complete_confirmed_zero("555").unwrap();
+        drop(b);
+        let mut legacy: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("decision_benchmarks");
+        std::fs::write(&p, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let b=PositionBook::open(&p, &empty()).unwrap();
+        assert!(b.decision_benchmarks.lock().is_empty());
+    }
+
+    #[test]
+    fn conflicting_persisted_exit_benchmark_is_rejected() {
+        let p=path(); seed(&p);
+        let b=PositionBook::open(&p, &bought()).unwrap();
+        b.stage_exit_measured("777".into(), position(), 0.5, 0., Some(DecisionBenchmark::signal(110.,0.5,pirana_core::types::Side::Sell))).unwrap();
+        drop(b);
+        let sidecar=p.with_extension("benchmarks.json");
+        let mut data:Value=serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        data["decision_benchmarks"]["777"]["requested_quantity"]=json!(1.);
+        std::fs::write(&sidecar,serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(PositionBook::open(&p,&bought()).is_err());
+    }
+
     #[test]
     fn atomic_exit_failure_cannot_settle_without_residual_and_reserve() {
         let p = path();
@@ -1699,7 +1960,67 @@ mod tests {
         let b = PositionBook::open(&p, &empty()).unwrap();
         assert!(PositionBook::open(&p, &empty()).is_err());
         drop(b);
-        assert!(PositionBook::open(&p, &empty()).is_ok());
+        let reopened = PositionBook::open(&p, &empty());
+        assert!(reopened.is_ok(), "reopen after drop: {:?}", reopened.err());
+    }
+    #[test]
+    fn non_owner_drop_does_not_unlock_owning_process() {
+        let p = path();
+        let b = PositionBook::open(&p, &empty()).unwrap();
+        let non_owner = JournalLock {
+            file: b._lock.file.try_clone().unwrap(),
+            owner_pid: b._lock.owner_pid.wrapping_add(1),
+        };
+        // Emulate a destructor executing under a different process identity.
+        // No fork of the multithreaded Rust runtime is needed for this branch.
+        drop(non_owner);
+        assert!(PositionBook::open(&p, &empty()).is_err());
+        drop(b);
+        let reopened = PositionBook::open(&p, &empty());
+        assert!(reopened.is_ok(), "owner release: {:?}", reopened.err());
+    }
+    #[test]
+    fn failed_open_releases_lock_without_rewriting_bad_journal() {
+        let p = path();
+        std::fs::write(&p, b"{").unwrap();
+        let failed = PositionBook::open(&p, &empty());
+        assert!(failed.as_ref().err().unwrap().starts_with("invalid position journal:"));
+        let file = OpenOptions::new().read(true).write(true).open(p.with_extension("lock")).unwrap();
+        let lock = JournalLock::acquire(file);
+        assert!(lock.is_ok(), "failed-open lock release: {:?}", lock.err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"{");
+    }
+    #[test]
+    fn owner_drop_unlocks_even_while_exec_child_retains_descriptor() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let p = path();
+        let b = PositionBook::open(&p, &empty()).unwrap();
+        let fd = b._lock.as_raw_fd();
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'ready\\n'; read -r release"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped());
+        // The child executes only fcntl before exec: no allocation or locking
+        // in the multithreaded test process's post-fork/pre-exec interval.
+        unsafe {
+            command.pre_exec(move || {
+                unsafe extern "C" { fn fcntl(fd: i32, command: i32, ...) -> i32; }
+                if fcntl(fd, 2, 0) == -1 { return Err(std::io::Error::last_os_error()); }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+        assert!(PositionBook::open(&p, &empty()).is_err());
+        drop(b);
+        let reopened = PositionBook::open(&p, &empty());
+        // Always reap the barrier child before asserting, including on failure.
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(reopened.is_ok(), "reopen with inherited descriptor: {:?}", reopened.err());
     }
     #[tokio::test]
     async fn disk_failure_blocks_staging_before_submit() {

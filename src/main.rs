@@ -40,6 +40,9 @@ mod accounting;
 mod operational_recovery;
 mod execution_recovery;
 mod position_persistence;
+mod measurement_evidence;
+
+static EVIDENCE_MARK: parking_lot::Mutex<Option<(i64, f64)>> = parking_lot::Mutex::new(None);
 mod entry_policy;
 use entry_policy::{
     EntryGate, EntryGateDecision, EntryRoutingDecision, DEFAULT_MIN_IMPULSE_SPACING,
@@ -806,12 +809,14 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         // a kalibrace ma reagovat na rezim trhu, ne na jednotlivy obchod.
         const RECALIBRATION_EVERY_N_TICKS: u64 = 60;
         let mut tick: u64 = 0;
+        let mut evidence_writer: Option<measurement_evidence::EquityEvidenceWriter> = None;
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             tick = tick.wrapping_add(1);
             let Some(observation) = EXECUTION_ACTIVITY.idle_generation() else { continue; };
             if let Ok(wallets) = client_for_reconciliation.get_wallets().await {
+                let wallet_at_ms = chrono::Utc::now().timestamp_millis();
                 if !EXECUTION_ACTIVITY.unchanged(observation) { continue; }
                 let mut btc_total = None;
                 let mut usd_total = None;
@@ -874,7 +879,34 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
 
                     tracing::debug!("Wallet balances auto-reconciled with Bitfinex: BTC={:.8}, USD={:.2}", new_btc, new_usd);
 
+                    let evidence_observation = EVIDENCE_MARK.lock().map(|(mark_at_ms, btc_price)| measurement_evidence::EquityObservation {
+                        observed_at_ms: chrono::Utc::now().timestamp_millis(), wallet_at_ms, mark_at_ms,
+                        btc_balance: new_btc, usd_balance: new_usd, btc_price, sync_cursor_ms: None,
+                    });
                     drop(wallet_guard);
+                    if let Some(observation) = evidence_observation {
+                        let writer = evidence_writer.take();
+                        match tokio::task::spawn_blocking(move || {
+                            let mut writer = writer;
+                            let result = (|| {
+                                if writer.is_none() {
+                                    writer = Some(measurement_evidence::EquityEvidenceWriter::open(
+                                        pirana_risk_engine::persistence::default_state_path().with_file_name("measurement_evidence"))?);
+                                }
+                                writer.as_mut().expect("writer initialized").append(observation)
+                            })();
+                            (writer, result)
+                        }).await {
+                            Ok((writer, result)) => {
+                                evidence_writer = writer;
+                                if let Err(e) = result { tracing::error!("Equity evidence BLOCKED: {}", e); }
+                            }
+                            Err(e) => tracing::error!("Equity evidence task BLOCKED: {}", e),
+                        }
+                    } else {
+                        tracing::warn!("Equity evidence BLOCKED: no timestamped market mark");
+                    }
+
 
                     // [CASLAV v5.1] Periodicka rekalibrace rizika (1x za 15 min).
                     // Az ZDE, po rekonciliaci — equity i cena jsou cerstve.
@@ -1122,6 +1154,7 @@ async fn process_ws_message(
             if let Some(values) = array[1].as_array() {
                 if frame.channel == market_events::Channel::Ticker && values.len() >= 10 {
                     if let Some(price) = values[6].as_f64() {
+                        *EVIDENCE_MARK.lock() = Some((chrono::Utc::now().timestamp_millis(), price));
                         *state.btc_price.write() = price;
                         state.add_price_point(price);
                         *last_price = price;
@@ -1432,6 +1465,7 @@ async fn process_ws_message(
                                     });
                                 });
                             } else {
+                                let decision_benchmark = position_persistence::DecisionBenchmark::signal(price, pos_clone.quantity, match pos_clone.side { Side::Buy => Side::Sell, Side::Sell => Side::Buy });
                                 tokio::spawn(async move {
                                 let _execution_activity = execution_activity;
                                     let close_side = match pos_clone.side {
@@ -1448,7 +1482,7 @@ async fn process_ws_message(
                                     let exit_cid = next_entry_cid();
                                     let exit_mts = chrono::Utc::now().timestamp_millis();
                                     let skim = strategy_config_clone.read().profit_skimmer.clone();
-                                    let exit_result = match active_positions_clone.stage_exit_quantity_with_skim(exit_cid.to_string(), pos_clone.clone(), pos_clone.quantity, if skim.enabled { skim.btc_lock_pct } else { 0.0 }) {
+                                    let exit_result = match active_positions_clone.stage_exit_measured(exit_cid.to_string(), pos_clone.clone(), pos_clone.quantity, if skim.enabled { skim.btc_lock_pct } else { 0.0 }, Some(decision_benchmark)) {
                                         Ok(()) if close_side != Side::Sell || operational_recovery::sale_allowed(*state_clone.btc_balance.read(), quarantined_btc(), pos_clone.quantity) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", close_side, pirana_core::types::OrderType::IOC, sign * pos_clone.quantity, exit_limit, exit_cid)).await,
                                         Ok(()) => Err(pirana_core::errors::PiranaError::Config("sale would consume quarantined BTC".into())),
                                         Err(e) => Err(pirana_core::errors::PiranaError::Config(e)),
@@ -2490,7 +2524,7 @@ async fn process_ws_message(
                                                          highest_price_seen: price, lowest_price_seen: price,
                                                          is_breakeven: false, trailing_active: false,
                                                      };
-                                                     if let Err(e) = active_positions.stage_intent(entry_cid.to_string(), intent) {
+                                                     if let Err(e) = active_positions.stage_intent_measured(entry_cid.to_string(), intent, Some(position_persistence::DecisionBenchmark::signal(price, final_trade_size, Side::Buy))) {
                                                          POSITION_PERSISTENCE_OK.store(false, std::sync::atomic::Ordering::Release);
                                                          entry_gate.lock().release_reservation();
                                                          tracing::error!("BUY intent not durable; submission refused: {}", e);
@@ -3041,6 +3075,7 @@ async fn process_ws_message(
                                                 let exp_size = closed_pos.exposure_size;
                                                 let pos_to_restore = closed_pos.clone();
                                                 let entry_price_closed = closed_pos.entry_price;
+                                                let decision_benchmark = position_persistence::DecisionBenchmark::signal(price, final_trade_size, Side::Sell);
 
                                                 tokio::spawn(async move {
                                 let _execution_activity = execution_activity;
@@ -3051,7 +3086,7 @@ async fn process_ws_message(
                                                     let exit_cid = next_entry_cid();
                                     let exit_mts = chrono::Utc::now().timestamp_millis();
                                                     let skim = strategy_config_sell.read().profit_skimmer.clone();
-                                                    let exit_result = match active_positions_clone.stage_exit_quantity_with_skim(exit_cid.to_string(), pos_to_restore.clone(), final_trade_size, if skim.enabled { skim.btc_lock_pct } else { 0.0 }) {
+                                                    let exit_result = match active_positions_clone.stage_exit_measured(exit_cid.to_string(), pos_to_restore.clone(), final_trade_size, if skim.enabled { skim.btc_lock_pct } else { 0.0 }, Some(decision_benchmark)) {
                                                         Ok(()) if operational_recovery::sale_allowed(*state_clone.btc_balance.read(), quarantined_btc(), final_trade_size) => durable_order_submission(|| client_clone.submit_order_with_cid("tBTCUSD", Side::Sell, pirana_core::types::OrderType::IOC, -final_trade_size, sell_ioc_limit, exit_cid)).await,
                                                         Ok(()) => Err(pirana_core::errors::PiranaError::Config("sale would consume quarantined BTC".into())),
                                                         Err(e) => Err(pirana_core::errors::PiranaError::Config(e)),

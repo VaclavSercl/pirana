@@ -862,6 +862,15 @@ def canonical_unavailable(reason: str) -> dict:
                 issues=[reason], daily=period.copy(), lifetime=period.copy(), active_period=None)
 
 
+def unverified_execution_source(value):
+    if not isinstance(value, dict):
+        return False
+    provenance = value.get("execution_provenance")
+    return (value.get("source") == "mixed_execution_and_operator_adjustments"
+            or isinstance(provenance, dict) and (
+                provenance.get("status") == "MIXED_UNVERIFIED" or bool(provenance.get("excluded_records"))))
+
+
 def validate_active_period(value: Any, now_ms: int):
     verified = _validate_active_period(value, now_ms)
     if verified is not None:
@@ -880,7 +889,7 @@ def validate_active_period(value: Any, now_ms: int):
 
 def _validate_active_period(value: Any, now_ms: int):
     """Verify period independently of historical gaps, with shared capture gates."""
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or unverified_execution_source(value):
         return None
     if (type(value.get("schema_version")) is not int or value["schema_version"] != 1
             or value.get("source") != "authenticated_bitfinex_fills"
@@ -928,12 +937,18 @@ def _validate_active_period(value: Any, now_ms: int):
 def validate_accounting_projection(value: Any, now_ms: int) -> dict:
     result = _validate_historical_projection(value, now_ms).copy()
     result["active_period"] = validate_active_period(value, now_ms)
+    if unverified_execution_source(value):
+        result["execution_provenance"] = value.get("execution_provenance", {})
+        result["source"] = "mixed_execution_and_operator_adjustments"
+        result["issues"] = ["mixed_execution_provenance"]
     return result
 
 
 def _validate_historical_projection(value: Any, now_ms: int) -> dict:
     if not isinstance(value, dict):
         return canonical_unavailable("canonical projection is not an object")
+    if unverified_execution_source(value):
+        return canonical_unavailable("mixed_execution_provenance")
     if (type(value.get("schema_version")) is not int or value["schema_version"] != 1
             or value.get("source") != "authenticated_bitfinex_fills"
             or value.get("scope") != "account:tBTCUSD"):
@@ -987,7 +1002,8 @@ def generate_report_data(ledger_path=DEFAULT_LEDGER_PATH, snapshot_file=None,
             value = json.load(stream)
         accounting = validate_accounting_projection(value, int(now.timestamp() * 1000))
         if (isinstance(value, dict) and type(value.get("schema_version")) is int
-                and value["schema_version"] == 1 and value.get("source") == "authenticated_bitfinex_fills"
+                and value["schema_version"] == 1 and value.get("source") in (
+                    "authenticated_bitfinex_fills", "mixed_execution_and_operator_adjustments")
                 and value.get("scope") == "account:tBTCUSD"):
             sync = value.get("sync")
             for key, timestamp in (("generated_at_ms", value.get("generated_at_ms")),
@@ -1035,6 +1051,7 @@ def format_text_report(data) -> str:
     if not isinstance(data, dict):
         return "LEGACY — NEOVĚŘENÉ ODHADY, NIKOLI POTVRZENÝ ZISK\n" + format_legacy_text_report(data)
     a = data["accounting"]
+    mixed = unverified_execution_source(a)
     runtime = data.get("runtime") or {}
     sats = _runtime_balance(runtime.get("btc_balance"), 100_000_000)
     vault = _runtime_balance(runtime.get("locked_btc_reserve"), 100_000_000)
@@ -1055,7 +1072,7 @@ def format_text_report(data) -> str:
     periods.extend(((a["daily"], "Dnes Europe/Prague"), (a["lifetime"], "Celá pokrytá historie")))
     for period, label in periods:
         net, fees, count = period.get("net_pnl_usd"), period.get("fees_usd"), period.get("closed_count")
-        if net is None or fees is None:
+        if mixed or net is None or fees is None:
             lines.append(label + ": NEOVĚŘENO")
             continue
         count_text = str(count) if type(count) is int and 0 <= count <= 10**12 else "NEOVĚŘENO"
@@ -1074,11 +1091,15 @@ def format_text_report(data) -> str:
         lines.append(f"KONTROLA: U {len(missing)} prodejních plnění chybí pořizovací cena; doplnit nákupní historii.")
     elif a["status"] != "complete" or not active or active.get("status") != "complete":
         lines.append("KONTROLA: prověřit dostupnost a úplnost účetního snímku.")
+    if mixed:
+        lines.append("PŮVOD NEOVĚŘEN: evidence obsahuje ruční rezervní úpravu nebo kolizi její identity; nejde o burzovní plnění.")
+        lines.append("Dokumentovaná úprava: 51 000 sats při referenci 81 500 USD/BTC; skutečná pořizovací cena a schválení NEOVĚŘENO. Účetní řádek je zachován, PnL není ověřen.")
     metadata = data.get("source_metadata") or {}
     generated = metadata.get("generated_at_ms", a.get("generated_at_ms"))
     cursor = metadata.get("cursor_ms", a.get("sync", {}).get("cursor_ms"))
     lines.extend(("PŮVOD DAT",
-        "PnL: autentizované filly → FIFO; " + str(data["snapshot_source"])[:160],
+        ("PnL: NEOVĚŘENO — smíšený původ účetních dat; " if mixed else "PnL: autentizované filly → FIFO; ")
+        + str(data["snapshot_source"])[:160],
         "Snímek: " + _report_timestamp(generated) + " | sync do: " + _report_timestamp(cursor)
         + "; časy nepotvrzují úplnost PnL.",
         "Zůstatky: " + str(data.get("runtime_source", "NEOVĚŘENO"))[:120]
