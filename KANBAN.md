@@ -75,7 +75,9 @@ Replay na historii místo „nasadíme a doufáme".
 ## Completion1–4 — 2026-09-30
 |Phase|State|Acceptance|
 |---|---|---|
-|1daily08:00|DEPLOYED_WITH_INCIDENT|next08 verified; extra catchup exposed daily delivery status error, tested repair pending deployment|
-|2performance|DISCOVERY|freshhonestcoverageandknownhistorylimits|
-|3audits|PENDING|packageadvisoriesandCLIreviewevidence|
-|4decisiondataset|PENDING|allactualcandidateas-ofdecisions, testsandforwardproof|
+|1daily08:00|DEPLOYED_OFFLINE_VERIFIED|next08 verified; one extra catchup and false alert documented; delivery-status fix installed, first natural08 run still pending|
+|2performance|VERIFIED_WITH_LIMITATIONS|fresh canonical and continuous forward window; old gaps and external basis remain unknown|
+|3audits|VERIFIED_WITH_LIMITATIONS|OSV four pinned versions, actual Agy and Hermes reviews; no unknown-vulnerability guarantee|
+|4decisiondataset|IMPLEMENTED_RELEASE_BUILT|all evaluated decisions and rejected candidates recorded; native/Docker builds and preliminary499Rust/362Python/43ML passed; exact gate/deployment acceptance stored privately|
+
+Completion transaction: current source/checkpoint/deployment evidence is under private completion-20260930 and common Git codex-audit-20260923. Older dated tables above are historical snapshots, not fresh verification. Final research status validates only a recorded prefix; future data and inventory/exit replay remain unqualified. No live model orders or new remote publication.

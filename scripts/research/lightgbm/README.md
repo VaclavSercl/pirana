@@ -38,3 +38,19 @@ Private SQLite output has model/session/time uniqueness, FULL synchronous commit
 ## Promotion requirements
 
 A different validated model, sufficient fresh holdout data across regimes, all actual Pirana candidate decisions with as-of features, faithful position/exit/risk replay, cost/latency analysis and independent review are required before considering a filter. The current negative model has no authorization or capability to trade. Local research deployment does not change live risk, orders, accounting, calibration or Telegram scheduling.
+
+## Actual entry-decision evidence
+
+The production Rust recorder observes every admitted trade that reaches baseline evaluation, including no-signal, shadow and rejected live candidates. The earlier execution, cooldown and VPIN guards are counted separately because they prevent candidate evaluation. Rejected raw wire messages are outside this scope. Inputs are frozen before entry side effects; the recorder never scores a model or changes an order/risk decision. A CID and `intent_handoff` mean a durable intent was handed to the asynchronous execution task, not that the venue received or filled an order.
+
+The producer uses a bounded 1024-record channel without waiting for capacity. One worker writes private append-only segments under the sibling `decision_evidence` directory of the existing risk-state path. Segments are limited to 64 MiB and retained evidence to 2 GiB. No automatic deletion occurs. Loss, write failure, unknown outcomes, a missing segment or stale final evidence prevents research qualification; the trading policy is unaffected. Capacity duration depends on observed traffic. This worker shares the trader process; it is not the isolated public-data model sandbox.
+
+Each segment identifies the actual running binary SHA-256. The offline reader requires a separately pinned deployment manifest containing its verified source commit/tree and verification-evidence hash. It verifies segment order, monotonic sequence/counters, frozen baseline predicate and intent timestamps. Canonical fills join by CID and a unique venue order, including partial quantities and signed USD/BTC fees. An unmatched CID remains `NOT_YET_MATCHED`, never an invented cancellation. Acknowledgement receipt is not assumed to precede an exchange fill timestamp.
+
+    python3 scripts/research/lightgbm/decision_dataset.py --directory /private/decision_evidence --manifest /private/deployment.json --manifest-sha256 VERIFIED_MANIFEST_SHA256 --canonical-db /var/lib/pirana/accounting.sqlite3 --output /new/private/audit
+
+Use a new output directory each time. `rows.unqualified.jsonl` is deliberately unqualified; `BLOCKED.json` marks failed assessments and any partial output must not be trained on. Successful validation describes only the recorded prefix, with source hashes and coverage counters. Live or abruptly stopped sessions retain an unverified tail. It does not prove complete continuous capture, a faithful position/exit simulation, full historical returns or a profitable model. No automatic training/promotion is provided. The original holdout is frozen; collect 4–8 weeks of new evidence and implement independently verified inventory/exit replay before reconsidering live filtering.
+
+Dependency assessment on 2026-09-30 queried OSV for the four exact installed package versions: no advisories were listed. Official wheel hashes and native tests establish provenance and tested behavior, not absence of unknown vulnerabilities. Agy and Hermes completed text-only reviews; their opinions do not replace the tests or future performance evidence.
+
+The research auditor validates a recorded prefix (`VERIFIED_RECORDED_PREFIX`), not an independently observed disk-flush acknowledgement. The writer syncs each record, but a concurrent reader cannot attest an in-flight sync completion. The live tail and full strategy replay remain unqualified.

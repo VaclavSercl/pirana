@@ -43,6 +43,7 @@ mod startup_orders;
 mod execution_recovery;
 mod position_persistence;
 mod measurement_evidence;
+mod decision_evidence;
 
 static EVIDENCE_MARK: parking_lot::Mutex<Option<(i64, f64)>> = parking_lot::Mutex::new(None);
 mod entry_policy;
@@ -528,6 +529,9 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let slippage_telemetry = Arc::new(parking_lot::Mutex::new(
         pirana_core::slippage::SlippageTelemetry::new(),
     ));
+    if let Err(e) = decision_evidence::start(&pirana_risk_engine::persistence::default_state_path().with_file_name("decision_evidence")) {
+        tracing::error!("Entry evidence unavailable; research UNVERIFIED ({}); trading policy unchanged", e.kind());
+    }
     let mut order_book;
     let mut log_throttler = LogThrottler::new(std::time::Duration::from_secs(60));
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
@@ -1923,11 +1927,13 @@ async fn process_ws_message(
 
                                 // Every admitted economic trade updates all models before order gating.
                                 if !execution_available || last_trade_time.elapsed().as_millis() < dynamic_cooldown_ms as u128 {
+                                    decision_evidence::skipped(if !execution_available { 0 } else { 1 });
                                     return;
                                 }
 
                                 // VPIN Adverse Selection & Emergency Flash Crash Guard
                                 if is_vpin_emergency {
+                                    decision_evidence::skipped(2);
                                     if log_throttler.should_log("vpin_emergency_toxic") {
                                         tracing::warn!(
                                             "🚨 [VPIN EMERGENCY FLASH CRASH ALERT] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.1}% | Flash Crash Risk - Blocking new entries & safeguarding passive book",
@@ -1944,6 +1950,7 @@ async fn process_ws_message(
                                 // We block long entries ONLY during sell-side dumping (adverse selection for buyers).
                                 // When institutional buyers sweep the book (buy_vpin dominates), entries are permitted.
                                 if is_vpin_sell_toxic && !is_lead_lag_buy && !is_hawkes_buy && !is_lead_lag_sell && !is_hawkes_sell {
+                                    decision_evidence::skipped(3);
                                     if log_throttler.should_log("vpin_high_toxicity_sell") {
                                         tracing::warn!(
                                             "⚠️ [DIRECTIONAL VPIN SELL TOXICITY] VPIN={:.1}% (Sell={:.1}%, Buy={:.1}%) >= {:.0}% (kalibrovany prah) - Sell-side adverse selection guard active, skipping BUY entry",
@@ -2009,6 +2016,23 @@ async fn process_ws_message(
                                 // Gate 2: Multi-Level L2 Depth Queue Confirmation Gate (Bieganowski & Ślepaczuk 2026)
                                 // Reject entry if ask side heavily dominates the book (queue resistance / ask wall)
                                 let is_ask_wall = conf.order_book.use_l2_depth_imbalance && l2_depth.is_selling_supported();
+                                // Freeze actual evaluated inputs before entry/order side effects.
+                                let mut decision = decision_evidence::begin(decision_evidence::Decision {
+                                    trade_id: id, exchange_ms: now_ms as i64, received_ms: frame.received_ms,
+                                    observed_ms: chrono::Utc::now().timestamp_millis(), price, signed_quantity: qty,
+                                    ofi: ofi_val, l2: l2_imb, composite: composite_signal,
+                                    flow: current_flow, flow_hwm, atr: current_atr, vpin: vpin_score,
+                                    buy_vpin, sell_vpin, vpin_threshold,
+                                    best_bid: order_book.best_bid().map(|b| b.price),
+                                    best_ask: order_book.best_ask().map(|a| a.price),
+                                    raw_baseline: raw_pullback_flow_signal, sell_cascade: is_sell_cascade,
+                                    ask_wall: is_ask_wall, route: "none",
+                                    outcome: if raw_pullback_flow_signal && is_sell_cascade { "sell_cascade" }
+                                        else if raw_pullback_flow_signal && is_ask_wall { "ask_wall" }
+                                        else { "no_signal" },
+                                    cid: None, quantity: None, ioc_limit: None, intent_ms: None, handoff_ms: None,
+                                });
+
 
                                 // Gate 3: Hawkes Buy Clustering Conviction Boost (Raffaelli et al. 2026)
                                 let hawkes_buy_conviction = conf.hawkes_process.enabled
@@ -2080,10 +2104,14 @@ async fn process_ws_message(
 
                                 let (is_buying, live_rationale) = match entry_routing {
                                     EntryRoutingDecision::LivePullbackFlow { rationale } => {
+                                        decision.data.route = "live_pullback_flow";
+                                        decision.data.outcome = "evaluation_incomplete";
                                         entry_gate.lock().update_signal_state(true);
                                         (true, rationale)
                                     }
                                     EntryRoutingDecision::ShadowCandidate { source, rationale } => {
+                                        decision.data.route = "shadow_candidate";
+                                        if !decision.data.raw_baseline { decision.data.outcome = "shadow_only"; }
                                         entry_gate.lock().update_signal_state(false);
                                         if log_throttler.should_log("shadow_candidate_entry") {
                                             let stats_cand = shadow_engine.lock().candidate_stats();
@@ -2125,13 +2153,14 @@ async fn process_ws_message(
                                 };
                                 // Only a real candidate starts economic activity; heartbeat/book/model updates do not.
                                 if !is_buying && !is_selling { return; }
-                                let Some(mut execution_activity) = EXECUTION_ACTIVITY.try_begin_idle() else { return; };
-                                if !POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire) { return; }
+                                let Some(mut execution_activity) = EXECUTION_ACTIVITY.try_begin_idle() else { decision.reject_live("execution_busy"); return; };
+                                if !POSITION_PERSISTENCE_OK.load(std::sync::atomic::Ordering::Acquire) { decision.reject_live("position_persistence"); return; }
                                 let total_btc = *state.btc_balance.read();
                                 let current_btc = pirana_core::reconciliation::BalanceReconciliation::calculate_tradable_margin(total_btc, locked_btc);
                                 let equity = total_btc * price + *state.usd_balance.read();
-                                if !EQUITY_GUARD_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) { return; }
+                                if !EQUITY_GUARD_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) { decision.reject_live("equity_uninitialized"); return; }
                                 if let Err(e) = risk_engine.mark_equity(equity, chrono::Utc::now().timestamp_millis()) {
+                                    decision.reject_live("equity_mark_failed");
                                     tracing::error!("Trade blocked by equity mark: {}", e);
                                     return;
                                 }
@@ -2205,6 +2234,7 @@ async fn process_ws_message(
 
                                 if is_buying {
                                     if !execution_available || execution_recovery::blocking_reason().is_some() {
+                                            decision.data.outcome = "execution_recovery";
                                         if log_throttler.should_log("accounting_unavailable") {
                                             execution_recovery::refresh_status(state);
                                             tracing::warn!("BUY paused: {}", execution_recovery::blocking_reason().unwrap_or("execution state changed during decision"));
@@ -2212,6 +2242,7 @@ async fn process_ws_message(
                                         return;
                                     }
                                     if current_btc >= max_allowed_btc {
+                                            decision.data.outcome = "inventory_limit";
                                         if log_throttler.should_log("max_inventory_btc") {
                                             tracing::warn!("Max dynamic BTC inventory reached ({:.6} >= {:.6} BTC), skipping BUY (throttled)", current_btc, max_allowed_btc);
                                         }
@@ -2236,18 +2267,21 @@ async fn process_ws_message(
                                     match gate_decision {
                                         EntryGateDecision::Approved => {}
                                         EntryGateDecision::BlockedByActiveImpulse => {
+                                            decision.data.outcome = "active_impulse";
                                             if log_throttler.should_log("entry_gate_impulse") {
                                                 tracing::warn!("🚪 [ENTRY GATE] Live BUY blocked: continuous signal impulse already executed (throttled)");
                                             }
                                             return;
                                         }
                                         EntryGateDecision::BlockedByMinSpacing { remaining_ms } => {
+                                            decision.data.outcome = "minimum_spacing";
                                             if log_throttler.should_log("entry_gate_spacing") {
                                                 tracing::warn!("🚪 [ENTRY GATE] Live BUY blocked: min impulse spacing active ({} ms remaining)", remaining_ms);
                                             }
                                             return;
                                         }
                                         EntryGateDecision::BlockedByMaxPositions { active_count, pending_count, max_allowed } => {
+                                            decision.data.outcome = "max_positions";
                                             if log_throttler.should_log("entry_gate_max_positions") {
                                                 tracing::warn!(
                                                     "🚪 [ENTRY GATE] Live BUY blocked: max tracked long positions reached ({} active + {} pending >= {} max)",
@@ -2256,7 +2290,7 @@ async fn process_ws_message(
                                             }
                                             return;
                                         }
-                                        EntryGateDecision::NoSignal => return,
+                                        EntryGateDecision::NoSignal => { decision.data.outcome = "entry_gate_no_signal"; return; },
                                     }
 
                                     let p = SignalParams {
@@ -2304,12 +2338,14 @@ async fn process_ws_message(
                                     match validator.validate(&sig) {
                                         Ok(ValidationResult::Approved { .. }) => {}
                                         Ok(other) => {
+                                            decision.data.outcome = "validator_rejected";
                                              tracing::warn!("Signal rejected by validator: {:?}", other);
                                              state.add_signal(signal_view);
                                              return;
                                         }
                                         Err(e) => {
                                              tracing::error!("Validator error: {}", e);
+                                            decision.data.outcome = "validator_error";
                                              state.add_signal(signal_view);
                                              return;
                                         }
@@ -2344,12 +2380,14 @@ async fn process_ws_message(
                                         match governance.apply_governance(&sig, risk_engine.mode()) {
                                             Ok(GovernanceResult::Approved) => {}
                                             Ok(GovernanceResult::Denied { reason }) => {
+                                            decision.data.outcome = "governance_denied";
                                                 tracing::warn!("Signal denied by Governance: {}", reason);
                                                 state.add_signal(signal_view);
                                                 return;
                                             }
                                             Err(e) => {
                                                 tracing::error!("Governance error: {}", e);
+                                            decision.data.outcome = "governance_error";
                                                 state.add_signal(signal_view);
                                                 return;
                                             }
@@ -2359,6 +2397,7 @@ async fn process_ws_message(
                                     // 2. Evaluate in Risk Engine
 
                                     if is_halted {
+                                         decision.data.outcome = "paper_router_rejected";
                                         // Paper trading in Halted mode!
                                         let current_usd = (*state.usd_balance.read() - if conf.profit_skimmer.exclude_from_trading_margin { active_positions.pending_skim_usd() } else { 0.0 }).max(0.0);
                                         let total_portfolio_usd = current_btc * price + current_usd;
@@ -2368,6 +2407,7 @@ async fn process_ws_message(
                                         let final_trade_size = dynamic_trade_size.clamp(MIN_ORDER_SIZE_BTC, 1.0);
 
                                         if let Ok(order_id) = router.lock().create_order(&sig, price, final_trade_size) {
+                                             decision.data.outcome = "paper_created";
                                              tracing::info!("🔒 [PAPER TRADING] Buying Pressure (Composite: {:.2}) -> Creating stínovou BUY pozici pro {:.6} BTC (Halted mode active)", composite_signal, final_trade_size);
 
                                              // Paper obchod slot v routeru okamzite uvolni.
@@ -2428,6 +2468,7 @@ async fn process_ws_message(
                                     } else {
                                         match risk_engine.evaluate_trade(&sig, price) {
                                              Ok(assessment) if assessment.approved => {
+                                                 decision.data.outcome = "router_rejected";
                                                  let current_usd = (*state.usd_balance.read() - if conf.profit_skimmer.exclude_from_trading_margin { active_positions.pending_skim_usd() } else { 0.0 }).max(0.0);
                                                  let total_portfolio_usd = current_btc * price + current_usd;
 
@@ -2455,7 +2496,8 @@ async fn process_ws_message(
                                                          equity_cap_btc,
                                                          total_equity_usd,
                                                      }) => {
-                                                         if log_throttler.should_log("buy_sizing_undersized") {
+                                                         decision.data.outcome = "sizing_below_minimum";
+                                                          if log_throttler.should_log("buy_sizing_undersized") {
                                                              tracing::warn!(
                                                                  "⚠️ [SIZING HARD CAP] Live BUY rejected: 1% equity cap ({:.6} BTC / {:.2} USD) is below exchange min ({:.6} BTC). Never clamping upward.",
                                                                  equity_cap_btc,
@@ -2471,7 +2513,8 @@ async fn process_ws_message(
                                                          required_usd,
                                                          min_required_btc,
                                                      }) => {
-                                                         if log_throttler.should_log("buy_sizing_insufficient_usd") {
+                                                         decision.data.outcome = "insufficient_usd";
+                                                          if log_throttler.should_log("buy_sizing_insufficient_usd") {
                                                              tracing::warn!(
                                                                  "⚠️ [SIZING] Live BUY rejected: available USD {:.2} < required {:.2} for min order {:.6} BTC",
                                                                  available_usd,
@@ -2483,7 +2526,8 @@ async fn process_ws_message(
                                                          return;
                                                      }
                                                      Err(entry_policy::SizingRejection::InvalidInputs { price: invalid_price, total_equity_usd }) => {
-                                                         tracing::error!("⚠️ [SIZING] Invalid price {:.2} or equity {:.2}", invalid_price, total_equity_usd);
+                                                         decision.data.outcome = "invalid_sizing";
+                                                          tracing::error!("⚠️ [SIZING] Invalid price {:.2} or equity {:.2}", invalid_price, total_equity_usd);
                                                          state.add_signal(signal_view);
                                                          return;
                                                      }
@@ -2491,6 +2535,8 @@ async fn process_ws_message(
 
                                                  let final_trade_size = sizing.final_qty_btc;
                                                  let required_usd = sizing.required_usd;
+                                                  decision.data.quantity = Some(final_trade_size);
+                                                  decision.data.ioc_limit = Some(ioc_limit_price);
 
                                                  // [CASLAV v5.1 / SLIPPAGE P0] Pre-trade guard:
                                                  // očekávaná fill cena (VWAP z ask strany knihy)
@@ -2500,6 +2546,7 @@ async fn process_ws_message(
                                                  let expected_buy_vwap = order_book.vwap(Side::Buy, final_trade_size);
                                                  match slippage_guard.check(Side::Buy, price, expected_buy_vwap) {
                                                      pirana_core::slippage::SlippageDecision::Skip { slippage_bps, expected_fill_price } => {
+                                                          decision.data.outcome = "slippage_guard";
                                                          if log_throttler.should_log("slippage_guard_buy") {
                                                              tracing::warn!(
                                                                  "🛡️ [SLIPPAGE GUARD] BUY skip: očekávaný fill {:.0} = +{:.1} bps > práh {} bps (signál {:.0}). Alpha pryč.",
@@ -2540,6 +2587,8 @@ async fn process_ws_message(
                                                      let tracked_position_id = next_position_id();
                                                      let entry_mts = chrono::Utc::now().timestamp_millis();
                                                      let entry_cid = next_entry_cid();
+                                                      decision.data.cid = Some(entry_cid);
+                                                      decision.data.intent_ms = Some(entry_mts);
                                                      let intent = ActivePosition {
                                                          position_id: tracked_position_id, exchange_order_id: 0, entry_mts,
                                                          entry_price: price, quantity: final_trade_size, side: Side::Buy,
@@ -2552,7 +2601,8 @@ async fn process_ws_message(
                                                      if let Err(e) = active_positions.stage_intent_measured(entry_cid.to_string(), intent, Some(position_persistence::DecisionBenchmark::signal(price, final_trade_size, Side::Buy))) {
                                                          POSITION_PERSISTENCE_OK.store(false, std::sync::atomic::Ordering::Release);
                                                          entry_gate.lock().release_reservation();
-                                                         tracing::error!("BUY intent not durable; submission refused: {}", e);
+                                                         decision.data.outcome = "intent_not_durable";
+                                                          tracing::error!("BUY intent not durable; submission refused: {}", e);
                                                          return;
                                                      }
 
@@ -2591,6 +2641,8 @@ async fn process_ws_message(
                                                      let exp_size = sizing.effective_equity_fraction;
                                                      let entry_gate_clone = entry_gate.clone();
 
+                                                     decision.data.outcome = "intent_handoff";
+                                                     decision.data.handoff_ms = Some(chrono::Utc::now().timestamp_millis());
                                                      tokio::spawn(async move {
                                                          let _execution_activity = execution_activity;
                                                          // [CASLAV v5.1 / SLIPPAGE P1] IOC LIMIT místo MARKET:
@@ -2720,6 +2772,7 @@ async fn process_ws_message(
                                              }
                                              Ok(assessment) => {
                                                  tracing::warn!("Trade rejected by Risk Engine: {:?}", assessment.rejection_reason);
+                                            decision.data.outcome = "risk_rejected";
                                                  *state.system_mode.write() = risk_engine.mode();
                                                  *state.exposure_pct.write() = assessment.current_exposure_pct * 100.0;
                                                  *state.daily_drawdown_pct.write() = assessment.daily_drawdown_pct;
@@ -2728,6 +2781,7 @@ async fn process_ws_message(
                                              }
                                              Err(e) => {
                                                  tracing::error!("Risk Engine error: {}", e);
+                                            decision.data.outcome = "risk_error";
                                                  state.add_signal(signal_view);
                                              }
                                         }
