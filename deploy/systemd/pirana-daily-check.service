@@ -20,7 +20,7 @@ PrivateTmp=true
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 
-ExecStart=/home/wwwenda/workspace/pirana/scripts/daily_check.sh
+ExecStart=/home/wwwenda/workspace/pirana/scripts/daily_check.sh --delivery-status
 TimeoutStartSec=420
 StandardOutput=journal
 StandardError=journal

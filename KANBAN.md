@@ -75,7 +75,7 @@ Replay na historii místo „nasadíme a doufáme".
 ## Completion1–4 — 2026-09-30
 |Phase|State|Acceptance|
 |---|---|---|
-|1daily08:00|VERIFIED_CANDIDATE|calendar/DST and actual safe timer migration verified; deployment pending|
+|1daily08:00|DEPLOYED_WITH_INCIDENT|next08 verified; extra catchup exposed daily delivery status error, tested repair pending deployment|
 |2performance|DISCOVERY|freshhonestcoverageandknownhistorylimits|
 |3audits|PENDING|packageadvisoriesandCLIreviewevidence|
 |4decisiondataset|PENDING|allactualcandidateas-ofdecisions, testsandforwardproof|

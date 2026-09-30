@@ -178,3 +178,23 @@ def test_delivery_flag_never_turns_dry_run_health_check_green():
     unit = Path("deploy/systemd/pirana-recalib.service").read_text()
     assert "--delivery-status" in unit
     assert "OnFailure=notify-telegram-failure@%n.service" in unit
+
+
+def test_daily_installed_delivery_arguments_preserve_health_and_delivery_status():
+    import shlex
+    unit = Path("deploy/systemd/pirana-daily-check.service").read_text()
+    configured = shlex.split(next(line.split("=", 1)[1] for line in unit.splitlines()
+                                 if line.startswith("ExecStart=")))
+    assert configured[0].endswith("/scripts/daily_check.sh")
+    args = ["--daily-audit", *configured[1:]]
+    with patch.object(report, "daily_observation", return_value=("NEOVĚŘENO: WARMUP", 2)), patch.object(
+            report, "load_env", return_value=dict(TELEGRAM_BOT_TOKEN="fake", TELEGRAM_CHAT_ID="fake")), patch.object(
+            report, "send_telegram", return_value=True) as send, patch("sys.stdout", new_callable=io.StringIO) as output:
+        assert report.main(args) == 0
+        assert "OBSERVATION_STATUS=2; DELIVERY=OK" in output.getvalue()
+        assert "NEOVĚŘENO" in send.call_args.args[2]
+        send.return_value = False
+        assert report.main(args) == 1
+        send.reset_mock()
+        assert report.main([*args, "--dry-run"]) == 2
+        send.assert_not_called()
