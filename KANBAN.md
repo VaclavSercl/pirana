@@ -6,6 +6,14 @@
 
 ## 🔥 IN PROGRESS
 
+### Telegram incidents and LightGBM pilot — 2026-09-30
+| Phase | Goal | Status | Definition of Done |
+|---|---|---|---|
+| A | Diagnose calibration notification and post-update recovery halt | IN PROGRESS | Root cause, regression, independent Hermes/Agy review, verified repair |
+| B | Validated public L2 dataset and chronological experiment | APPROVED NEXT | Sequence/checksum/gap audit; reproducible features and executable labels |
+| C | Isolated LightGBM comparison and shadow observer | APPROVED NEXT | Dependencies explicitly authorized; no order access; measured results and limitations |
+
+
 ### T1 — Testovací pyramida ✅ KOMPLETNÍ (29.8.–3.9.)
 
 **Cíl:** Chyby odhalovat PŘED nasazením, ne po týdnu provozu.

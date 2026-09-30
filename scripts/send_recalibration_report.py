@@ -264,6 +264,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--daily-audit", action="store_true")
+    parser.add_argument("--delivery-status", action="store_true",
+                        help="For report delivery units only: exit reflects delivery/persistence; observation status remains in report and journal")
     args = parser.parse_args(argv)
     now = int(time.time())
     snap = None
@@ -289,7 +291,13 @@ def main(argv=None):
     if snap is not None and isinstance(snap.get("calibration"), dict):
         saved = save_current_state(snap["calibration"], now)
     print(f"OBSERVATION_STATUS={status}; DELIVERY={'OK' if delivered else 'FAILED'}; BASELINE={'OK' if saved else 'FAILED'}")
-    return 1 if not delivered else (2 if not saved else status)
+    if not delivered:
+        return 1
+    if not saved:
+        return 2
+    # Only delivery-unit callers select this contract. Default and dry-run remain
+    # health-sensitive; successful notification is not a healthy trading verdict.
+    return 0 if args.delivery_status else status
 
 
 if __name__ == "__main__":

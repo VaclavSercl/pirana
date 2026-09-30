@@ -39,6 +39,7 @@ use config::StrategyConfig;
 mod accounting;
 mod calibration;
 mod operational_recovery;
+mod startup_orders;
 mod execution_recovery;
 mod position_persistence;
 mod measurement_evidence;
@@ -399,12 +400,11 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     }
 
     // Pending exchange orders require reconciliation, never a blanket cancellation.
-    let recovery_blocker = match client.get_active_orders("tBTCUSD").await {
-        Ok(orders) if orders.is_empty() => None,
-        Ok(_) => Some(pirana_core::errors::PiranaError::Config("active exchange orders require reconciliation before startup".into())),
-        Err(error) => Some(error),
-    };
-    if recovery_blocker.is_some() { mark_recovery_halted(&state); }
+    let initial_orders_empty = client.get_active_orders("tBTCUSD").await.map(|orders| orders.is_empty());
+    if !matches!(initial_orders_empty, Ok(true)) {
+        mark_recovery_halted(&state);
+        warn!("Initial order observation unavailable or nonempty; execution stays blocked pending accounting and fresh order checks");
+    }
     notify_systemd_watchdog();
     tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     // Capture and replay authenticated executions before enabling new entries.
@@ -438,10 +438,12 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
         notify_systemd_watchdog();
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     };
-    if let Some(error) = recovery_blocker { return Err(error); }
-    if !client.get_active_orders("tBTCUSD").await?.is_empty() {
-        return Err(pirana_core::errors::PiranaError::Config("exchange orders changed during recovery".into()));
-    }
+    startup_orders::verify(
+        initial_orders_empty,
+        || async { client.get_active_orders("tBTCUSD").await.map(|orders| orders.is_empty()) },
+        notify_systemd_watchdog,
+        std::time::Duration::from_secs(5),
+    ).await?;
     let fee_request_at = chrono::Utc::now().timestamp_millis();
     client.verify_zero_spot_fees().await?;
     ZERO_FEE_POLICY.confirm(fee_request_at);

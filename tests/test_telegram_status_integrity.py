@@ -153,3 +153,28 @@ def test_subsecond_evidence_uses_precise_postfetch_time_without_future_tolerance
     assert report.build_calibration_report(snap, None, (True, "fixture"), NOW, now_ms=NOW*1000+400)[1] == 0
     assert report.build_calibration_report(snap, None, (True, "fixture"), NOW, now_ms=NOW*1000+200)[1] == 2
     assert report.build_calibration_report(snap, None, (True, "fixture"), NOW, now_ms=NOW*1000+1000)[1] == 2
+
+
+def test_delivery_unit_contract_keeps_observation_and_all_delivery_failures_visible():
+    with patch.object(report, "get_snapshot", return_value=snapshot()), patch.object(
+            report, "load_last_state", return_value=None), patch.object(report, "check_risk_state_file", return_value=(False, "stale")), patch.object(
+            report, "load_env", return_value=dict(TELEGRAM_BOT_TOKEN="fake", TELEGRAM_CHAT_ID="fake")), patch.object(
+            report, "send_telegram", return_value=True) as send, patch.object(report, "save_current_state", return_value=True) as save, patch(
+            "sys.stdout", new_callable=io.StringIO) as out:
+        assert report.main(["--delivery-status"]) == 0
+        assert "OBSERVATION_STATUS=2; DELIVERY=OK; BASELINE=OK" in out.getvalue()
+        assert "NEOVĚŘENO" in send.call_args.args[2] or "STAR" in send.call_args.args[2]
+        save.return_value = False
+        assert report.main(["--delivery-status"]) == 2
+        save.return_value = True
+        send.return_value = False
+        assert report.main(["--delivery-status"]) == 1
+
+
+def test_delivery_flag_never_turns_dry_run_health_check_green():
+    with patch.object(report, "daily_observation", return_value=("NEOVĚŘENO", 2)), patch.object(
+            report, "send_telegram", side_effect=AssertionError("must not send")):
+        assert report.main(["--daily-audit", "--dry-run", "--delivery-status"]) == 2
+    unit = Path("deploy/systemd/pirana-recalib.service").read_text()
+    assert "--delivery-status" in unit
+    assert "OnFailure=notify-telegram-failure@%n.service" in unit
