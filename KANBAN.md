@@ -71,3 +71,11 @@ Replay na historii místo „nasadíme a doufáme".
 - Installedisolatedruntime and completedfrozenexperiment: noadvantage demonstrated; livepromotionREJECTED.
 -31researchtestsPASS; bounded600sno-tradingforwardpilotPASS (97freshobservations, automaticstop,32independentlyreplayedexactfeatures/predictions). Exactcandidatecheckpointexpectedonlyafterfinalgate.
 - Privateevidence: telegram-lightgbm-20260930/approved-pilot. No productionbinary/risk/Telegramchanges.
+
+## Completion1–4 — 2026-09-30
+|Phase|State|Acceptance|
+|---|---|---|
+|1daily08:00|VERIFIED_CANDIDATE|calendar/DST and actual safe timer migration verified; deployment pending|
+|2performance|DISCOVERY|freshhonestcoverageandknownhistorylimits|
+|3audits|PENDING|packageadvisoriesandCLIreviewevidence|
+|4decisiondataset|PENDING|allactualcandidateas-ofdecisions, testsandforwardproof|

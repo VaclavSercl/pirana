@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Pirana daily audit at 07:00 local time
+Description=Run Pirana daily audit at 08:00 Europe/Prague
 
 [Timer]
-OnCalendar=*-*-* 07:00:00
+OnCalendar=*-*-* 08:00:00 Europe/Prague
 Persistent=true
 AccuracySec=1min
 Unit=pirana-daily-check.service
