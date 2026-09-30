@@ -66,3 +66,8 @@ Replay na historii místo „nasadíme a doufáme".
 | Container release and publication | IN_PROGRESS | Compose and exact-candidate Docker release passed; Git checkpoint/publication pending |
 | Production reconciliation | PENDING | Backup, exact binary digest, fresh accounting, pending-intent recovery and healthy service required |
 | Hourly oversight | CONFIGURED | Codex thread heartbeat; live authenticated baseline stored privately on server |
+
+## LightGBM optional research — 2026-09-30
+- Installedisolatedruntime and completedfrozenexperiment: noadvantage demonstrated; livepromotionREJECTED.
+-31researchtestsPASS; bounded600sno-tradingforwardpilotPASS (97freshobservations, automaticstop,32independentlyreplayedexactfeatures/predictions). Exactcandidatecheckpointexpectedonlyafterfinalgate.
+- Privateevidence: telegram-lightgbm-20260930/approved-pilot. No productionbinary/risk/Telegramchanges.
