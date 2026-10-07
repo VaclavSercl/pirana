@@ -177,7 +177,9 @@ def test_delivery_flag_never_turns_dry_run_health_check_green():
         assert report.main(["--daily-audit", "--dry-run", "--delivery-status"]) == 2
     unit = Path("deploy/systemd/pirana-recalib.service").read_text()
     assert "--delivery-status" in unit
-    assert "OnFailure=notify-telegram-failure@%n.service" in unit
+    # The owner removed the shared failure sender; delivery status stays checked.
+    # Vlastník odstranil společný sender selhání; stav doručení se dále kontroluje.
+    assert "OnFailure=notify-telegram-failure@%n.service" not in unit
 
 
 def test_daily_installed_delivery_arguments_preserve_health_and_delivery_status():

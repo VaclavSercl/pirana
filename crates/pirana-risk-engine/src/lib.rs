@@ -1,5 +1,10 @@
 //! # ČÁSLAV Risk Engine
 //!
+//! Production uses validated fixed strategy.toml policy; automatic tuning is removed.
+//! Produkce používá ověřenou pevnou politiku strategy.toml; automatické ladění je odstraněno.
+//! Historical calibration modules below remain for preserved formats and offline regressions.
+//! Historické kalibrační moduly níže zůstávají pro zachované formáty a offline regrese.
+//!
 //! ## Struktura
 //!
 //! - [`engine`] — bezici stav rizika, FSM rezimu (Active/Defensive/Halted)
@@ -49,6 +54,9 @@ pub mod engine;
 pub mod equity_risk;
 pub mod ledger_persistence;
 pub mod limits;
+/// Operator ceilings for the production constructor; calibration remains historical data.
+/// Stropy operátora pro produkční konstruktor; kalibrace zůstává historickými daty.
+pub mod operator_limits;
 pub mod persistence;
 pub mod self_calibration;
 pub mod tick_recorder;

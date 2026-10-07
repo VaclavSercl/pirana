@@ -1,29 +1,17 @@
-//! # Entry Policy & Invariant Enforcement (Points 3, 4, 7)
-//!
-//! This module provides monotonic-time entry gating, entry signal routing (production vs shadow),
-//! and strict 1% equity hard-cap sizing for the Pirana trading system.
-//!
-//! ## Core Invariants & Rules
-//!
-//! 1. **Point 3 — Monotonic-Time Entry Gate & Position Limiting**:
-//!    - **Impulse Latch**: At most ONE successful / reserved live BUY per continuous signal impulse.
-//!    - **Rearm Condition**: Rearms only after the signal becomes `false` AND a minimum spacing
-//!      duration (default 2 seconds) has elapsed since the last reservation.
-//!    - **Tracked Live Positions**: At most 3 tracked live long positions, INCLUDING pending async submissions.
-//!    - **Reservation Lifecycle**: Reserves slot on main thread before async order dispatch;
-//!      releases reservation upon exchange fill confirmation or order failure/no-fill.
-//!    - **Decoupled Exits**: Exit pathways (TP, SL, Discretionary SELL, Rebalance) are never blocked by the entry gate.
-//!
-//! 2. **Point 4 — Live Entry Signal Routing & Shadow Candidate Isolation**:
-//!    - Only the validated production `pullback_flow` confirmation is authorized for live BUY orders.
-//!    - Legacy / experimental entry sources (Lead-Lag front-run, Hawkes cascade, TrendUp pullback, OFI imbalance)
-//!      are routed as shadow candidates for offline comparison rather than executing live orders.
-//!
-//! 3. **Point 7 — Hard 1% Equity Sizing Cap & Anti-Upward-Clamping**:
-//!    - Hard maximum of 1.0% portfolio equity per live BUY order under all circumstances.
-//!    - Sizing is capped to 1% equity even if dynamic sizers or risk engine assessments request higher sizing.
-//!    - If the 1% equity cap in BTC falls below the exchange minimum (`MIN_ORDER_SIZE_BTC`), the order is
-//!      strictly REJECTED as undersized. It is NEVER clamped upward above the equity cap.
+//! # Entry policy and invariant enforcement
+//! # Politika vstupu a vynucení invariantů
+//! Reserve at most ten live long slots, including pending BUY submissions.
+//! Rezervovat nejvýše deset živých nákupních pozic včetně čekajících BUY příkazů.
+//! One reservation per continuous impulse; rearm only after a false signal and configured spacing.
+//! Jedna rezervace na souvislý impuls; obnovit až po neaktivním signálu a nastaveném odstupu.
+//! Release the reservation on confirmed fill or failure; exits remain independent of the entry gate.
+//! Uvolnit rezervaci po potvrzeném plnění či selhání; výstupy zůstávají nezávislé na vstupní bráně.
+//! Only production pullback_flow may route live BUYs; experimental signals remain shadow candidates.
+//! Jen produkční pullback_flow smí odeslat živý BUY; experimentální signály zůstávají stínové.
+//! A live BUY must fit within 10% marked equity and available USD at the actual IOC price.
+//! Živý BUY se musí vejít do 10 % oceněného kapitálu a dostupných USD podle skutečné IOC ceny.
+//! Reject an undersized order instead of raising it above the equity cap.
+//! Odmítnout příliš malý příkaz místo jeho zvýšení nad kapitálový strop.
 
 use std::time::{Duration, Instant};
 
@@ -35,6 +23,7 @@ use std::time::{Duration, Instant};
 pub const MAX_TRACKED_LIVE_LONG_POSITIONS: usize = 10;
 
 /// Hard maximum fraction of total equity (10.0%, max 1/10th) authorized for a single live BUY order.
+/// Tvrdý strop jednoho živého BUY příkazu je 10,0 % celkového kapitálu.
 pub const MAX_LIVE_BUY_EQUITY_FRACTION: f64 = 0.10;
 
 /// Default minimum monotonic time spacing between distinct entry impulses.
@@ -102,10 +91,23 @@ impl EntryGate {
         }
     }
 
-    /// Creates an `EntryGate` with default settings (2s spacing, max 3 positions).
+    /// Creates an `EntryGate` with default settings (2s spacing, max 10 positions).
     #[allow(dead_code)]
     pub fn default_gate() -> Self {
         Self::new(DEFAULT_MIN_IMPULSE_SPACING)
+    }
+
+    /// Construct a configured gate within the existing hard ceilings.
+    /// Vytvořit konfigurovanou bránu v rámci dosavadních pevných stropů.
+    pub fn with_limits(min_spacing: Duration, max_positions: usize) -> std::io::Result<Self> {
+        if !(1..=MAX_TRACKED_LIVE_LONG_POSITIONS).contains(&max_positions)
+            || min_spacing < DEFAULT_MIN_IMPULSE_SPACING {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                "invalid configured entry gate"));
+        }
+        let mut gate = Self::new(min_spacing);
+        gate.max_positions = max_positions;
+        Ok(gate)
     }
 
     /// Updates the signal state for impulse latch tracking.
@@ -150,7 +152,7 @@ impl EntryGate {
             }
         }
 
-        // Rule 3c: Maximum 3 tracked live long positions INCLUDING pending async submissions
+        // Rule 3c: Maximum 10 tracked live long positions INCLUDING pending async submissions
         let total_tracked = active_live_long_count.saturating_add(self.pending_buy_reservations);
         if total_tracked >= self.max_positions {
             return EntryGateDecision::BlockedByMaxPositions {
@@ -285,7 +287,7 @@ pub fn route_entry_signals(
 }
 
 // ============================================================================
-// POINT 7: HARD 1% EQUITY SIZING & ANTI-UPWARD-CLAMPING
+// POINT 7: HARD 10% EQUITY SIZING & ANTI-UPWARD-CLAMPING
 // ============================================================================
 
 /// Formats price to 2 decimal places matching Bitfinex client submission (`format!("{:.2}", price)`).
@@ -323,7 +325,7 @@ pub fn quantize_qty_down_6dec(qty: f64) -> f64 {
 pub struct LiveBuySizing {
     /// Approved order quantity in BTC (quantized down to 6 decimal places).
     pub final_qty_btc: f64,
-    /// Effective fraction of total portfolio equity allocated to this trade (<= 0.01).
+    /// Effective fraction of total portfolio equity allocated to this trade (<= 0.10).
     pub effective_equity_fraction: f64,
     /// Total required USD cost of the trade at worst execution price.
     pub required_usd: f64,
@@ -1012,3 +1014,19 @@ pub mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod configured_gate_tests {
+    use super::*;
+    #[test]
+    fn configured_capacity_counts_pending_reservations() {
+        let mut gate = EntryGate::with_limits(Duration::from_secs(2), 2).unwrap();
+        let now = Instant::now();
+        gate.reserve_live_buy(now);
+        gate.update_signal_state(false);
+        assert!(matches!(gate.check_live_entry(true, 1, now + Duration::from_secs(3)),
+            EntryGateDecision::BlockedByMaxPositions { max_allowed: 2, .. }));
+        assert!(EntryGate::with_limits(Duration::from_secs(2), 11).is_err());
+        assert!(EntryGate::with_limits(Duration::from_millis(1999), 10).is_err());
+    }
+}

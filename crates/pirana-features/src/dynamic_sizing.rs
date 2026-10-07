@@ -8,6 +8,15 @@ pub struct DynamicSizer {
     pub max_aggregate_exposure_pct: f64,
 }
 
+/// Configured inventory percentages.
+/// Nakonfigurovaná procenta inventáře.
+#[derive(Debug, Clone, Copy)]
+pub struct RegimeInventoryCaps {
+    pub range_pct: f64,
+    pub trend_down_pct: f64,
+    pub trend_up_pct: f64,
+}
+
 impl DynamicSizer {
     pub fn new(min_position_pct: f64, max_position_pct: f64, max_aggregate_exposure_pct: f64) -> Self {
         Self {
@@ -75,15 +84,32 @@ impl DynamicSizer {
         trend_down: bool,
         rolling_pnl_negative: bool,
     ) -> f64 {
-        if current_btc_price <= 0.0 || total_portfolio_usd <= 0.0 {
-            return 0.0001;
+        self.calculate_regime_inventory_btc_with_caps(total_portfolio_usd,
+            current_btc_price, trend_up, trend_down, rolling_pnl_negative,
+            RegimeInventoryCaps { range_pct: 20.0, trend_down_pct: 10.0, trend_up_pct: 35.0 })
+    }
+
+    /// Read current equity without caching wallet observations.
+    /// Číst aktuální kapitál bez ukládání pozorování peněženky.
+    pub fn calculate_regime_inventory_btc_with_caps(
+        &self, total_portfolio_usd: f64, current_btc_price: f64,
+        trend_up: bool, trend_down: bool, rolling_pnl_negative: bool,
+        caps: RegimeInventoryCaps,
+    ) -> f64 {
+        if !total_portfolio_usd.is_finite() || !current_btc_price.is_finite()
+            || total_portfolio_usd <= 0.0 || current_btc_price <= 0.0
+            || !caps.range_pct.is_finite() || !caps.trend_down_pct.is_finite()
+            || !caps.trend_up_pct.is_finite()
+            || !(0.0 < caps.trend_down_pct && caps.trend_down_pct <= caps.range_pct
+                && caps.range_pct <= caps.trend_up_pct && caps.trend_up_pct <= 90.0) {
+            return 0.0;
         }
         let cap_pct = if trend_down || rolling_pnl_negative {
-            0.10
+            caps.trend_down_pct / 100.0
         } else if trend_up {
-            0.35
+            caps.trend_up_pct / 100.0
         } else {
-            0.20
+            caps.range_pct / 100.0
         };
         let cap_usd = total_portfolio_usd * cap_pct;
         let cap_btc = cap_usd / current_btc_price;
@@ -214,4 +240,20 @@ mod tests {
         assert!(max >= 0.00004, "nikdy pod minimální order");
     }
 
+}
+
+#[cfg(test)]
+mod configured_inventory_tests {
+    use super::*;
+    #[test]
+    fn current_equity_and_defensive_priority() {
+        let s = DynamicSizer::new(1.0, 25.0, 60.0);
+        let caps = RegimeInventoryCaps { range_pct: 15.0, trend_down_pct: 5.0, trend_up_pct: 25.0 };
+        let inventory = |e, down| s.calculate_regime_inventory_btc_with_caps(
+            e, 80_000.0, true, down, false, caps);
+        assert!((inventory(400.0, false) - 100.0 / 80_000.0).abs() < 1e-12);
+        assert!((inventory(400.0, true) - 20.0 / 80_000.0).abs() < 1e-12);
+        assert!((inventory(800.0, false) - 200.0 / 80_000.0).abs() < 1e-12);
+        assert_eq!(inventory(f64::NAN, false), 0.0);
+    }
 }

@@ -48,7 +48,7 @@ mod decision_evidence;
 static EVIDENCE_MARK: parking_lot::Mutex<Option<(i64, f64)>> = parking_lot::Mutex::new(None);
 mod entry_policy;
 use entry_policy::{
-    EntryGate, EntryGateDecision, EntryRoutingDecision, DEFAULT_MIN_IMPULSE_SPACING,
+    EntryGate, EntryGateDecision, EntryRoutingDecision,
 };
 
 mod signal_exit;
@@ -91,6 +91,27 @@ pub struct ActivePosition {
     /// prefixem pro offline srovnání živé (SCALP) vs stínové (TIGHT)
     /// strategie.
     pub is_shadow: bool,
+}
+
+/// Arms BUY trailing after a price rise and only ratchets its floor upwards.
+/// Aktivuje BUY trailing po růstu ceny a posouvá jeho hranici pouze nahoru.
+fn update_buy_trailing(pos: &mut ActivePosition, price: f64, atr_usd: f64,
+    config: &config::TrailingStopConfig, max_distance_usd: f64) {
+    if pos.side != Side::Buy || !config.enabled || !price.is_finite() || price <= 0.0 {
+        return;
+    }
+    pos.highest_price_seen = pos.highest_price_seen.max(price);
+    if !pos.is_breakeven && price > pos.entry_price
+        && price >= pos.entry_price + config.min_trigger_usd {
+        pos.is_breakeven = true;
+        pos.trailing_active = true;
+        pos.sl_price = pos.sl_price.max(pos.entry_price + config.be_offset_usd);
+    }
+    if pos.trailing_active {
+        let distance = (atr_usd * config.trail_multiplier)
+            .clamp(config.min_trigger_usd, max_distance_usd);
+        pos.sl_price = pos.sl_price.max(pos.highest_price_seen - distance);
+    }
 }
 
 /// Evaluates whether a BUY position should be closed according to Bitcoin Standard (§1b):
@@ -214,16 +235,18 @@ fn build_calibration_view(
     use pirana_dashboard::state::{CalibrationView, DerivedParamView};
     use pirana_risk_engine::self_calibration::DerivedParam;
 
-    /// Prevod s explicitne dosazenou efektivni hodnotou.
-    fn view_of(p: &DerivedParam, effective: f64) -> DerivedParamView {
+    // Convert with the explicit effective policy value.
+    // Převod s explicitně dosazenou účinnou hodnotou pravidla.
+    let fixed = engine.uses_fixed_operator_policy();
+    let view_of = |p: &DerivedParam, effective: f64| -> DerivedParamView {
         DerivedParamView {
             value: effective,
-            formula: p.formula.clone(),
-            inputs: p.inputs.clone(),
-            computed_at: p.computed_at,
-            is_seed: p.is_seed(),
+            formula: if fixed { "strategy.toml fixed operator policy".to_owned() } else { p.formula.clone() },
+            inputs: if fixed { "automatic tuning removed".to_owned() } else { p.inputs.clone() },
+            computed_at: if fixed { 0 } else { p.computed_at },
+            is_seed: if fixed { false } else { p.is_seed() },
         }
-    }
+    };
 
     CalibrationView {
         generation: snap.calibration_generation,
@@ -248,7 +271,11 @@ fn build_calibration_view(
             engine.vpin_toxicity_threshold(),
         ),
         // P(ruin) neni limit, nic se neoramovava — publikuje se jak vyslo.
-        p_ruin_1y: view_of(&snap.p_ruin_1y, snap.p_ruin_1y.value),
+        p_ruin_1y: if fixed {
+            let measured = engine.passive_ruin_measurement();
+            DerivedParamView { value: measured.value, formula: measured.formula.clone(),
+                inputs: measured.inputs.clone(), computed_at: measured.computed_at, is_seed: measured.is_seed() }
+        } else { view_of(&snap.p_ruin_1y, snap.p_ruin_1y.value) },
         hard_cap_aggregate_exposure: pirana_core::constants::MAX_AGGREGATE_EXPOSURE,
         hard_cap_single_trade_risk: pirana_core::constants::MAX_SINGLE_TRADE_RISK,
         calibrated_at: snap.calibrated_at,
@@ -288,7 +315,14 @@ async fn main() -> PiranaResult<()> {
             let interval = sc_clone.read().system.reload_interval_seconds;
             tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             match StrategyConfig::load() {
-                Ok(new_config) => *sc_clone.write() = new_config,
+                Ok(new_config) => {
+                    let mut applied = sc_clone.write();
+                    if applied.requires_restart(&new_config) {
+                        tracing::warn!("strategy.toml differs from applied policy; PENDING_RESTART, current policy retained");
+                    } else {
+                        *applied = new_config;
+                    }
+                }
                 Err(e) => tracing::error!(
                     "strategy.toml hot-reload rejected; keeping last-known-good config: {}",
                     e
@@ -535,9 +569,13 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let mut order_book;
     let mut log_throttler = LogThrottler::new(std::time::Duration::from_secs(60));
     let mut last_trade_time = std::time::Instant::now() - std::time::Duration::from_secs(100);
-    let entry_gate = Arc::new(parking_lot::Mutex::new(EntryGate::new(
-        DEFAULT_MIN_IMPULSE_SPACING,
-    )));
+    let entry_gate = {
+        let applied = strategy_config.read();
+        Arc::new(parking_lot::Mutex::new(EntryGate::with_limits(
+            std::time::Duration::from_millis(applied.trading.min_impulse_spacing_ms),
+            applied.trading.max_live_positions,
+        ).map_err(|error| PiranaError::Config(format!("entry policy rejected: {error}")))?))
+    };
     let (shadow_tx, shadow_rx) = tokio::sync::mpsc::channel(1024);
     spawn_shadow_writer(shadow_rx, SHADOW_LOG_PATH);
     let shadow_engine = Arc::new(parking_lot::Mutex::new(ShadowExperimentEngine::new(Some(shadow_tx))));
@@ -549,15 +587,21 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     let usd_bal = *state.usd_balance.read();
     let initial_price = if *state.btc_price.read() > 0.0 { *state.btc_price.read() } else { 73000.0 };
     let initial_balance = btc_bal * initial_price + usd_bal;
-    // [CASLAV v5.1 / U1] Kalibrovany stav se nacita z disku (§8.4).
-    // Do teto zmeny zil jen v RAM: kazdy restart sluzby zahodil vsechno
-    // namerene a engine zacal znovu na seedu. Pri osmi restartech za den
-    // kalibrace nemohla konvergovat, protoze nikdy nezacala tam, kde skoncila.
+    // Effective limits are validated fixed operator settings. Preserve historical files.
+    // Účinné limity jsou ověřená pevná nastavení operátora. Historické soubory zachovat.
     let risk_state_path = pirana_risk_engine::persistence::default_state_path();
-    let risk_engine = RiskEngine::new_persistent(
+    let risk_engine = RiskEngine::new_persistent_with_operator_limits(
         if initial_balance > 0.0 { initial_balance } else { 1000.0 },
         risk_state_path,
-    );
+        strategy_config.read().operator_limits(),
+    ).map_err(|error| PiranaError::Config(format!("operator policy rejected: {error}")))?;
+    {
+        let applied = strategy_config.read();
+        tracing::info!("Applied policy: slots={}, entry_pct={}, daily_ceiling_pct={}, weekly_ceiling_pct={}",
+            applied.trading.max_live_positions, applied.trading.max_live_buy_equity_pct,
+            applied.risk_management.max_daily_drawdown_pct,
+            applied.risk_management.max_weekly_drawdown_pct);
+    }
     risk_engine.require_verified_calibration();
     risk_engine.require_equity_guard();
     risk_engine.activate();
@@ -598,29 +642,6 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
-    }
-
-    // [ADAPTIVE BASELINE 26.8.] Seed autonomní baseline z strategy.toml —
-    // pouze pokud dosud neexistuje (první běh / starší risk_state.json).
-    // Jinak pokračuje perzistovaná hodnota; strategy.toml position_size_pct
-    // je od teď jen studený start, skutečnou baseline řídí risk engine.
-    {
-        let mut calibrated = risk_engine.calibrated_mut();
-        if calibrated.adaptive_baseline.is_none() {
-            let seed_pct = strategy_config.read().risk_management.position_size_pct;
-            calibrated.adaptive_baseline =
-                Some(pirana_risk_engine::adaptive_baseline::AdaptiveBaseline::seed(seed_pct));
-            info!(
-                "Adaptive baseline: seedován z strategy.toml ({} %) — autonomie začne po nasbírání vzorku",
-                seed_pct
-            );
-            // Persist hned po seedu (nález oponentury: pád před první
-            // rekalibrací by seed zahodil a příští start by seedoval znovu).
-            drop(calibrated);
-            let _ = risk_engine.persist_calibration();
-        } else {
-            drop(calibrated);
-        }
     }
 
     // [CASLAV v5.1 / PERSISTENCE] TradeLedger persistence + reconstruction
@@ -817,11 +838,8 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
     }
 
     tokio::spawn(async move {
-        // [CASLAV v5.1] Citac ticku pro kadenci rekalibrace.
-        // Rekonciliace bezi kazdych 15 s; rekalibrace 1x za 60 ticku = 15 min.
-        // Casteji nema smysl: MAX_RELATIVE_CHANGE=0,30 stejne omezuje skoky
-        // a kalibrace ma reagovat na rezim trhu, ne na jednotlivy obchod.
-        const RECALIBRATION_EVERY_N_TICKS: u64 = 60;
+        // Refresh read-only measurement evidence; never tune policy.
+        // Obnovovat pouze měřicí důkazy, nikdy nepřelaďovat politiku.
         let mut tick: u64 = 0;
         let mut evidence_writer: Option<measurement_evidence::EquityEvidenceWriter> = None;
 
@@ -976,7 +994,10 @@ async fn run_market_data_feed(state: Arc<DashboardState>, api_key: String, api_s
                                 chrono::Utc::now().timestamp_millis(),
                             );
                         }
-                        if tick % RECALIBRATION_EVERY_N_TICKS == 0 { risk_engine_for_reconciliation.recalibrate_and_log(equity_usd, btc_price); }
+                        // Estimate telemetry without changing strategy.toml limits.
+                        // Odhadovat telemetrii bez změny limitů strategy.toml.
+                        risk_engine_for_reconciliation.refresh_passive_measurements(
+                            equity_usd, btc_price, chrono::Utc::now().timestamp_millis());
 
                         // Publikace kalibrovaneho stavu do dashboardu (/api/risk_state).
                         // Publikuji se EFEKTIVNI hodnoty — tedy uz po oramovani
@@ -1306,27 +1327,8 @@ async fn process_ws_message(
                                             pos.lowest_price_seen = price;
                                         }
 
-                                        // 1. Breakeven Trigger: If price reaches entry + min_trigger_usd, secure profit floor
-                                        if trailing_cfg.enabled && !pos.is_breakeven && price >= pos.entry_price + trailing_cfg.min_trigger_usd {
-                                            pos.is_breakeven = true;
-                                            pos.trailing_active = true;
-                                            let new_be_sl = pos.entry_price + trailing_cfg.be_offset_usd;
-                                            if new_be_sl > pos.sl_price {
-                                                pos.sl_price = new_be_sl;
-                                                tracing::info!("🛡️ [BREAKEVEN] BUY Position moved to secure profit floor! Entry: {}, New SL: {}", pos.entry_price, pos.sl_price);
-                                            }
-                                        }
-
-                                        // 2. Trailing Stop: Trail behind peak price
-                                        if trailing_cfg.enabled && pos.trailing_active {
-                                            let trail_dist = (atr.current_atr() * trailing_cfg.trail_multiplier)
-                                                .clamp(trailing_cfg.min_trigger_usd, vol_cfg.max_tp_usd);
-                                            let trailing_sl = pos.highest_price_seen - trail_dist;
-                                            if trailing_sl > pos.sl_price {
-                                                pos.sl_price = trailing_sl;
-                                                tracing::info!("📈 [TRAILING STOP] BUY Position SL trailed up to {} (Peak: {})", pos.sl_price, pos.highest_price_seen);
-                                            }
-                                        }
+                                        update_buy_trailing(pos, price, atr.current_atr(),
+                                            trailing_cfg, vol_cfg.max_tp_usd);
 
                                         // 3. Exit check
                                         // [OPONENTURA P0-1 FIX] TP check per-pozice: pos.tp_price
@@ -1351,26 +1353,8 @@ async fn process_ws_message(
                                             pos.highest_price_seen = price;
                                         }
 
-                                        if trailing_cfg.enabled && !pos.is_breakeven && price <= pos.entry_price - trailing_cfg.min_trigger_usd {
-                                            pos.is_breakeven = true;
-                                            pos.trailing_active = true;
-                                            let new_be_sl = pos.entry_price - trailing_cfg.be_offset_usd;
-                                            if new_be_sl < pos.sl_price {
-                                                pos.sl_price = new_be_sl;
-                                                tracing::info!("🛡️ [BREAKEVEN] SELL Position moved to secure profit floor! Entry: {}, New SL: {}", pos.entry_price, pos.sl_price);
-                                            }
-                                        }
-
-                                        if trailing_cfg.enabled && pos.trailing_active {
-                                            let trail_dist = (atr.current_atr() * trailing_cfg.trail_multiplier)
-                                                .clamp(trailing_cfg.min_trigger_usd, vol_cfg.max_tp_usd);
-                                            let trailing_sl = pos.lowest_price_seen + trail_dist;
-                                            if trailing_sl < pos.sl_price {
-                                                pos.sl_price = trailing_sl;
-                                                tracing::info!("📈 [TRAILING STOP] SELL Position SL trailed down to {} (Low: {})", pos.sl_price, pos.lowest_price_seen);
-                                            }
-                                        }
-
+                                        // Do not arm or ratchet trailing on BTC declines.
+                                        // Při poklesu BTC trailing neaktivovat ani neposouvat.
                                         if price <= pos.tp_price {
                                             tracing::info!("🎯 SELL Position TP Hit! Price {} <= TP {}", price, pos.tp_price);
                                             should_close = true;
@@ -2171,29 +2155,12 @@ async fn process_ws_message(
                                 let dynamic_sizer = pirana_features::dynamic_sizing::DynamicSizer::new(
                                     conf.risk_management.min_position_size_pct,
                                     conf.risk_management.max_position_size_pct,
-                                    conf.risk_management.max_aggregate_exposure_pct,
+                                    risk_engine.max_aggregate_exposure() * 100.0,
                                 );
 
-                                // [ADAPTIVE BASELINE 26.8.] Baseline sizingu přebírá
-                                // autonomní baseline z risk engine (risk_state.json),
-                                // pokud existuje. strategy.toml position_size_pct je
-                                // pak jen seed pro studený start. Operator lock
-                                // (baseline_mode=locked) baseline zmrazí.
-                                let base_pos_pct = match risk_engine.adaptive_baseline_pct() {
-                                    Some(pct) if pct > 0.0 => pct,
-                                    _ => conf.risk_management.position_size_pct,
-                                };
-
-                                let dynamic_pos_pct_raw = if conf.risk_management.use_dynamic_winrate_sizing {
-                                    dynamic_sizer.calculate_dynamic_position_pct(
-                                        base_pos_pct,
-                                        *state.win_rate.read(),
-                                        *state.trades_today.read(),
-                                        *state.consecutive_losses.read(),
-                                    )
-                                } else {
-                                    base_pos_pct
-                                };
+                                // Position sizing is configured, not inferred from historical wins.
+                                // Velikost pozice je nastavena, neodvozuje se z historických výher.
+                                let dynamic_pos_pct_raw = conf.risk_management.position_size_pct;
 
                                 let as_multiplier_buy = if conf.avellaneda_stoikov.enabled {
                                     as_model.calculate_inventory_skew_multiplier(
@@ -2221,12 +2188,17 @@ async fn process_ws_message(
                                 // tradingu (52 % dne je přirozeně pod nulou).
                                 let rolling_negative = risk_engine.brakes_rolling_engaged();
                                 let max_allowed_btc = if conf.inventory.use_dynamic_inventory {
-                                    dynamic_sizer.calculate_regime_inventory_btc(
+                                    dynamic_sizer.calculate_regime_inventory_btc_with_caps(
                                         total_portfolio_usd,
                                         price,
                                         trend_up,
                                         trend_down,
                                         rolling_negative,
+                                        pirana_features::dynamic_sizing::RegimeInventoryCaps {
+                                            range_pct: conf.inventory.range_inventory_pct,
+                                            trend_down_pct: conf.inventory.trend_down_inventory_pct,
+                                            trend_up_pct: conf.inventory.trend_up_inventory_pct,
+                                        },
                                     )
                                 } else {
                                     conf.inventory.max_inventory_btc
@@ -2297,7 +2269,7 @@ async fn process_ws_message(
                                         entry_zone: (price - conf.strategy.entry_zone_spread_usd, price + conf.strategy.entry_zone_spread_usd),
                                         invalidation_level: price - sl_dist,
                                         volatility_adjusted_tp: price + tp_dist,
-                                        position_size_pct: (dynamic_pos_pct / 100.0).min(entry_policy::MAX_LIVE_BUY_EQUITY_FRACTION),
+                                        position_size_pct: (dynamic_pos_pct / 100.0).min(conf.live_buy_equity_fraction()),
                                         max_slippage_bps: conf.risk_management.max_slippage_bps,
                                     };
                                     let as_info = if conf.avellaneda_stoikov.enabled {
@@ -2479,9 +2451,8 @@ async fn process_ws_message(
                                                  );
                                                  let ioc_limit_price = slippage_guard.ioc_limit_price(Side::Buy, price);
 
-                                                 // [POINT 7 — HARD 1% EQUITY SIZING & NO UPWARD CLAMPING]
-                                                 // Sizing is computed against the ACTUAL formatted worst execution price (IOC limit price)
-                                                 // and quantized down to 6 decimal places to guarantee real submitted notional <= 1% equity.
+                                                 // Quantize against the actual IOC price; never exceed the hard 10% equity ceiling.
+                                                 // Zaokrouhlit podle skutečné IOC ceny; nikdy nepřekročit tvrdý strop 10 % kapitálu.
                                                  let sizing = match entry_policy::calculate_live_buy_sizing(
                                                      total_portfolio_usd,
                                                      ioc_limit_price,
@@ -2499,7 +2470,8 @@ async fn process_ws_message(
                                                          decision.data.outcome = "sizing_below_minimum";
                                                           if log_throttler.should_log("buy_sizing_undersized") {
                                                              tracing::warn!(
-                                                                 "⚠️ [SIZING HARD CAP] Live BUY rejected: 1% equity cap ({:.6} BTC / {:.2} USD) is below exchange min ({:.6} BTC). Never clamping upward.",
+                                                                 "⚠️ [SIZING HARD CAP] Live BUY rejected: hard {:.1}% equity cap ({:.6} BTC / {:.2} USD) is below exchange min ({:.6} BTC). Never clamping upward.",
+                                                                 entry_policy::MAX_LIVE_BUY_EQUITY_FRACTION * 100.0,
                                                                  equity_cap_btc,
                                                                  total_equity_usd * entry_policy::MAX_LIVE_BUY_EQUITY_FRACTION,
                                                                  min_required_btc
@@ -3443,6 +3415,35 @@ mod bitcoin_standard_tests {
             is_rebalance: false,
             is_shadow: false,
         }
+    }
+
+    #[test]
+    fn owner_trailing_arms_only_after_rise_and_never_moves_down() {
+        let cfg = config::TrailingStopConfig { enabled: true, min_trigger_usd: 25.0,
+            be_offset_usd: 10.0, trail_multiplier: 0.5 };
+        let mut pos = sample_buy_position(80_000.0, 120.0, 400.0);
+        for price in [79_000.0, 80_000.0, 80_024.99] {
+            update_buy_trailing(&mut pos, price, 60.0, &cfg, 120.0);
+            assert!(!pos.trailing_active);
+            assert!(!pos.is_breakeven);
+        }
+        update_buy_trailing(&mut pos, 80_025.0, 60.0, &cfg, 120.0);
+        assert!(pos.trailing_active);
+        assert_eq!(pos.sl_price, 80_010.0);
+        update_buy_trailing(&mut pos, 80_100.0, 60.0, &cfg, 120.0);
+        assert_eq!(pos.sl_price, 80_070.0);
+        update_buy_trailing(&mut pos, 80_050.0, 60.0, &cfg, 120.0);
+        assert_eq!(pos.sl_price, 80_070.0);
+        assert!(should_close_buy_position(&pos, 80_050.0, false));
+        assert!(!should_close_buy_position(&pos, 79_900.0, false));
+        let mut sell = sample_buy_position(80_000.0, 120.0, 400.0);
+        sell.side = Side::Sell;
+        update_buy_trailing(&mut sell, 79_000.0, 60.0, &cfg, 120.0);
+        assert!(!sell.trailing_active);
+        let mut disabled = cfg.clone(); disabled.enabled = false;
+        let mut pos = sample_buy_position(80_000.0, 120.0, 400.0);
+        update_buy_trailing(&mut pos, 80_100.0, 60.0, &disabled, 120.0);
+        assert!(!pos.trailing_active);
     }
 
     #[test]

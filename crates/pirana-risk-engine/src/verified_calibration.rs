@@ -347,4 +347,36 @@ mod tests {
         assert!(validate(&report, generated + FRESH + 1).is_err());
     }
 
+    // Exercise valid canonical measurement and reject its later stale reuse.
+    // Ověřit platné kanonické měření a odmítnout jeho pozdější zastaralé použití.
+    #[test]
+    fn fixed_policy_passive_estimate_uses_verified_data_then_invalidates_stale_value() {
+        let now = 20000 * DAY + 10000;
+        let report = ready(now);
+        let ledger = validate(&report, now).unwrap();
+        let stats = ledger.build_stats(1000.0, 100000.0, 0.30, now / 1000).unwrap();
+        let expected = crate::self_calibration::SelfCalibration::p_ruin_at_exposure(&stats, 0.60);
+        let mut policy = crate::operator_limits::observed_operator_limits();
+        policy.max_daily_drawdown = 0.01;
+        let engine = crate::engine::RiskEngine::new_persistent_with_operator_limits(
+            1000.0, std::env::temp_dir().join("unused-passive-estimate.json"), policy).unwrap();
+        engine.require_verified_calibration();
+        engine.update_verified_calibration(report, now);
+        let generation = engine.calibration_snapshot().calibration_generation;
+        engine.refresh_passive_measurements(1000.0, 100000.0, now);
+        let measured = engine.passive_ruin_measurement();
+        assert!(measured.value.is_finite());
+        assert!(!measured.is_seed());
+        assert_eq!(measured.value, expected);
+        assert_eq!(measured.computed_at, now / 1000);
+        assert_eq!(engine.max_daily_drawdown(), 0.01);
+        assert_eq!(engine.max_aggregate_exposure(), 0.60);
+        engine.refresh_passive_measurements(1000.0, 100000.0, now + FRESH + 1);
+        assert!(engine.passive_ruin_measurement().value.is_nan());
+        assert!(engine.passive_ruin_measurement().is_seed());
+        assert_eq!(engine.calibration_snapshot().calibration_generation, generation);
+        assert_eq!(engine.max_daily_drawdown(), 0.01);
+        assert!(!engine.persist_calibration());
+    }
+
 }

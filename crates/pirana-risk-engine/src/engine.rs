@@ -44,6 +44,9 @@ use std::path::PathBuf;
 /// ulozi. Bez toho zil vysledek mereni jen v RAM a kazdy restart ho zahodil.
 #[derive(Debug, Clone)]
 pub struct RiskEngine {
+    /// Immutable validated ceilings; no persisted calibration can broaden them.
+    /// Neměnné ověřené stropy; žádná uložená kalibrace je nemůže rozšířit.
+    operator_limits: Option<Arc<crate::operator_limits::OperatorLimits>>,
     state: Arc<RwLock<RiskState>>,
     equity_risk: Arc<Mutex<Option<crate::equity_risk::EquityRisk>>>,
     /// Kalibrovane rizikove parametry (seed z hard capu dokud neni dost vzorku).
@@ -53,6 +56,9 @@ pub struct RiskEngine {
     /// Cesta k perzistentnimu `risk_state.json`. `None` = jen RAM (testy).
     state_path: Option<PathBuf>,
     verified_calibration: Arc<Mutex<crate::verified_calibration::VerifiedCalibration>>,
+    // Passive estimate never changes operator policy.
+    // Pasivní odhad nikdy nemění pravidla vlastníka.
+    passive_ruin: Arc<RwLock<crate::self_calibration::DerivedParam>>,
     /// [TRADING BRAKES 27. 8.] Tři daty podložené brzdy vstupu —
     /// loss-cooldown, VPIN deadzone, rolling brake. Entry-only.
     brakes: Arc<Mutex<crate::trading_brakes::TradingBrakes>>,
@@ -149,12 +155,28 @@ impl RiskEngine {
         Self::with_calibration(initial_balance, calibrated, Some(state_path))
     }
 
+    /// Validate operator policy before loading historical calibration.
+    /// Ověřit politiku operátora před načtením historické kalibrace.
+    pub fn new_persistent_with_operator_limits(
+        initial_balance: f64, state_path: PathBuf,
+        limits: crate::operator_limits::OperatorLimits,
+    ) -> std::io::Result<Self> {
+        limits.validate()?;
+        // Historical tuning files are preserved but cannot control production policy.
+        // Historické soubory ladění zachovat, nesmějí řídit produkční politiku.
+        let _historical_state_path = state_path;
+        let mut engine = Self::with_calibration(initial_balance, CalibratedRisk::seed(), None);
+        engine.operator_limits = Some(Arc::new(limits));
+        Ok(engine)
+    }
+
     fn with_calibration(
         initial_balance: f64,
         calibrated: CalibratedRisk,
         state_path: Option<PathBuf>,
     ) -> Self {
         Self {
+            operator_limits: None,
             state: Arc::new(RwLock::new(RiskState {
                 equity_required: false,
                 equity_blocked: false,
@@ -177,6 +199,7 @@ impl RiskEngine {
             calibrated: Arc::new(RwLock::new(calibrated)),
             ledger: Arc::new(Mutex::new(TradeLedger::new())),
             state_path,
+            passive_ruin: Arc::new(RwLock::new(crate::self_calibration::DerivedParam::seed(f64::NAN, "verified measurements unavailable"))),
             verified_calibration: Arc::new(Mutex::new(
                 crate::verified_calibration::VerifiedCalibration::default(),
             )),
@@ -281,21 +304,33 @@ impl RiskEngine {
 
     /// Efektivni strop agregatni expozice (kalibrace ∧ hard cap).
     pub fn max_aggregate_exposure(&self) -> f64 {
+        if let Some(limits) = &self.operator_limits {
+            return limits.max_aggregate_exposure;
+        }
         effective_max_aggregate_exposure(self.calibrated.read().max_aggregate_exposure.value)
     }
 
     /// Efektivni strop rizika jednoho obchodu (kalibrace ∧ hard cap).
     pub fn max_single_trade_risk(&self) -> f64 {
+        if let Some(limits) = &self.operator_limits {
+            return limits.max_single_trade_risk;
+        }
         effective_max_single_trade_risk(self.calibrated.read().max_single_trade_risk.value)
     }
 
     /// Efektivni denni drawdown limit (kalibrace ∧ hard cap).
     pub fn max_daily_drawdown(&self) -> f64 {
+        if let Some(limits) = &self.operator_limits {
+            return limits.max_daily_drawdown;
+        }
         effective_max_daily_drawdown(self.calibrated.read().max_daily_drawdown.value)
     }
 
     /// Efektivni tydenni drawdown limit (kalibrace ∧ hard cap).
     pub fn max_weekly_drawdown(&self) -> f64 {
+        if let Some(limits) = &self.operator_limits {
+            return limits.max_weekly_drawdown;
+        }
         effective_max_weekly_drawdown(self.calibrated.read().max_weekly_drawdown.value)
     }
 
@@ -308,18 +343,21 @@ impl RiskEngine {
 
     /// Efektivni prah po sobe jdoucich ztrat (kalibrace ∧ hard cap).
     pub fn consecutive_loss_threshold(&self) -> u32 {
-        effective_consecutive_loss_threshold(self.calibrated.read().consecutive_loss_threshold.value)
+        if let Some(limits) = &self.operator_limits {
+            return limits.consecutive_loss_threshold;
+        }
+        effective_consecutive_loss_threshold(
+            self.calibrated.read().consecutive_loss_threshold.value)
     }
 
     /// Efektivni VPIN prah toxicity. Nema tvrdy protejsek v constants.rs,
     /// kalibrator ho uz clampuje do ⟨0,30 ; 0,95⟩.
     pub fn vpin_toxicity_threshold(&self) -> f64 {
-        let v = self.calibrated.read().vpin_toxicity_threshold.value;
-        if v.is_finite() {
-            v.clamp(0.30, 0.95)
-        } else {
-            0.65
+        if let Some(limits) = &self.operator_limits {
+            return limits.vpin_toxicity_threshold;
         }
+        let v = self.calibrated.read().vpin_toxicity_threshold.value;
+        if v.is_finite() { v.clamp(0.30, 0.95) } else { 0.65 }
     }
 
         /// [TRADING BRAKES] Zápis VPIN pro hysterzní deadzone brzdu.
@@ -382,6 +420,12 @@ impl RiskEngine {
     }
 
 /// Kopie kalibrovaneho stavu pro dashboard / report.
+    /// Reports whether effective policy comes exclusively from strategy.toml.
+    /// Udává, zda účinná politika pochází výhradně ze strategy.toml.
+    pub fn uses_fixed_operator_policy(&self) -> bool {
+        self.operator_limits.is_some()
+    }
+
     pub fn calibration_snapshot(&self) -> CalibratedRisk {
         self.calibrated.read().clone()
     }
@@ -467,6 +511,34 @@ impl RiskEngine {
         }
     }
 
+    /// Refresh a passive statistical estimate from fresh canonical evidence only.
+    /// Obnovit pasivní statistický odhad pouze z čerstvých kanonických důkazů.
+    pub fn refresh_passive_measurements(&self, equity_usd: f64, price_usd: f64, now_ms: i64) {
+        use crate::self_calibration::DerivedParam;
+        let result = (|| {
+            if !equity_usd.is_finite() || equity_usd <= 0.0
+                || !price_usd.is_finite() || price_usd <= 0.0 || now_ms <= 0 {
+                return Err(RiskError::NonFiniteInput);
+            }
+            let ledger = self.verified_calibration.lock().ready_ledger(now_ms)
+                .map_err(|_| RiskError::OutOfRange("verified_measurements_not_ready", 0.0))?;
+            let stats = ledger.build_stats(equity_usd, price_usd, self.vpin_toxicity_threshold(), now_ms / 1000)?;
+            stats.validate()?;
+            let exposure = self.max_aggregate_exposure();
+            let value = SelfCalibration::p_ruin_at_exposure(&stats, exposure);
+            if !value.is_finite() { return Err(RiskError::NonFiniteInput); }
+            Ok(DerivedParam::new(value, "Gaussian statistical estimate; not a guarantee",
+                format!("canonical roundtrips={}, fixed exposure={}", stats.sample_size, exposure), now_ms / 1000))
+        })();
+        *self.passive_ruin.write() = result.unwrap_or_else(|_| DerivedParam::seed(f64::NAN, "verified measurements unavailable"));
+    }
+
+    /// Return telemetry independently of every learned policy field.
+    /// Vrátit telemetrii nezávisle na všech naučených pravidlech.
+    pub fn passive_ruin_measurement(&self) -> crate::self_calibration::DerivedParam {
+        self.passive_ruin.read().clone()
+    }
+
     /// Rekalibrace z namerenych dat.
     ///
     /// Pri uspechu zapise novy kalibrovany stav a vrati jeho generaci.
@@ -480,6 +552,9 @@ impl RiskEngine {
         equity_usd: f64,
         price_usd: f64,
     ) -> Result<u64, RiskError> {
+        if self.operator_limits.is_some() {
+            return Err(RiskError::OutOfRange("automatic_tuning_removed", 0.0));
+        }
         let now = chrono::Utc::now().timestamp();
         let current = self.calibrated.read().clone();
 
@@ -613,11 +688,12 @@ impl RiskEngine {
 
     /// Aktuální autonomní baseline jako procento (0.0 = baseline neaktivní).
     pub fn adaptive_baseline_pct(&self) -> Option<f64> {
-        self.calibrated
-            .read()
-            .adaptive_baseline
-            .as_ref()
-            .map(|b| b.value * 100.0)
+        if let Some(limits) = &self.operator_limits {
+            return Some(limits.baseline_pct);
+        }
+        let measured = self.calibrated.read().adaptive_baseline.as_ref()
+            .map(|baseline| baseline.value * 100.0);
+        measured
     }
 
     /// [MARKOUT GATE — podmínka operátora 26. 8.] Záznam posledního měřeného
@@ -1824,4 +1900,107 @@ mod verified_projection_tests {
         engine.update_verified_calibration(serde_json::json!({}), now);
         assert_eq!(engine.calibration_evidence()["status"], "BLOCKED");
     }
+}
+
+#[cfg(test)]
+mod operator_policy_tests {
+    use super::*;
+    use crate::operator_limits::observed_operator_limits;
+
+    #[test]
+    fn calibrated_limits_cannot_broaden_operator_policy() {
+        let mut engine = RiskEngine::new(1000.0);
+        engine.operator_limits = Some(Arc::new(observed_operator_limits()));
+        {
+            let mut measured = engine.calibrated_mut();
+            measured.max_daily_drawdown.value = f64::NAN;
+            measured.max_weekly_drawdown.value = 0.50;
+            measured.max_aggregate_exposure.value = 0.90;
+            measured.vpin_toxicity_threshold.value = 0.90;
+            measured.adaptive_baseline = Some(
+                crate::adaptive_baseline::AdaptiveBaseline::seed(20.0));
+        }
+        assert_eq!(engine.max_daily_drawdown(), 0.005);
+        assert_eq!(engine.max_weekly_drawdown(), 0.01165);
+        assert_eq!(engine.max_aggregate_exposure(), 0.60);
+        assert_eq!(engine.vpin_toxicity_threshold(), 0.30);
+        assert_eq!(engine.adaptive_baseline_pct(), Some(10.0));
+        engine.calibrated_mut().max_daily_drawdown.value = 0.002;
+        assert_eq!(engine.max_daily_drawdown(), 0.005);
+        assert_eq!(engine.clone().max_daily_drawdown(), 0.005);
+    }
+
+    #[test]
+    fn historical_values_cannot_tighten_or_broaden_fixed_policy() {
+        let mut engine = RiskEngine::new(1000.0);
+        let mut policy = observed_operator_limits();
+        policy.max_daily_drawdown = 0.01;
+        engine.operator_limits = Some(Arc::new(policy));
+        for value in [0.0, 0.002, 0.005, 0.5, f64::NAN, f64::INFINITY] {
+            {
+                let mut history = engine.calibrated_mut();
+                history.max_daily_drawdown.value = value;
+                history.max_weekly_drawdown.value = value;
+                history.max_aggregate_exposure.value = value;
+                history.max_single_trade_risk.value = value;
+                history.consecutive_loss_threshold.value = value;
+                history.vpin_toxicity_threshold.value = value;
+                history.adaptive_baseline = Some(crate::adaptive_baseline::AdaptiveBaseline::seed(1.0));
+            }
+            assert_eq!(engine.max_daily_drawdown(), 0.01);
+            assert_eq!(engine.max_weekly_drawdown(), 0.01165);
+            assert_eq!(engine.max_aggregate_exposure(), 0.60);
+            assert_eq!(engine.max_single_trade_risk(), 0.05);
+            assert_eq!(engine.consecutive_loss_threshold(), 5);
+            assert_eq!(engine.vpin_toxicity_threshold(), 0.30);
+            assert_eq!(engine.adaptive_baseline_pct(), Some(10.0));
+        }
+    }
+
+    #[test]
+    fn fixed_policy_preserves_historical_file_and_refuses_tuning() {
+        let path = std::env::temp_dir().join(format!("pirana-fixed-policy-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())).join("history.json");
+        let original = b"historical state must remain bytewise untouched";
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let policy = observed_operator_limits();
+        let engine = RiskEngine::new_persistent_with_operator_limits(1000.0, path.clone(), policy.clone()).unwrap();
+        engine.record_closed_trade(2.0, 100_000.0, 1000.0, 0.0);
+        assert_eq!(engine.ledger_len(), 1);
+        assert!(matches!(engine.recalibrate_now(1000.0, 100_000.0),
+            Err(RiskError::OutOfRange("automatic_tuning_removed", _))));
+        assert!(!engine.persist_calibration());
+        let restarted = RiskEngine::new_persistent_with_operator_limits(1000.0, path.clone(), policy).unwrap();
+        assert_eq!(engine.max_daily_drawdown(), restarted.max_daily_drawdown());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn invalid_policy_is_rejected_before_history_access() {
+        let mut invalid = observed_operator_limits();
+        invalid.max_daily_drawdown = f64::INFINITY;
+        let path = std::env::temp_dir().join("pirana-policy-invalid-never-written.json");
+        assert!(RiskEngine::new_persistent_with_operator_limits(1000.0, path, invalid).is_err());
+    }
+    #[test]
+    fn passive_measurements_do_not_invent_data_or_mutate_policy() {
+        let mut limits = crate::operator_limits::observed_operator_limits();
+        limits.max_daily_drawdown = 0.01;
+        let engine = RiskEngine::new_persistent_with_operator_limits(
+            100.0, std::env::temp_dir().join("unused-fixed-policy-history.json"), limits).unwrap();
+        engine.require_verified_calibration();
+        let before = engine.calibration_snapshot();
+        for (equity, price) in [(100.0, 80000.0), (f64::NAN, 80000.0), (100.0, 0.0)] {
+            engine.refresh_passive_measurements(equity, price, 1700000000000);
+            assert!(engine.passive_ruin_measurement().value.is_nan());
+            assert!(engine.passive_ruin_measurement().is_seed());
+            assert_eq!(engine.max_daily_drawdown(), 0.01);
+            assert_eq!(engine.calibration_snapshot().calibration_generation, before.calibration_generation);
+        }
+        assert_eq!(engine.ledger_len(), 0);
+        assert!(!engine.persist_calibration());
+    }
+
 }

@@ -4,6 +4,11 @@ reload_interval_seconds = 60
 [trading]
 trade_size_btc = 0.0002
 max_open_orders = 10
+# Entry caps include pending reservations; equity percentage is a notional ceiling.
+# Stropy vstupu zahrnují čekající rezervace; procento kapitálu omezuje hodnotu nákupu.
+max_live_positions = 10
+max_live_buy_equity_pct = 10.0
+min_impulse_spacing_ms = 2000
 
 [strategy]
 entry_zone_spread_usd = 5.0
@@ -59,14 +64,28 @@ max_inventory_btc = 0.05
 target_inventory_pct = 30.0
 target_inventory_btc = 0.01
 use_dynamic_inventory = true
+# Existing regime inventory ceilings remain in force.
+# Dosavadní režimové stropy inventáře zůstávají platné.
+range_inventory_pct = 20.0
+trend_down_inventory_pct = 10.0
+trend_up_inventory_pct = 35.0
 
 [risk_management]
 max_slippage_bps = 5
 position_size_pct = 10.0
-max_aggregate_exposure_pct = 90.0
+# Preserve the observed effective operator ceiling.
+# Zachovat zjištěný efektivní strop operátora.
+max_aggregate_exposure_pct = 60.0
 max_single_trade_risk_pct = 5.0
-# daily_loss_limit_usd odstraněno 24.8. — risk engine používá daily_loss_limit_sats (kalibrované).
-use_dynamic_winrate_sizing = true
+# Percentages are percentage points; calibration may tighten these ceilings.
+# Procenta jsou procentní body; kalibrace může tyto stropy zpřísnit.
+max_daily_drawdown_pct = 1.0
+max_weekly_drawdown_pct = 1.165
+consecutive_loss_threshold = 5
+vpin_toxicity_threshold = 0.30
+# Daily 1% activation remains a separate production change.
+# Aktivace denního 1 % zůstává samostatnou produkční změnou.
+use_dynamic_winrate_sizing = false
 min_position_size_pct = 1.0
 max_position_size_pct = 25.0
 
@@ -118,7 +137,7 @@ min_l2_imbalance_threshold = 0.15
 # Důvod: min_trigger_usd 6.0 USD a be_offset_usd 2.0 USD jsou MENŠÍ než spread trhu (8 USD).
 # Posun SL na Entry+2 USD následovaný prodejem Market orderem na Bid způsobil fill na Entry-6 USD.
 # Vypnuto: exity jsou řízeny výhradně robustním ATR Take Profit (100% win rate) a Stop Loss.
-enabled = false
+enabled = true
 min_trigger_usd = 25.0
 be_offset_usd = 10.0
 trail_multiplier = 0.5

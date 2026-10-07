@@ -2,7 +2,6 @@
 Description=Pirana daily calibration audit report
 After=network-online.target pirana.service
 Wants=network-online.target
-OnFailure=notify-telegram-failure@%n.service
 
 [Service]
 Type=oneshot

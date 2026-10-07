@@ -21,16 +21,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.85.1
+      - name: Install Rust 1.94.0
         run: |
-          rustup toolchain install 1.85.1 --profile minimal --component clippy
-          rustup default 1.85.1
+          rustup toolchain install 1.94.0 --profile minimal --component clippy
+          rustup default 1.94.0
           rustc --version
           cargo --version
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install Python test dependency
         run: python -m pip install --disable-pip-version-check pytest
@@ -112,12 +112,7 @@ jobs:
       - name: Python tests
         run: python -m pytest -q
 
-      - name: Validate Compose configuration
-        env:
-          BITFINEX_API_KEY: ci-placeholder
-          BITFINEX_API_SECRET: ci-placeholder
-          GRAFANA_PASSWORD: ci-placeholder
-        run: docker compose -f infrastructure/docker/docker-compose.yml config --quiet
-
-      - name: Build production Docker image
-        run: docker build -f infrastructure/docker/Dockerfile .
+      # Production is a native systemd binary; Docker was removed by the owner.
+      # Produkce je nativní binární soubor pod systemd; vlastník Docker odstranil.
+      - name: Build native production binary
+        run: cargo build --locked --release

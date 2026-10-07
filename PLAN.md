@@ -190,3 +190,89 @@ Final candidate preparation: preliminary checks499Rust/362Python/43ML passed; na
 Independent Agy fullsource, source-delta, deployment and finalsemantic reviews passed with explicitlimitations. Hermes successfully reviewed daily delivery; newsource attempt timedout and focusedretry failedexternalNousHTTP404, no successful newsourceHermesverdict. Reject reviewer unsupportedzero-financial-risk/zero-overhead guarantees.
 A finalsemantic correction renames the research audit result VERIFIED_RECORDED_PREFIX: reading a complete concurrentfile prefix does not prove completion of the writer-inflight fsync. All parsing, provenance, loss and canonicalmatching checks unchanged; training/fullstrategyreplay stayfalse. Agy confirmed and requested matchingREADMEwording, applied. Actual missing/corruptSQLite regression reproduced an uncaught operational failure; catch sqlite3.Error as BLOCKED with no successful audit. Thirteen reader checks passed in private candidate; complete44MLchecks required at finalgate.
 Current authenticated recovery fixture is completion-20260930/fresh-recovery (not priorSeptember29fixture); its hashes mustbe bound before/after realPositionBookrecoverytest. Exact stagedfinalgate thenlocalcheckpoint, authenticatedstablejournal proof, preservedbinary/source/SQLitebackups, onecontrolledrestart and actualentryevidence audit. Finaldeployment acceptance is recorded privately in completion-20260930/postdeploy-verification.json and commonGit evidence, never asserted beforeexecution. GitHubpush/PR remainoutside currentpublicationauthority. FivecompleteUTCdays and4–8weekforwardholdout/fullinventory-exitreplay remainfuturequalification gates; originalnegativeholdout unchanged.
+
+
+# Goal
+Unify operator trading parameters in the existing strategy.toml in an isolated candidate, per the owner's explicit approval. Preserve live production, foreign AGENT_STATE, archived candidates and budgets.
+# Non-goals
+No deployment, restart, trading key use, stop-loss activation, removal of economic veto, automatic risk increase, new harness or new dependencies. Profit-only single-distance trailing remains a separately reviewed proposal, not this refactor. External BTC/USD funding must be accounted as capital flows, never profit or erased loss; retain this required integration boundary, do not pretend existing raw balance anchoring implements it.
+# Environment
+caslav UID1000; baseline HEAD c6af5636047394b073228af93dff395959abd788; Rust cargo1.93.1; source working tree has only foreign AGENT_STATE modification. Existing worktrees contain owned frozen fixes; create a distinct detached candidate, do not reset or adopt them.
+# Impact / file checklist
+strategy.toml: explicit current effective operator risk fields, entry caps and regime inventory settings; concise English/Czech paired comments.
+src/config.rs: typed single-source schema, validation, no silent policy defaults, operator-fixed settings require restart and cannot partially hot-reload.
+src/main.rs and src/entry_policy.rs: wire validated entry/risk/inventory parameters into actual consumers.
+crates/pirana-risk-engine/src/operator_limits.rs, lib.rs, engine.rs: separate fixed operator limits from calibration observations; retain original persistent history and guard semantics.
+docs/unified-strategy.md and relevant regression tests: desired/applied distinction, exact units, retained safety limits, funding requirement and migration.
+No tests/policy weakening; no unrelated formatting or edits.
+# Acceptance
+10 slots and 10% entry maximum unchanged; existing effective daily0.5%/weekly1.165%/aggregate60%/single5%/loss5/VPIN30%/baseline10% migrated without silently broadening risk. Owner's prepared daily1% is separate activation, not smuggled into a refactor. Regime10/20/35 remains until separately approved simplification. Recalibration observations cannot replace the explicitly configured operator limits. Unknown/invalid input fails closed. Source configuration changes requiring rebuild/restart are rejected as partial hot reload; desired/applied status is explicit.
+# Commands
+Discover and retain .github/workflows/ci.yml. Run offline cargo check --locked --offline --all-targets; cargo test --locked --offline --workspace; cargo clippy --locked --offline --all-targets -- -D warnings; python3 scripts/strategy_versioning.py validate; shell syntax; configured Python tests and security/diff checks as applicable.
+No installers. Docker CI build requires separate exact owner authorization; mark BLOCKED if unavailable/unauthorized. Native tests in one own user unit CPU10%, MemoryMax2G, MemorySwapMax0, Restart=no with finite controlled run and original thermal75 admission/80stop policy; AGY opposition remains uncapped.
+# Failure / recovery
+At most three evidence-driven repair cycles for this unified-configuration change; do not reset prior incident budgets or resume frozen harness. Record actual loaded terminal and cleanup. Preserve any failed/unknown actions, no blind replay. No commit before complete required gate. Preserve candidate on block.
+# Review / authorization
+Fresh AGY code opposition using existing verified no-tools adapter. Report proposal vs real implementation/test separately. Live publication/migration/restart remains unauthorized. Program identifiers English; each new code comment English followed by Czech.
+
+
+## Scope refinement: conservative ceilings and capital flows
+Add crates/pirana-features/src/dynamic_sizing.rs to parameterize existing 10/20/35 regime caps. Operator values are ceilings: measured calibration may tighten them, never raise them. Freeze the entire loaded configuration until an authorized restart to prevent mixed policy.
+Funding finding: main.rs halts on unexplained BTC deltas; reconciliation.rs infers BTC funding from balances and ignores USD-only funding; equity_risk.rs has no verified cash-flow adjustment. Document required deposit IDs, BTC valuation, flow-neutral performance, external-holding provenance and replay/restart tests separately. No private exchange requests or removal of guards.
+
+# Application repair 1: explicit configuration and diagnostics
+# Aplikační oprava 1: explicitní konfigurace a diagnostika
+
+Confirmed source issues UC-CONFIG-01/02/03 and UC-LABEL-01: require all risk fields and explicit stop-loss/trailing controls; reject unknown fields in root and critical sections; correct the 10% hard-cap log and changed bilingual documentation. Preserve every canonical strategy value and all calibration algorithms/history. Missing policy never increases exposure or enables exits. Add removal/typo/missing-section regressions using the real canonical TOML.
+
+AGY code1 consumed once; provider ERROR/API500 and contradictory PASS text are not approval. Native3 timed out during test compilation, retained terminal/cleanup verified. Preserve originals. Wrapper repair count stays2; application repair becomes1 (maximum3). No source196/owner33/refund or apparatus reset.
+
+FINDING-RISK-01 is not accepted as a defect: build_stats labels historical toxicity against the measured current calibration and vpin_threshold computes the next measured calibration. Actual execution getter separately clamps against operator0.30. Replacing this input changes the algorithm; no live breach is shown. engine.rs stays byte-identical. A later strategy/calibration decision requires separate evidence.
+
+After mutation: fresh exact-code AGY review in a new context with real provider status, then current native verification using the already verified worker, isolated fresh execution records and retained old timeout. Do not deploy, restart, commit, install, request live exchange keys or remove guards. Funding remains a separate unimplemented follow-up.
+
+
+# Fixed operator policy and removal of automatic tuning
+# Pevná politika operátora a odstranění automatického přelaďování
+
+## Goal
+Implement the owner's approved 10 positions / 10% entry ceiling / 1% daily drawdown / no conventional stop loss / BTC-rise-only trailing. Remove automatic history-driven tuning from the production path, keeping measurement, financial accounting, funding and recovery protections.
+
+## Authority and lineage
+Owner approved point 1, explicitly removed point 3 (automatic tuning), then authorized Git/GitHub/deploy/restart while preserving measurement and accounting. This is initial implementation of new product requirements excluded from the earlier frozen consolidation candidate. The old unified repair chain remains exhausted (3 consumed, 0 remaining), and SOURCE/DATA/owner33 histories remain unchanged. No retry of its old runner. At most three corrective cycles after the first failed implemented gate in this new policy scope, charged before changes, across continuations.
+
+## Baseline and ownership
+Source baseline c6af5636047394b073228af93dff395959abd788. Preserve the frozen unified candidate and its 10 owned files with verified hashes. Create a clean owned worktree from this revision, copy only those verified changes, append this plan without replacing the existing PLAN.md, and integrate the specifically authorized send_alert.py deletion. Do not copy foreign AGENT_STATE.md.
+Production PID1512/invocation b16aacb34fe5479e976ab0730cad428d, binary9af6 unchanged before rollout. FD operation/audit locks with inode proof required.
+
+## Packages
+1. Fixed operator limits and immutable startup configuration: calibrated history must neither tighten nor broaden owner limits. Production must not load/write/calibrate history as policy. Remove periodic recalibration, adaptive baseline startup and historical win-rate sizing. Preserve observed ledger/equity/fees/market metrics. Retain historical offline calibration sources only where required to read preserved formats/test legacy contracts; no production scheduler or writable tuning surface. Dashboard must explicitly disclose fixed policy rather than attribute it to measured formulas.
+2. Activate and validate BUY profit trailing; no new SELL-decline trailing. Preserve recovered position state, exit profit/fee floor, pending reservations and execution safeguards. Keep capacity and per-entry capital ceilings. Maxima are not requirements to fill all slots; other configured safety checks still apply.
+3. Native release/CI deployment migration after Docker and Telegram decommissioning. Preserve equivalent native application/static/security/recovery checks, no Docker reinstallation or deleted sender restoration. Funding-safe account reconciliation is a release prerequisite.
+4. Independent actual AGY review and exact native verification, show all final strategy.toml rules, explicit exact candidate commit/remote readback/deploy/one restart with rollback of binary/config only. Never roll accounting history back.
+5. Continue fresh whole-project audit; no claim that a policy change completes it.
+
+## Initial file scope
+crates/pirana-risk-engine/src/{engine.rs,operator_limits.rs,lib.rs}; src/{config.rs,main.rs,calibration.rs}; strategy.toml; docs/unified-strategy.md; regression tests. Deployment/CI files require a documented scope update after reading actual consumers. Do not delete unrelated measurement scripts just because filenames mention calibration.
+
+## Acceptance and exact native commands
+From trusted CI/OPERATIONS: cargo check --locked --all-targets; cargo test --locked --workspace; cargo clippy --locked --all-targets -- -D warnings; python3 -m pytest -q; python3 scripts/strategy_versioning.py validate; cargo build --locked --release. Use installed explicit /home/wwwenda/.cargo/bin/cargo and /usr/bin/python3; no installers. Record Rust/Python version differences from CI. Existing strategy versioning and shell/unit graph, secrets and complete candidate diff checks required. Private recovery fixture test requires fresh authorized balances/orders/positions, never model transmission.
+Independent tests: low/high/nonfinite stored calibration never changes any configured limit; explicit attempted tuning refused without mutation/write; restored history preserved; daily drawdown below/at/above1% decisions; BUY trailing no decline/equality arm, upward-only ratchet, disabled behavior, invalid trailing inputs; 10 slots including pending and10% fee-aware capital cap.
+Any missing required check is BLOCKED; model review or historical tests are not PASS. No commit before applicable complete gate.
+
+## Recovery and stop
+One owned writer; model calls serial, AGY without artificial CPU/memory/time caps. Native tests use scoped own resources and production thermal safeguards. No broad signals or PID-only kills. Reconcile every intent/receipt/terminal before replay. Preserve pending orders, positions, capital flows and financial history. Unknown funding/recovery stops rollout, not independent source work. Exact old package/dataset/model budgets cannot be refunded or renamed.
+
+## Native CI and removed notification integration
+Owner removed Docker and shared Telegram failure sender. Replace Docker configuration/image stages with a native locked release build; retain all existing application checks. Align CI to the installed tested toolchain Rust1.94.0/Python3.14, recording prior1.85.1/3.12 policy divergence rather than claiming old CI ran. Remove the obsolete sender/template and its OnFailure edges. Replace tests of the deleted transport with explicit decommissioning regressions; preserve canonical financial report tests. Remove the doctor service/timer from deployable units so rollout cannot resurrect the disabled ten-minute sender. Do not alter other host timers here. Existing other measurement/report scripts are preserved; no new tuning or AI scheduler.
+
+## Corrective cycle 1: passive measurement
+Restore read-only P(ruin) estimates from the existing independently validated canonical ledger. No policy mutation, fallback to runtime counters, new capital-flow assumptions or historical writes. Pending entries already count through EntryGate reservations. External BTC/USD deposits remain a separate rollout blocker; margin/perpetual funding is outside this spot product. Add meaningful warmup/invalid-input and policy-invariance tests.
+
+## Native initial gate
+Use current native CI commands and source fingerprint before/after every stage; explicit tracked deletion markers. Capped trusted native worker CPU10%, memory2GiB, swap0, no new privileges, no restart, runtime1800s, file-size unlimited for existing genuine fixtures. Existing ignored old target is serialized build cache only, never test evidence. Current focused risk/trailing regressions, static/diff/secrets/shell/unit graphs, strategy validation, cargo check/clippy/workspace tests, Python tests, native release build. Full candidate input unchanged after release; exact loaded terminal and cleanup required. No live venue calls, credentials, deployment or trading. Optional absent cargo-audit/gitleaks not claimed clean.
+
+Cycle1 source review completion: add canonical valid/stale passive estimate regression, simplify six equivalent getter return expressions, correct historical slot-size comments. Existing historical lower-limit fixture remains intentional and documented. No runtime behavior change in this final cleanup.
+
+## Repair cycle 2 and exact staged gate
+Observed native Clippy rejects a documentation comment before a statement (main.rs238). Convert only this comment to an English ordinary comment followed by Czech; no behavior or guard change. Prepare exact index from 26 approved owned paths and run actual complete CI gate on that staged tree, including real private snapshot recovery test. Final current native job uses one CPU, Memory2GiB, Swap0, NNP, noRestart, bounded 2400s and continuous thermal80 monitor. Stage source/index signatures before/after all stages; reject movement. Native1 failure and historical budgets remain immutable. Flow-neutral external capital support remains a separate rollout blocker; no restart or deployment claim.

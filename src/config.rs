@@ -1,7 +1,10 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct StrategyConfig {
+    #[serde(skip)]
+    loaded_source: String,
     pub system: SystemConfig,
     pub trading: TradingConfig,
     pub strategy: StrategyParams,
@@ -11,7 +14,6 @@ pub struct StrategyConfig {
     pub volatility: VolatilityStrategyConfig,
     #[serde(default)]
     pub order_book: OrderBookStrategyConfig,
-    #[serde(default)]
     pub trailing_stop: TrailingStopConfig,
     #[serde(default)]
     pub profit_skimmer: ProfitSkimmerConfig,
@@ -28,23 +30,28 @@ pub struct StrategyConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SystemConfig {
     pub reload_interval_seconds: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TradingConfig {
     #[allow(dead_code)]
     pub trade_size_btc: f64,
     pub max_open_orders: u32,
+    pub max_live_positions: usize,
+    pub max_live_buy_equity_pct: f64,
+    pub min_impulse_spacing_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct StrategyParams {
     pub entry_zone_spread_usd: f64,
     pub take_profit_distance_usd: f64,
     pub stop_loss_distance_usd: f64,
-    #[serde(default = "default_false")]
     pub stop_loss_enabled: bool,
     pub ofi_trigger_threshold: f64,
     pub ofi_window_size: usize,
@@ -53,6 +60,7 @@ pub struct StrategyParams {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct InventoryConfig {
     #[serde(default = "default_min_inventory_btc")]
     pub min_inventory_btc: f64,
@@ -70,6 +78,9 @@ pub struct InventoryConfig {
     pub target_inventory_pct: f64,
     #[serde(default = "default_true")]
     pub use_dynamic_inventory: bool,
+    pub range_inventory_pct: f64,
+    pub trend_down_inventory_pct: f64,
+    pub trend_up_inventory_pct: f64,
 }
 
 fn default_min_inventory_btc() -> f64 { 0.0001 }
@@ -78,30 +89,22 @@ fn default_target_inventory_btc() -> f64 { 0.01 }
 fn default_target_inventory_pct() -> f64 { 30.0 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RiskConfig {
-    #[serde(default = "default_max_slippage_bps")]
+    pub max_daily_drawdown_pct: f64,
+    pub max_weekly_drawdown_pct: f64,
+    pub consecutive_loss_threshold: u32,
+    pub vpin_toxicity_threshold: f64,
     pub max_slippage_bps: u32,
-    #[serde(default = "default_position_size_pct")]
     pub position_size_pct: f64,
-    #[serde(default = "default_max_aggregate_exposure_pct")]
     pub max_aggregate_exposure_pct: f64,
-    #[serde(default = "default_max_single_trade_risk_pct")]
     #[allow(dead_code)]
     pub max_single_trade_risk_pct: f64,
-    #[serde(default = "default_true")]
     pub use_dynamic_winrate_sizing: bool,
-    #[serde(default = "default_min_position_size_pct")]
     pub min_position_size_pct: f64,
-    #[serde(default = "default_max_position_size_pct")]
     pub max_position_size_pct: f64,
 }
 
-fn default_max_slippage_bps() -> u32 { 5 }
-fn default_position_size_pct() -> f64 { 5.0 }
-fn default_max_aggregate_exposure_pct() -> f64 { 90.0 }
-fn default_max_single_trade_risk_pct() -> f64 { 5.0 }
-fn default_min_position_size_pct() -> f64 { 1.0 }
-fn default_max_position_size_pct() -> f64 { 15.0 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct VolatilityStrategyConfig {
@@ -126,7 +129,6 @@ pub struct VolatilityStrategyConfig {
 }
 
 fn default_true() -> bool { true }
-fn default_false() -> bool { false }
 fn default_atr_period() -> usize { 14 }
 fn default_ticks_per_bar() -> usize { 50 }
 fn default_atr_tp_multiplier() -> f64 { 0.5 }
@@ -184,8 +186,8 @@ impl Default for OrderBookStrategyConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TrailingStopConfig {
-    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_trailing_min_trigger_usd")]
     pub min_trigger_usd: f64,
@@ -199,16 +201,6 @@ fn default_trailing_min_trigger_usd() -> f64 { 4.0 }
 fn default_trailing_be_offset_usd() -> f64 { 1.0 }
 fn default_trailing_trail_multiplier() -> f64 { 0.5 }
 
-impl Default for TrailingStopConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            min_trigger_usd: 4.0,
-            be_offset_usd: 1.0,
-            trail_multiplier: 0.5,
-        }
-    }
-}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProfitSkimmerConfig {
@@ -256,6 +248,28 @@ impl Default for AdaptiveCooldownConfig {
 }
 
 impl StrategyConfig {
+    /// Reject partial reloads that mix startup engines with a new policy.
+    /// Odmítnout částečné přenačtení míchající startovní enginy s novou politikou.
+    pub fn requires_restart(&self, desired: &Self) -> bool {
+        self.loaded_source != desired.loaded_source
+    }
+
+    pub fn live_buy_equity_fraction(&self) -> f64 {
+        self.trading.max_live_buy_equity_pct / 100.0
+    }
+
+    pub fn operator_limits(&self) -> pirana_risk_engine::operator_limits::OperatorLimits {
+        pirana_risk_engine::operator_limits::OperatorLimits {
+            max_aggregate_exposure: self.risk_management.max_aggregate_exposure_pct / 100.0,
+            max_single_trade_risk: self.risk_management.max_single_trade_risk_pct / 100.0,
+            max_daily_drawdown: self.risk_management.max_daily_drawdown_pct / 100.0,
+            max_weekly_drawdown: self.risk_management.max_weekly_drawdown_pct / 100.0,
+            consecutive_loss_threshold: self.risk_management.consecutive_loss_threshold,
+            vpin_toxicity_threshold: self.risk_management.vpin_toxicity_threshold,
+            baseline_pct: self.risk_management.position_size_pct,
+        }
+    }
+
     fn invalid(message: impl Into<String>) -> Box<dyn std::error::Error> {
         Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()))
     }
@@ -273,6 +287,31 @@ impl StrategyConfig {
         }
         if !(1..=10).contains(&self.trading.max_open_orders) {
             return Err(Self::invalid("max_open_orders must be in hard range 1..=10"));
+        }
+        if !(1..=10).contains(&self.trading.max_live_positions)
+            || self.trading.min_impulse_spacing_ms < 2000 {
+            return Err(Self::invalid("entry capacity must be 1..=10 and spacing >= 2000ms"));
+        }
+        let entry_pct = finite("max_live_buy_equity_pct", self.trading.max_live_buy_equity_pct)?;
+        if !(0.0 < entry_pct && entry_pct <= 10.0) {
+            return Err(Self::invalid("max_live_buy_equity_pct must be in (0, 10]"));
+        }
+        self.operator_limits().validate()?;
+        if self.risk_management.use_dynamic_winrate_sizing {
+            return Err(Self::invalid("automatic win-rate tuning has been removed"));
+        }
+        let trigger = finite("trailing min_trigger_usd", self.trailing_stop.min_trigger_usd)?;
+        let offset = finite("trailing be_offset_usd", self.trailing_stop.be_offset_usd)?;
+        let multiplier = finite("trailing trail_multiplier", self.trailing_stop.trail_multiplier)?;
+        if trigger <= 0.0 || offset <= 0.0 || offset >= trigger || multiplier <= 0.0
+            || trigger > self.volatility.max_tp_usd {
+            return Err(Self::invalid("invalid profit trailing trigger, offset or multiplier"));
+        }
+        let down = finite("trend_down_inventory_pct", self.inventory.trend_down_inventory_pct)?;
+        let range = finite("range_inventory_pct", self.inventory.range_inventory_pct)?;
+        let up = finite("trend_up_inventory_pct", self.inventory.trend_up_inventory_pct)?;
+        if !(0.0 < down && down <= range && range <= up && up <= 90.0) {
+            return Err(Self::invalid("regime inventory requires 0 < down <= range <= up <= 90"));
         }
         if self.strategy.ofi_window_size == 0 || self.strategy.trade_cooldown_ms == 0 {
             return Err(Self::invalid("OFI window and trade cooldown must be > 0"));
@@ -324,9 +363,121 @@ impl StrategyConfig {
 
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string("strategy.toml")?;
-        let config: StrategyConfig = toml::from_str(&content)?;
+        let mut config: StrategyConfig = toml::from_str(&content)?;
         config.validate()?;
+        config.loaded_source = content;
         Ok(config)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn candidate() -> StrategyConfig {
+        let source = include_str!("../strategy.toml");
+        let mut config: StrategyConfig = toml::from_str(source).unwrap();
+        config.loaded_source = source.to_owned();
+        config
+    }
+    #[test]
+    fn canonical_operator_ceilings() {
+        let config = candidate();
+        config.validate().unwrap();
+        assert_eq!(config.trading.max_live_positions, 10);
+        assert_eq!(config.live_buy_equity_fraction(), 0.10);
+        assert_eq!(config.operator_limits().max_daily_drawdown, 0.01);
+        assert_eq!(config.operator_limits().max_aggregate_exposure, 0.60);
+        assert!(!config.strategy.stop_loss_enabled);
+    }
+    #[test]
+    fn missing_explicit_policy_is_an_error() {
+        let source: toml::Value = toml::from_str(include_str!("../strategy.toml")).unwrap();
+        let roundtrip: StrategyConfig = toml::from_str(&toml::to_string(&source).unwrap()).unwrap();
+        roundtrip.validate().unwrap();
+        assert!(!roundtrip.strategy.stop_loss_enabled);
+        assert!(roundtrip.trailing_stop.enabled);
+        let fields = [
+            ("trading", "max_live_positions"), ("trading", "max_live_buy_equity_pct"),
+            ("trading", "min_impulse_spacing_ms"), ("trading", "max_open_orders"),
+            ("inventory", "range_inventory_pct"), ("inventory", "trend_down_inventory_pct"),
+            ("inventory", "trend_up_inventory_pct"), ("strategy", "stop_loss_enabled"),
+            ("trailing_stop", "enabled"),
+            ("risk_management", "max_daily_drawdown_pct"),
+            ("risk_management", "max_weekly_drawdown_pct"),
+            ("risk_management", "consecutive_loss_threshold"),
+            ("risk_management", "vpin_toxicity_threshold"),
+            ("risk_management", "max_slippage_bps"),
+            ("risk_management", "position_size_pct"),
+            ("risk_management", "max_aggregate_exposure_pct"),
+            ("risk_management", "max_single_trade_risk_pct"),
+            ("risk_management", "use_dynamic_winrate_sizing"),
+            ("risk_management", "min_position_size_pct"),
+            ("risk_management", "max_position_size_pct"),
+        ];
+        for (section, field) in fields {
+            let mut edited = source.clone();
+            assert!(edited[section].as_table_mut().unwrap().remove(field).is_some());
+            assert!(toml::from_str::<StrategyConfig>(&toml::to_string(&edited).unwrap()).is_err(),
+                    "missing explicit {section}.{field}");
+        }
+    }
+    #[test]
+    fn missing_trailing_section_is_an_error() {
+        let mut source: toml::Value = toml::from_str(include_str!("../strategy.toml")).unwrap();
+        assert!(source.as_table_mut().unwrap().remove("trailing_stop").is_some());
+        assert!(toml::from_str::<StrategyConfig>(&toml::to_string(&source).unwrap()).is_err());
+        assert!(candidate().trailing_stop.enabled);
+    }
+    #[test]
+    fn unknown_operator_fields_and_sections_are_errors() {
+        let source: toml::Value = toml::from_str(include_str!("../strategy.toml")).unwrap();
+        for section in ["system", "trading", "strategy", "inventory", "risk_management", "trailing_stop"] {
+            let mut edited = source.clone();
+            edited[section].as_table_mut().unwrap().insert(
+                "misspelled_operator_setting".to_owned(), toml::Value::Integer(10));
+            assert!(toml::from_str::<StrategyConfig>(&toml::to_string(&edited).unwrap()).is_err(),
+                    "ignored unknown field in {section}");
+        }
+        let mut edited = source.clone();
+        edited.as_table_mut().unwrap().insert("traling_stop".to_owned(), source["trailing_stop"].clone());
+        assert!(toml::from_str::<StrategyConfig>(&toml::to_string(&edited).unwrap()).is_err());
+    }
+    #[test]
+    fn invalid_settings_fail_closed() {
+        let mut c = candidate(); c.trading.max_live_positions = 11;
+        assert!(c.validate().is_err());
+        c = candidate(); c.trading.max_live_buy_equity_pct = f64::NAN;
+        assert!(c.validate().is_err());
+        c = candidate(); c.inventory.trend_down_inventory_pct = 50.0;
+        assert!(c.validate().is_err());
+        c = candidate(); c.trading.min_impulse_spacing_ms = 1999;
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn removed_tuning_and_invalid_trailing_are_rejected() {
+        let mut config = candidate();
+        config.risk_management.use_dynamic_winrate_sizing = true;
+        assert!(config.validate().is_err());
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 121.0] {
+            let mut config = candidate();
+            config.trailing_stop.min_trigger_usd = invalid;
+            assert!(config.validate().is_err());
+        }
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 25.0] {
+            let mut config = candidate();
+            config.trailing_stop.be_offset_usd = invalid;
+            assert!(config.validate().is_err());
+        }
+        assert!(!candidate().risk_management.use_dynamic_winrate_sizing);
+        assert!(candidate().trailing_stop.enabled);
+    }
+
+    #[test]
+    fn edited_policy_is_pending_restart() {
+        let applied = candidate(); let mut desired = applied.clone();
+        assert!(!applied.requires_restart(&desired));
+        desired.loaded_source.push_str("\n# Operator edit\n# Úprava operátora\n");
+        assert!(applied.requires_restart(&desired));
+    }
 }
